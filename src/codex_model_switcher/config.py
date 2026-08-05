@@ -33,6 +33,24 @@ class ConfigChangedError(ConfigError):
     """Raised when the target changed after this project wrote it."""
 
 
+class ConfigPostCommitError(ConfigError):
+    """Raised when replacement committed but cleanup made completion uncertain."""
+
+    def __init__(
+        self,
+        path: Path,
+        detail: str,
+        *,
+        backup_path: Path | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.committed = True
+        self.backup_path = Path(backup_path) if backup_path is not None else None
+        super().__init__(
+            f"atomic replacement for {self.path} committed, but cleanup failed: {detail}"
+        )
+
+
 @dataclass(frozen=True)
 class ConfigReceipt:
     config_path: Path
@@ -89,6 +107,9 @@ class _PathLease:
         self._kernel32: object | None = None
         self._overlapped: _WindowsOverlapped | None = None
         self._locked = False
+        self._created_new_path = False
+        self._replacement_committed = False
+        self._backup_path: Path | None = None
         self._cooperative_stream = None
         self._fcntl = None
 
@@ -101,10 +122,34 @@ class _PathLease:
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         if os.name == "nt":
-            self._release_windows(exc_type is None)
+            cleanup_error: ConfigError | None = None
+            if self._created_new_path and not self._replacement_committed:
+                try:
+                    self._rollback_new_path()
+                except ConfigError as error:
+                    cleanup_error = error
+            try:
+                self._release_windows(exc_type is None)
+            except Exception:
+                if cleanup_error is not None:
+                    raise cleanup_error
+                raise
+            if cleanup_error is not None:
+                if exc_value is not None:
+                    raise cleanup_error from exc_value
+                raise cleanup_error
         else:
             self._release_cooperative()
         return False
+
+    def _rollback_new_path(self) -> None:
+        if not self._created_new_path or self._replacement_committed:
+            return
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError as error:
+            raise ConfigError("unable to roll back the newly created config file") from error
+        self._created_new_path = False
 
     def assert_target(self, path: Path) -> None:
         if Path(path).resolve() != self.path:
@@ -188,6 +233,7 @@ class _PathLease:
             0x00000080 | 0x00040000,  # NORMAL | FILE_FLAG_OPEN_REQUIRING_OPLOCK
             None,
         )
+        created_new_path = self.create and ctypes.get_last_error() == 0
         invalid_handle = ctypes.c_void_p(-1).value
         if handle in (None, invalid_handle):
             error = ctypes.get_last_error()
@@ -217,16 +263,32 @@ class _PathLease:
         ):
             error = ctypes.get_last_error()
             close_handle(handle)
+            if created_new_path:
+                try:
+                    self.path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    raise ConfigError(
+                        "unable to roll back the newly created config file"
+                    ) from cleanup_error
             raise ConfigError(f"unable to lock config on Windows (error {error})")
 
         self._kernel32 = kernel32
         self._handle = int(handle)
         self._overlapped = overlapped
         self._locked = True
+        self._created_new_path = created_new_path
         try:
             self._verify_windows_handle_path_identity(self._handle, create_file, close_handle)
-        except Exception:
+        except Exception as error:
+            cleanup_error: ConfigError | None = None
+            if self._created_new_path:
+                try:
+                    self._rollback_new_path()
+                except ConfigError as cleanup_exception:
+                    cleanup_error = cleanup_exception
             self._release_windows(False)
+            if cleanup_error is not None:
+                raise cleanup_error from error
             raise
 
     def _verify_windows_handle_path_identity(
@@ -485,6 +547,7 @@ class _PathLease:
                 error = ctypes.get_last_error()
                 raise ConfigError(f"unable to commit Windows config transaction (error {error})")
             committed = True
+            self._replacement_committed = True
 
             # The share-denying handle was opened before commit.  Install it
             # on the lease before releasing any pre-commit handles so every
@@ -499,11 +562,13 @@ class _PathLease:
             source_handle = None
             old_error = self._release_windows_handle(kernel32, old_handle, old_overlapped)
             if source_close_code is not None:
-                raise ConfigError(
+                raise ConfigPostCommitError(
+                    target_path,
                     f"unable to release temporary Windows config handle (error {source_close_code})"
                 )
             if old_error is not None:
-                raise ConfigError(
+                raise ConfigPostCommitError(
+                    target_path,
                     f"unable to release previous Windows config lock (error {old_error})"
                 )
         finally:
@@ -513,7 +578,21 @@ class _PathLease:
                         rollback_transaction(int(transaction))
                     except OSError:
                         pass
-                close_handle(transaction)
+                try:
+                    transaction_closed = bool(close_handle(transaction))
+                except Exception as error:
+                    if committed:
+                        raise ConfigPostCommitError(
+                            target_path,
+                            "unable to close the Windows transaction handle",
+                        ) from error
+                    raise
+                if committed and not transaction_closed:
+                    error = ctypes.get_last_error()
+                    raise ConfigPostCommitError(
+                        target_path,
+                        f"unable to close the Windows transaction handle (error {error})",
+                    )
             if new_handle is not None:
                 close_handle(new_handle)
             if source_handle is not None:
@@ -533,6 +612,12 @@ class _PathLease:
         self._handle = None
         self._locked = False
         if unlock_error is not None and raise_on_error:
+            if self._replacement_committed:
+                raise ConfigPostCommitError(
+                    self.path,
+                    f"unable to release Windows config lock (error {unlock_error})",
+                    backup_path=self._backup_path,
+                )
             raise ConfigError(f"unable to release Windows config lock (error {unlock_error})")
 
     def _release_windows_handle(
@@ -662,6 +747,7 @@ def _apply_managed_config_locked(
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_path = config_path.with_name(f"{config_path.name}.bak.{timestamp}")
+    lease._backup_path = backup_path
     backup_descriptor = os.open(
         backup_path,
         os.O_CREAT | os.O_EXCL | os.O_WRONLY,
@@ -670,11 +756,17 @@ def _apply_managed_config_locked(
     try:
         with _exclusive_path_lock(backup_path, create=False) as backup_lease:
             _atomic_write(backup_path, original, expected=b"", lease=backup_lease)
+    except ConfigPostCommitError as error:
+        error.backup_path = backup_path
+        raise
     except Exception:
         backup_path.unlink(missing_ok=True)
         raise
     try:
         _atomic_write(config_path, written, expected=original, lease=lease)
+    except ConfigPostCommitError as error:
+        error.backup_path = backup_path
+        raise
     except Exception:
         backup_path.unlink(missing_ok=True)
         raise
@@ -693,6 +785,7 @@ def restore_managed_config(config_path: Path, receipt: ConfigReceipt) -> None:
         raise ConfigError("receipt belongs to a different config path")
     with _config_lock(config_path):
         with _exclusive_path_lock(config_path, create=False) as lease:
+            lease._backup_path = receipt.backup_path
             try:
                 current = lease.read_bytes()
                 backup = receipt.backup_path.read_bytes()
@@ -839,6 +932,8 @@ def _atomic_write(
         dir=path.parent,
     )
     temporary_path = Path(temporary_name)
+    replacement_committed = False
+    body_error: Exception | None = None
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
@@ -846,9 +941,33 @@ def _atomic_write(
             os.fsync(stream.fileno())
         if expected is not None:
             _assert_current_bytes(path, expected, lease=lease)
-        _replace_temp_file(temporary_path, path, lease=lease, expected=data)
+        try:
+            _replace_temp_file(temporary_path, path, lease=lease, expected=data)
+        except ConfigPostCommitError:
+            raise
+        except Exception as error:
+            if lease is not None and getattr(lease, "_replacement_committed", False):
+                raise ConfigPostCommitError(path, str(error)) from error
+            raise
+        replacement_committed = True
+    except Exception as error:
+        body_error = error
+        raise
     finally:
-        temporary_path.unlink(missing_ok=True)
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            if replacement_committed or (
+                lease is not None and getattr(lease, "_replacement_committed", False)
+            ):
+                raise ConfigPostCommitError(
+                    path,
+                    "unable to remove the temporary replacement file",
+                ) from cleanup_error
+            if body_error is None:
+                raise ConfigError(
+                    "unable to remove the temporary replacement file"
+                ) from cleanup_error
 
 
 def _commit_windows_transaction(commit_transaction, transaction_handle) -> bool:

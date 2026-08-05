@@ -230,6 +230,188 @@ def test_apply_restore_preserves_original_bytes_with_low_level_render_seam(
     assert config_path.read_bytes() == original
 
 
+def test_windows_new_config_is_removed_after_precommit_failure(tmp_path, monkeypatch) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows OPEN_ALWAYS rollback is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "new-config.toml"
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+
+    def fail_before_replacement(*args, **kwargs):
+        raise ConfigError("injected pre-commit backup failure")
+
+    monkeypatch.setattr(config_module, "_atomic_write", fail_before_replacement)
+
+    with pytest.raises(ConfigError, match="pre-commit backup failure"):
+        apply_managed_config(config_path, catalog_path)
+
+    assert not config_path.exists()
+
+
+def test_windows_new_config_is_removed_after_replacement_failure(tmp_path, monkeypatch) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows replacement rollback is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "new-config.toml"
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    real_replace_temp_file = config_module._replace_temp_file
+
+    def fail_config_replacement(temporary_path, target_path, *, lease=None, expected=None):
+        if target_path.resolve() == config_path.resolve():
+            raise ConfigError("injected pre-commit replacement failure")
+        return real_replace_temp_file(
+            temporary_path,
+            target_path,
+            lease=lease,
+            expected=expected,
+        )
+
+    monkeypatch.setattr(config_module, "_replace_temp_file", fail_config_replacement)
+
+    with pytest.raises(ConfigError, match="pre-commit replacement failure"):
+        apply_managed_config(config_path, catalog_path)
+
+    assert not config_path.exists()
+
+
+def test_windows_postcommit_cleanup_failure_keeps_backup_and_status(
+    tmp_path, monkeypatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows post-commit cleanup is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b"# original bytes\r\n"
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    real_replace_temp_file = config_module._replace_temp_file
+
+    def replace_then_fail(temporary_path, target_path, *, lease=None, expected=None):
+        result = real_replace_temp_file(
+            temporary_path,
+            target_path,
+            lease=lease,
+            expected=expected,
+        )
+        if target_path.resolve() == config_path.resolve():
+            raise OSError("injected post-commit cleanup failure")
+        return result
+
+    monkeypatch.setattr(config_module, "_replace_temp_file", replace_then_fail)
+
+    with pytest.raises(ConfigError, match="committed") as caught:
+        apply_managed_config(config_path, catalog_path)
+
+    error = caught.value
+    assert getattr(error, "committed", False) is True
+    backup_path = getattr(error, "backup_path", None)
+    assert backup_path is not None
+    assert backup_path.read_bytes() == original
+    assert b'model_provider = "example-provider"' in config_path.read_bytes()
+
+
+def test_windows_postcommit_close_failure_keeps_backup_and_status(
+    tmp_path, monkeypatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows post-commit handle cleanup is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b"# original bytes\r\n"
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    real_release = config_module._PathLease._release_windows_handle
+    injected = [False]
+
+    def fail_new_handle_close(self, kernel32, handle, overlapped):
+        if (
+            self.path == config_path.resolve()
+            and self._replacement_committed
+            and overlapped is None
+            and not injected[0]
+        ):
+            injected[0] = True
+            return 123
+        return real_release(self, kernel32, handle, overlapped)
+
+    monkeypatch.setattr(
+        config_module._PathLease,
+        "_release_windows_handle",
+        fail_new_handle_close,
+    )
+
+    with pytest.raises(ConfigError, match="committed") as caught:
+        apply_managed_config(config_path, catalog_path)
+
+    error = caught.value
+    assert injected == [True]
+    assert getattr(error, "committed", False) is True
+    backup_path = getattr(error, "backup_path", None)
+    assert backup_path is not None
+    assert backup_path.read_bytes() == original
+    assert b'model_provider = "example-provider"' in config_path.read_bytes()
+
+
 def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> None:
     if os.name == "nt":
         pytest.skip("Windows target locking is covered by the OS-level probe")
