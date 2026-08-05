@@ -11,18 +11,21 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .catalog import (
     CatalogValidationError,
     PickerVerificationReceipt,
     load_catalog,
     validate_picker_verification,
+    write_native_catalog,
 )
 
 MANAGED_START = "# >>> codex-model-switcher managed start"
 MANAGED_END = "# <<< codex-model-switcher managed end"
 _CONFIG_LOCKS_GUARD = threading.Lock()
 _CONFIG_LOCKS: dict[Path, object] = {}
+DEFAULT_ROUTER_BASE_URL = "http://127.0.0.1:4317/v1"
 
 
 class ConfigError(RuntimeError):
@@ -1436,9 +1439,12 @@ def _exclusive_path_lock(path: Path, *, create: bool) -> _PathLease:
 def render_managed_config(
     catalog_path: Path,
     *,
+    native_catalog_path: Path | None = None,
+    bundled_catalog_path: Path | None = None,
+    router_base_url: str | None = None,
     verification: PickerVerificationReceipt | None = None,
 ) -> str:
-    """Render only an externally-attested candidate; never endpoint or credentials."""
+    """Render an externally-attested native catalog path and local Router provider."""
 
     try:
         catalog = load_catalog(Path(catalog_path))
@@ -1448,12 +1454,41 @@ def render_managed_config(
         validate_picker_verification(catalog, verification)
     except CatalogValidationError as error:
         raise ConfigError(str(error)) from error
-    catalog_json = json.dumps(catalog.to_mapping(), ensure_ascii=False, separators=(",", ":"))
+    router_base_url = router_base_url or DEFAULT_ROUTER_BASE_URL
+    parsed = urlparse(router_base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ConfigError("router_base_url must be a loopback URL")
+    if bundled_catalog_path is None:
+        raise ConfigError(
+            "bundled_catalog_path is required to preserve official native models"
+        )
+    if native_catalog_path is None:
+        native_catalog_path = Path(catalog_path).with_suffix(".native.json")
+    native_path = Path(native_catalog_path).resolve()
+    try:
+        write_native_catalog(
+            Path(catalog_path),
+            native_path,
+            bundled_catalog_path=bundled_catalog_path,
+        )
+    except CatalogValidationError as error:
+        raise ConfigError(str(error)) from error
     return "\n".join(
         (
             MANAGED_START,
             f"model_provider = {json.dumps(catalog.provider_id, ensure_ascii=False)}",
-            f"model_catalog_json = {json.dumps(catalog_json, ensure_ascii=False)}",
+            f"model_catalog_json = {json.dumps(str(native_path), ensure_ascii=False)}",
+            "",
+            f"[model_providers.{json.dumps(catalog.provider_id, ensure_ascii=False)}]",
+            f"name = {json.dumps(catalog.provider_id, ensure_ascii=False)}",
+            f"base_url = {json.dumps(router_base_url, ensure_ascii=False)}",
+            'wire_api = "responses"',
+            "requires_openai_auth = false",
             MANAGED_END,
         )
     )
@@ -1463,10 +1498,20 @@ def apply_managed_config(
     config_path: Path,
     catalog_path: Path,
     *,
+    native_catalog_path: Path | None = None,
+    bundled_catalog_path: Path | None = None,
+    router_base_url: str | None = None,
     verification: PickerVerificationReceipt | None = None,
 ) -> ConfigReceipt:
     catalog_path = Path(catalog_path)
-    managed_block = render_managed_config(catalog_path, verification=verification)
+    render_kwargs: dict[str, object] = {"verification": verification}
+    if native_catalog_path is not None:
+        render_kwargs["native_catalog_path"] = native_catalog_path
+    if bundled_catalog_path is not None:
+        render_kwargs["bundled_catalog_path"] = bundled_catalog_path
+    if router_base_url is not None:
+        render_kwargs["router_base_url"] = router_base_url
+    managed_block = render_managed_config(catalog_path, **render_kwargs)
     config_path = Path(config_path).resolve()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with _config_lock(config_path):

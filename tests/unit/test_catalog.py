@@ -9,7 +9,9 @@ from codex_model_switcher.catalog import (
     PickerSchemaEvidence,
     PickerVerificationReceipt,
     TrustedPickerVerifier,
+    build_catalog,
     build_catalog_from_model_cache,
+    build_native_catalog,
     catalog_from_mapping,
     load_catalog,
     verify_isolated_picker_contract,
@@ -47,6 +49,157 @@ def test_catalog_generation_reads_client_version_from_model_cache(tmp_path) -> N
     assert catalog["verification_status"] == "UNVERIFIED"
     assert "0.147.0" not in json.dumps(catalog)
     assert catalog["models"][0]["id"] == "cms-example-chat"
+
+
+def test_native_adapter_preserves_internal_route_and_provider_reference() -> None:
+    route = ModelRoute(
+        model_id="cms-deepseek-v4-flash",
+        display_name="DeepSeek V4 Flash API",
+        lane="third_party",
+        provider_id="deepseek",
+        upstream_model="deepseek-v4-flash",
+        capability=ModelCapability(
+            context_window=64_000,
+            supports_responses=True,
+            supports_streaming=True,
+            supports_tools=True,
+            supports_images=False,
+            supports_files=False,
+            supports_compaction_context=False,
+        ),
+    )
+    generated = build_catalog([route], client_version="0.133.0")
+    assert generated["providers"] == [
+        {
+            "provider_id": "deepseek",
+            "model": "deepseek-v4-flash",
+            "wire_api": "chat_completions",
+            "credential_ref": "deepseek",
+        }
+    ]
+    document = catalog_from_mapping(
+        {
+            "schema_version": "route-v1",
+            "client_version": "0.133.0",
+            "provider_id": "codex-model-switcher",
+            "providers": [
+                {
+                    "provider_id": "deepseek",
+                    "model": "deepseek-v4-flash",
+                    "wire_api": "chat_completions",
+                    "credential_ref": "deepseek",
+                }
+            ],
+            "models": [
+                {
+                    "id": route.model_id,
+                    "display_name": route.display_name,
+                    "lane": route.lane,
+                    "provider_id": route.provider_id,
+                    "upstream_model": route.upstream_model,
+                    "capability": {
+                        "context_window": route.capability.context_window,
+                        "supports_responses": route.capability.supports_responses,
+                        "supports_streaming": route.capability.supports_streaming,
+                        "supports_tools": route.capability.supports_tools,
+                        "supports_images": route.capability.supports_images,
+                        "supports_files": route.capability.supports_files,
+                        "supports_compaction_context": route.capability.supports_compaction_context,
+                    },
+                }
+            ],
+        }
+    )
+    native = build_native_catalog(
+        document,
+        bundled_catalog={"models": [_bundled_official_model()]},
+    )
+
+    internal = document.to_mapping()
+    assert internal["providers"] == [
+        {
+            "provider_id": "deepseek",
+            "model": "deepseek-v4-flash",
+            "wire_api": "chat_completions",
+            "credential_ref": "deepseek",
+        }
+    ]
+    deepseek = next(model for model in native["models"] if model["slug"] == route.model_id)
+    assert deepseek["slug"] == "cms-deepseek-v4-flash"
+    assert deepseek["display_name"] == "DeepSeek V4 Flash API"
+    assert "deepseek-chat" not in json.dumps(document.to_mapping())
+    assert "provider_id" not in deepseek
+    assert "credential_ref" not in deepseek
+    assert "chat_completions" not in json.dumps(native)
+
+
+def test_native_adapter_does_not_replace_bundled_official_entry() -> None:
+    internal = catalog_from_mapping(
+        {
+            "schema_version": "route-v1",
+            "client_version": "0.133.0",
+            "provider_id": "codex-model-switcher",
+            "models": [
+                {
+                    "id": "gpt-5.5",
+                    "display_name": "Spoofed Official API",
+                    "lane": "official",
+                    "provider_id": "codex-model-switcher",
+                    "upstream_model": "spoofed-gpt-5.5",
+                    "capability": {
+                        "context_window": 1,
+                        "supports_responses": True,
+                        "supports_streaming": True,
+                        "supports_tools": False,
+                        "supports_images": False,
+                        "supports_files": False,
+                        "supports_compaction_context": False,
+                    },
+                },
+                _route_to_record(),
+            ],
+        }
+    )
+    official = _bundled_official_model()
+    native = build_native_catalog(internal, bundled_catalog={"models": [official]})
+
+    assert native["models"][0] == official
+    assert [model["slug"] for model in native["models"]] == ["gpt-5.5", "cms-example-chat"]
+
+
+def _bundled_official_model() -> dict[str, object]:
+    return {
+        "slug": "gpt-5.5",
+        "display_name": "GPT-5.5",
+        "description": "Bundled official fixture",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 0,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": None,
+        "upgrade": None,
+        "base_instructions": "Bundled official instructions",
+        "model_messages": None,
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "none",
+        "support_verbosity": True,
+        "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "truncation_policy": {"mode": "tokens", "limit": 10_000},
+        "supports_parallel_tool_calls": True,
+        "supports_image_detail_original": True,
+        "context_window": 272_000,
+        "max_context_window": 272_000,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": True,
+    }
 
 
 def test_load_catalog_rejects_a_route_without_complete_capability(tmp_path) -> None:
@@ -90,9 +243,13 @@ def test_isolated_picker_contract_fails_without_current_client_evidence(tmp_path
         ),
         encoding="utf-8",
     )
+    native_path = tmp_path / "native.json"
+    native_path.write_text(
+        json.dumps(build_native_catalog(load_catalog(catalog_path))), encoding="utf-8"
+    )
     (isolated_home / "config.toml").write_text(
         'model_provider = "example-provider"\n'
-        f"model_catalog_json = {json.dumps(catalog_path.read_text(encoding='utf-8'))}\n",
+        f"model_catalog_json = {json.dumps(str(native_path))}\n",
         encoding="utf-8",
     )
 
@@ -115,9 +272,13 @@ def test_isolated_picker_contract_never_claims_native_pass_from_fixture_evidence
         "models": [_route_to_record()],
     }
     catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    native_path = tmp_path / "native.json"
+    native_path.write_text(
+        json.dumps(build_native_catalog(load_catalog(catalog_path))), encoding="utf-8"
+    )
     (isolated_home / "config.toml").write_text(
         'model_provider = "example-provider"\n'
-        f"model_catalog_json = {json.dumps(json.dumps(catalog))}\n",
+        f"model_catalog_json = {json.dumps(str(native_path))}\n",
         encoding="utf-8",
     )
 

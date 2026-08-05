@@ -207,6 +207,72 @@ def test_render_and_apply_reject_without_real_receipt(tmp_path) -> None:
         apply_managed_config(config_path, catalog_path)
 
 
+def test_render_references_native_catalog_file_and_local_router_without_secret(
+    tmp_path, monkeypatch
+) -> None:
+    import codex_model_switcher.config as config_module
+
+    catalog_path = tmp_path / "routes.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+    native_path = tmp_path / "native-models.json"
+    bundled_path = Path(__file__).parents[1] / "fixtures" / "catalogs" / "bundled-native.json"
+    fixture_secret = "fixture-deepseek-secret-never-written"
+    monkeypatch.setattr(config_module, "validate_picker_verification", lambda *_args: None)
+
+    rendered = render_managed_config(
+        catalog_path,
+        native_catalog_path=native_path,
+        bundled_catalog_path=bundled_path,
+        router_base_url="http://127.0.0.1:4317/v1",
+        verification=object(),
+    )
+
+    assert native_path.exists()
+    native = json.loads(native_path.read_text(encoding="utf-8"))
+    assert isinstance(native["models"], list)
+    assert native["models"][0]["slug"] == "gpt-5.5"
+    assert f'model_catalog_json = {json.dumps(str(native_path.resolve()))}' in rendered
+    assert "model_catalog_json = {" not in rendered
+    assert '[model_providers."example-provider"]' in rendered
+    assert 'base_url = "http://127.0.0.1:4317/v1"' in rendered
+    assert 'wire_api = "responses"' in rendered
+    assert "requires_openai_auth = false" in rendered
+    assert fixture_secret not in rendered
+    assert fixture_secret not in native_path.read_text(encoding="utf-8")
+
+
+def test_render_requires_bundled_catalog_to_preserve_official_models(tmp_path, monkeypatch) -> None:
+    import codex_model_switcher.config as config_module
+
+    catalog_path = tmp_path / "routes.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+    monkeypatch.setattr(config_module, "validate_picker_verification", lambda *_args: None)
+
+    with pytest.raises(ConfigError, match="bundled_catalog_path"):
+        render_managed_config(
+            catalog_path,
+            native_catalog_path=tmp_path / "native-models.json",
+            router_base_url="http://127.0.0.1:4317/v1",
+            verification=object(),
+        )
+
+
+def test_render_rejects_non_loopback_router_url(tmp_path, monkeypatch) -> None:
+    import codex_model_switcher.config as config_module
+
+    catalog_path = tmp_path / "routes.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+    monkeypatch.setattr(config_module, "validate_picker_verification", lambda *_args: None)
+
+    with pytest.raises(ConfigError, match="loopback"):
+        render_managed_config(
+            catalog_path,
+            native_catalog_path=tmp_path / "native-models.json",
+            router_base_url="https://api.example.invalid/v1",
+            verification=object(),
+        )
+
+
 def test_apply_without_real_receipt_does_not_create_missing_config(tmp_path) -> None:
     config_path = tmp_path / "missing-config.toml"
     catalog_path = tmp_path / "safe-picker.json"
