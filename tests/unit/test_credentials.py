@@ -17,6 +17,7 @@ from codex_model_switcher.credentials import (
     configure_credential,
     migrate_legacy_catalog,
     resolve_upstream_auth,
+    serialize_catalog,
     serialize_provider_record,
 )
 
@@ -109,7 +110,7 @@ def test_camel_case_sensitive_fields_are_removed_but_safe_labels_remain() -> Non
             "accessToken": secret,
             "apiKey": secret,
             "displayLabel": "display-only",
-            "credentialRef": secret,
+            "credentialRef": "deepseek",
         }
     )
 
@@ -135,6 +136,74 @@ def test_serializer_rejects_explicit_provider_id_mismatch() -> None:
             {"provider_id": "openai"},
             provider_id="deepseek",
         )
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [
+        pytest.param(
+            {"provider_id": "openai", "credential_ref": "deepseek"},
+            id="canonical-id-ref-conflict",
+        ),
+        pytest.param(
+            {"providerId": "openai", "credential_ref": "deepseek"},
+            id="camel-id-canonical-ref-conflict",
+        ),
+        pytest.param(
+            {"provider_id": "openai", "providerId": "deepseek"},
+            id="canonical-camel-id-conflict",
+        ),
+        pytest.param(
+            {"provider_id": "openai", "credential_ref": "openai", "credentialRef": "deepseek"},
+            id="canonical-camel-ref-conflict",
+        ),
+    ],
+)
+def test_serializer_rejects_provider_id_and_credential_ref_conflicts(
+    provider: dict[str, str],
+) -> None:
+    with pytest.raises(ProviderIdError) as error:
+        serialize_provider_record(provider)
+
+    assert error.value.__cause__ is None
+
+
+def test_serializer_rejects_explicit_id_against_camel_case_credential_ref() -> None:
+    with pytest.raises(ProviderIdError) as error:
+        serialize_provider_record(
+            {"credentialRef": "deepseek"},
+            provider_id="openai",
+        )
+
+    assert error.value.__cause__ is None
+
+
+def test_catalog_serializer_rejects_camel_case_provider_id_ref_conflict() -> None:
+    with pytest.raises(ProviderIdError) as error:
+        serialize_catalog(
+            {
+                "providers": [
+                    {"providerId": "openai", "credential_ref": "deepseek"}
+                ]
+            }
+        )
+
+    assert error.value.__cause__ is None
+
+
+def test_serializer_accepts_matching_canonical_and_legacy_id_refs() -> None:
+    record = serialize_provider_record(
+        {
+            "provider_id": "openai",
+            "providerId": "openai",
+            "credential_ref": "openai",
+            "credentialRef": "openai",
+        }
+    )
+
+    assert_secret_equal(record["credential_ref"], "openai")
+    assert "credential_ref" in record
+    assert "credentialRef" not in record
 
 
 def test_memory_fake_satisfies_credential_store_protocol() -> None:

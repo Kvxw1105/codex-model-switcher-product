@@ -580,6 +580,40 @@ def _is_credential_key(key: object) -> bool:
     return _canonical_key(key) in _CREDENTIAL_KEYS
 
 
+def _resolve_provider_reference(
+    provider: Mapping[str, Any],
+    explicit_provider_id: str | None,
+    provider_id_verifier: ProviderIdVerifierSpec,
+) -> str:
+    explicit_id = (
+        validate_provider_id(explicit_provider_id, provider_id_verifier)
+        if explicit_provider_id is not None
+        else None
+    )
+    record_ids: list[str] = []
+    credential_refs: list[str] = []
+    for raw_key, raw_value in provider.items():
+        key = _canonical_key(raw_key)
+        if key in {"provider_id", "id"}:
+            record_ids.append(validate_provider_id(raw_value, provider_id_verifier))
+        elif key == "credential_ref":
+            credential_refs.append(credential_ref(raw_value, provider_id_verifier))
+    if len(set(record_ids)) > 1:
+        raise ProviderIdError("provider IDs do not match")
+    if len(set(credential_refs)) > 1:
+        raise ProviderIdError("credential refs do not match")
+    record_id = record_ids[0] if record_ids else None
+    record_ref = credential_refs[0] if credential_refs else None
+    if explicit_id is not None and record_id is not None and explicit_id != record_id:
+        raise ProviderIdError("provider ID does not match record")
+    if explicit_id is not None and record_ref is not None and explicit_id != record_ref:
+        raise ProviderIdError("credential ref does not match provider ID")
+    if record_id is not None and record_ref is not None and record_id != record_ref:
+        raise ProviderIdError("credential ref does not match provider ID")
+    candidate = explicit_id or record_id or record_ref
+    return credential_ref(candidate, provider_id_verifier)  # type: ignore[arg-type]
+
+
 def _is_url_key(key: object) -> bool:
     return _normal_key(key) in _URL_KEYS
 
@@ -760,24 +794,11 @@ def serialize_provider_record(
 
     if not isinstance(provider, Mapping):
         raise TypeError("provider must be a mapping")
-    explicit_id = (
-        validate_provider_id(provider_id, provider_id_verifier)
-        if provider_id is not None
-        else None
+    reference = _resolve_provider_reference(
+        provider,
+        provider_id,
+        provider_id_verifier,
     )
-    record_ids: list[str] = []
-    for key in ("provider_id", "id"):
-        if key in provider and provider[key] is not None:
-            record_ids.append(validate_provider_id(provider[key], provider_id_verifier))
-    if len(set(record_ids)) > 1:
-        raise ProviderIdError("provider IDs do not match")
-    record_id = record_ids[0] if record_ids else None
-    if explicit_id is not None and record_id is not None and explicit_id != record_id:
-        raise ProviderIdError("provider ID does not match record")
-    candidate = explicit_id or record_id
-    if candidate is None:
-        candidate = provider.get("credential_ref")
-    reference = credential_ref(candidate, provider_id_verifier)  # type: ignore[arg-type]
     result = _sanitize_catalog_value(provider)
     if not isinstance(result, dict):
         raise TypeError("provider must serialize to an object")
