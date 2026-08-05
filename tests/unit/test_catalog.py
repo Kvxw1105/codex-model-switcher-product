@@ -6,7 +6,8 @@ from codex_model_switcher.catalog import (
     CatalogValidationError,
     PickerContractResult,
     PickerSchemaEvidence,
-    PickerVerifier,
+    PickerVerificationReceipt,
+    TrustedPickerVerifier,
     build_catalog_from_model_cache,
     catalog_from_mapping,
     load_catalog,
@@ -158,18 +159,27 @@ def test_only_verifier_issued_receipt_can_be_created_for_apply() -> None:
         "models": [_route_to_record()],
     }
     document = catalog_from_mapping(catalog)
-    verifier = PickerVerifier(
-        lambda candidate: PickerSchemaEvidence(
-            schema_version=candidate.schema_version,
-            client_version=candidate.client_version,
-            source="current-client-runtime",
-        )
-    )
+    class FixtureTrustedVerifier(TrustedPickerVerifier):
+        def _read_current_client_evidence(self, candidate):
+            return PickerSchemaEvidence(
+                schema_version=candidate.schema_version,
+                client_version=candidate.client_version,
+                source="fixture-verifier",
+            )
+
+    verifier = FixtureTrustedVerifier()
 
     receipt = verifier.issue_receipt(document)
 
     assert receipt.schema_version == "picker-v1"
     assert receipt.client_version == "9.9.9"
+    assert not hasattr(PickerVerificationReceipt, "_from_verifier")
+
+
+def test_untrusted_injected_verifier_factory_is_not_exposed() -> None:
+    import codex_model_switcher.catalog as catalog_module
+
+    assert not hasattr(catalog_module, "PickerVerifier")
 def _route_to_record() -> dict[str, object]:
     return {
         "id": "cms-example-chat",

@@ -9,7 +9,8 @@
 - route 的 `model_id`、`provider_id` 和 `upstream_model` 必须是稳定、非空且无空白的标识；display name 必须包含 `Official` 或 `API` lane 标记。
 - 目录生成从调用方提供的模型缓存读取 `client_version`，不会硬编码客户端版本。没有 schema 证据时，候选明确带有 `schema_version: null` 和 `verification_status: UNVERIFIED`；`picker-v1` 不再是默认或通过信号。
 - 配置只写入受管区块中的 `model_provider` 与 `model_catalog_json`。没有写入 upstream URL、Authorization、cookie 或凭据字段。
-- `render_managed_config` 与 `apply_managed_config` 必须收到 `PickerVerifier.issue_receipt` 产生的 `current-client-artifact` capability，并校验私有 HMAC、schema/version 与候选 catalog SHA-256；公开 dataclass 构造会直接失败，缺失真实 verifier receipt 时拒绝 apply。
+- `render_managed_config` 与 `apply_managed_config` 必须收到 `TrustedPickerVerifier.issue_receipt` 产生的 opaque writer capability，并校验 capability 身份、schema/version 与候选 catalog SHA-256；`PickerVerificationReceipt` 没有可调用的构造器或 `_from_verifier` 工厂，缺失真实 verifier receipt 时拒绝 render/apply。
+- `TrustedPickerVerifier` 只是未来真实外部 verifier 的抽象边界，本项目没有 concrete implementation；它不接受调用方注入的 `evidence_provider`。测试中的 fixture subclass 只验证 writer capability seam，进程内 identity token 也不等于当前客户端证据。
 - 受管区块 start/end marker 必须各自独占完整行且恰好一对；marker 出现在用户注释、TOML 字符串、嵌入文本或重复区块时直接拒绝替换。
 - apply 会创建包含写前字节和时间戳的备份，并以同目录临时文件加 `os.replace` 原子替换目标。receipt 保存写前/写后 SHA-256。
 - restore 仅在当前文件仍匹配本项目最后一次写入的 hash 时执行；外部编辑会拒绝覆盖。备份 hash 也必须匹配，恢复结果按字节保留原文件。

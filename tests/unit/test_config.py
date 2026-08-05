@@ -6,7 +6,7 @@ import pytest
 from codex_model_switcher.catalog import (
     PickerSchemaEvidence,
     PickerVerificationReceipt,
-    PickerVerifier,
+    TrustedPickerVerifier,
     catalog_fingerprint,
     load_catalog,
 )
@@ -20,13 +20,15 @@ from codex_model_switcher.config import (
 
 def _verification(catalog_path):
     catalog = load_catalog(catalog_path)
-    verifier = PickerVerifier(
-        lambda candidate: PickerSchemaEvidence(
-            schema_version=candidate.schema_version,
-            client_version=candidate.client_version,
-            source="current-client-runtime",
-        )
-    )
+    class FixtureTrustedVerifier(TrustedPickerVerifier):
+        def _read_current_client_evidence(self, candidate):
+            return PickerSchemaEvidence(
+                schema_version=candidate.schema_version,
+                client_version=candidate.client_version,
+                source="fixture-verifier",
+            )
+
+    verifier = FixtureTrustedVerifier()
     return verifier.issue_receipt(catalog)
 
 
@@ -161,6 +163,26 @@ def test_public_receipt_construction_cannot_authorize_apply(tmp_path) -> None:
             catalog_sha256=catalog_fingerprint(catalog),
             source="current-client-artifact",
         )
+
+
+def test_caller_forged_receipt_is_rejected(tmp_path, monkeypatch) -> None:
+    isolated_home = tmp_path / "isolated-codex-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
+    config_path = isolated_home / "config.toml"
+    config_path.write_bytes(b"model = \"original\"\n")
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+    catalog = load_catalog(catalog_path)
+
+    class CallerForgedReceipt:
+        schema_version = catalog.schema_version
+        client_version = catalog.client_version
+        catalog_sha256 = catalog_fingerprint(catalog)
+        source = "current-client-artifact"
+
+    with pytest.raises(ConfigError, match="verifier-issued|authentic"):
+        apply_managed_config(config_path, catalog_path, verification=CallerForgedReceipt())
 
 
 @pytest.mark.parametrize(
