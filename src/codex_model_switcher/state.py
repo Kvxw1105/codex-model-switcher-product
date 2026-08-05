@@ -7,7 +7,6 @@ configuration receipts, and cancellation metadata needed by an adapter.
 
 from __future__ import annotations
 
-import mmap
 import re
 import shutil
 import sqlite3
@@ -15,6 +14,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import RLock
@@ -30,6 +30,14 @@ class _ColumnSpec:
     primary_key: bool = False
     identifier: bool = False
     timestamp: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _FileFingerprint:
+    exists: bool
+    identity: tuple[int, int] | None
+    size: int | None
+    digest: bytes | None
 
 
 SCHEMA_VERSION = 3
@@ -333,21 +341,124 @@ class StateStore:
             f"quarantined as {quarantine.name}"
         )
 
+    @staticmethod
+    def _fingerprint_file(path: Path) -> _FileFingerprint:
+        try:
+            before = path.stat()
+        except FileNotFoundError:
+            return _FileFingerprint(False, None, None, None)
+
+        digest = sha256()
+        try:
+            with path.open("rb") as database_file:
+                for chunk in iter(lambda: database_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            after = path.stat()
+        except FileNotFoundError as exc:
+            raise DatabaseSnapshotError(
+                f"state database file disappeared while fingerprinting {path.name}"
+            ) from exc
+        if (
+            (before.st_dev, before.st_ino, before.st_size)
+            != (after.st_dev, after.st_ino, after.st_size)
+        ):
+            raise DatabaseSnapshotError(
+                f"state database file changed while fingerprinting {path.name}"
+            )
+        return _FileFingerprint(
+            True,
+            (int(after.st_dev), int(after.st_ino)),
+            int(after.st_size),
+            digest.digest(),
+        )
+
+    def _capture_database_set_fingerprints(self) -> dict[str, _FileFingerprint]:
+        return {
+            suffix: self._fingerprint_file(
+                self.path
+                if not suffix
+                else self.path.with_name(f"{self.path.name}{suffix}")
+            )
+            for suffix in ("", "-wal", "-shm")
+        }
+
+    @staticmethod
+    def _file_identity_and_size(
+        path: Path,
+    ) -> tuple[bool, tuple[int, int] | None, int | None]:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return False, None, None
+        return True, (int(stat.st_dev), int(stat.st_ino)), int(stat.st_size)
+
+    def _capture_initial_database_state(
+        self,
+    ) -> dict[str, _FileFingerprint]:
+        for _attempt in range(SNAPSHOT_COPY_ATTEMPTS):
+            before = self._capture_database_set_fingerprints()
+            after = self._capture_database_set_fingerprints()
+            if before != after:
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS)
+                continue
+            return before
+        raise DatabaseSnapshotError(
+            "state database files changed while capturing the initial evidence point"
+        )
+
+    def _capture_database_set_evidence(
+        self,
+    ) -> tuple[dict[str, _FileFingerprint], dict[str, bytes]]:
+        for _attempt in range(SNAPSHOT_COPY_ATTEMPTS):
+            before = self._capture_database_set_fingerprints()
+            evidence: dict[str, bytes] = {}
+            try:
+                for suffix, fingerprint in before.items():
+                    if not fingerprint.exists:
+                        continue
+                    path = self.path if not suffix else self.path.with_name(
+                        f"{self.path.name}{suffix}"
+                    )
+                    evidence[suffix] = path.read_bytes()
+            except OSError:
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS)
+                continue
+            if any(
+                sha256(evidence[suffix]).digest() != fingerprint.digest
+                for suffix, fingerprint in before.items()
+                if fingerprint.exists
+            ):
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS)
+                continue
+            return before, evidence
+        raise DatabaseSnapshotError(
+            "state database files changed while capturing quarantine evidence"
+        )
+
+    def _write_database_set_evidence(
+        self, destination: Path, evidence: dict[str, bytes]
+    ) -> None:
+        for suffix, content in evidence.items():
+            path = destination / self.path.name
+            if suffix:
+                path = path.with_name(f"{path.name}{suffix}")
+            path.write_bytes(content)
+
     def _verify_existing_before_write(self) -> None:
         source: sqlite3.Connection | None = None
         snapshot: sqlite3.Connection | None = None
+        source_preflight_started = False
+        initial_fingerprints: dict[str, _FileFingerprint] | None = None
         with TemporaryDirectory(prefix=".state-preflight-", dir=self.path.parent) as directory:
             snapshot_dir = Path(directory) / "snapshot"
             evidence_dir = Path(directory) / "evidence"
             snapshot_dir.mkdir()
             evidence_dir.mkdir()
-            original_shm: bytes | None = None
-            original_shm_present = False
             try:
-                shm_path = self.path.with_name(f"{self.path.name}-shm")
-                original_shm_present = shm_path.exists()
-                if original_shm_present:
-                    original_shm = shm_path.read_bytes()
+                try:
+                    initial_fingerprints = self._capture_initial_database_state()
+                except (OSError, DatabaseSnapshotError):
+                    initial_fingerprints = None
                 source_path = self.path.resolve()
                 self._validate_database_sidecars(source_path.parent)
                 with source_path.open("rb") as database_file:
@@ -355,6 +466,7 @@ class StateStore:
                         raise DatabaseSnapshotError("state database header is invalid")
                 read_only_uri = f"{source_path.as_uri()}?mode=ro"
                 source = sqlite3.connect(read_only_uri, uri=True, timeout=30.0)
+                source_preflight_started = True
                 source.execute("BEGIN")
                 result = source.execute("PRAGMA integrity_check").fetchone()
                 if not result or str(result[0]).lower() != "ok":
@@ -390,15 +502,104 @@ class StateStore:
                     with suppress(sqlite3.Error):
                         source.close()
                     source = None
+                preflight_fingerprints: dict[str, _FileFingerprint] | None = None
+                preflight_evidence: dict[str, bytes] | None = None
+                if source_preflight_started:
+                    try:
+                        preflight_fingerprints, preflight_evidence = (
+                            self._capture_database_set_evidence()
+                        )
+                    except (OSError, DatabaseSnapshotError) as fingerprint_error:
+                        failure = DatabaseSnapshotError(
+                            "state database files could not be fingerprinted after "
+                            "read-only preflight"
+                        )
+                        failure.__cause__ = fingerprint_error
+
+                recovery_lock: sqlite3.Connection | None = None
+                quarantine_source_directory: Path | None = None
                 try:
-                    self._restore_read_only_shm(original_shm_present, original_shm)
-                except OSError as restore_error:
-                    failure = DatabaseSnapshotError(
-                        "state database shm sidecar could not be restored after "
-                        "read-only preflight"
-                    )
-                    failure.__cause__ = restore_error
-                quarantine = self._quarantine_existing()
+                    if preflight_evidence is not None:
+                        self._write_database_set_evidence(evidence_dir, preflight_evidence)
+                        quarantine_source_directory = evidence_dir
+                    if (
+                        source_preflight_started
+                        and preflight_fingerprints is not None
+                    ):
+                        try:
+                            recovery_lock = sqlite3.connect(
+                                self.path,
+                                timeout=30.0,
+                                isolation_level=None,
+                                check_same_thread=False,
+                            )
+                            recovery_lock.execute("BEGIN IMMEDIATE")
+                            locked_main_wal = {
+                                suffix: self._fingerprint_file(
+                                    self.path
+                                    if not suffix
+                                    else self.path.with_name(f"{self.path.name}{suffix}")
+                                )
+                                for suffix in ("", "-wal")
+                            }
+                            shm_path = self.path.with_name(f"{self.path.name}-shm")
+                            # The writer lock can hold the WAL-index against raw
+                            # reads on Windows.  The SHM digest was verified when
+                            # preflight_evidence was captured; at the lock point
+                            # compare identity/size and never write an old index.
+                            locked_shm = self._file_identity_and_size(shm_path)
+                            main_wal_unchanged = (
+                                initial_fingerprints is None
+                                or all(
+                                    initial_fingerprints[suffix]
+                                    == locked_main_wal[suffix]
+                                    for suffix in ("", "-wal")
+                                )
+                            )
+                            live_main_wal_unchanged = all(
+                                preflight_fingerprints[suffix] == locked_main_wal[suffix]
+                                for suffix in ("", "-wal")
+                            )
+                            live_shm_identity_unchanged = (
+                                preflight_fingerprints["-shm"].exists == locked_shm[0]
+                                and preflight_fingerprints["-shm"].identity
+                                == locked_shm[1]
+                                and preflight_fingerprints["-shm"].size == locked_shm[2]
+                            )
+                            live_set_unchanged = (
+                                live_main_wal_unchanged
+                                and live_shm_identity_unchanged
+                            )
+                            if not live_set_unchanged:
+                                failure = DatabaseSnapshotError(
+                                    "state database changed during preflight; "
+                                    "live evidence was preserved"
+                                )
+                                quarantine_source_directory = None
+                            elif not main_wal_unchanged:
+                                failure = DatabaseSnapshotError(
+                                    "state database changed during preflight; "
+                                    "live evidence was preserved"
+                                )
+                            if not live_main_wal_unchanged:
+                                quarantine_source_directory = None
+                        except (
+                            OSError,
+                            sqlite3.Error,
+                            DatabaseSnapshotError,
+                        ) as recovery_error:
+                            failure = DatabaseSnapshotError(
+                                "state database writer lock/fingerprint validation failed; "
+                                "live evidence was preserved"
+                            )
+                            failure.__cause__ = recovery_error
+                    quarantine = self._quarantine_existing(quarantine_source_directory)
+                finally:
+                    if recovery_lock is not None:
+                        with suppress(sqlite3.DatabaseError):
+                            recovery_lock.rollback()
+                        with suppress(sqlite3.DatabaseError):
+                            recovery_lock.close()
                 raise DatabaseCorruptionError(
                     "existing state database snapshot/schema validation failed: "
                     f"{failure}; "
@@ -411,35 +612,6 @@ class StateStore:
                 if source is not None:
                     with suppress(sqlite3.Error):
                         source.close()
-
-    def _restore_read_only_shm(
-        self, originally_present: bool, original_shm: bytes | None
-    ) -> None:
-        shm_path = self.path.with_name(f"{self.path.name}-shm")
-        if not originally_present:
-            if shm_path.exists():
-                shm_path.unlink()
-            return
-        if original_shm is None:
-            raise OSError("original shm evidence is unavailable")
-        if not shm_path.exists():
-            raise OSError("original shm sidecar disappeared during preflight")
-        if shm_path.stat().st_size != len(original_shm):
-            raise OSError("original shm sidecar size changed during preflight")
-        if shm_path.read_bytes() == original_shm:
-            return
-        # SQLite keeps the WAL-index mapped and may deny ordinary writes to the
-        # sidecar while another connection is alive.  Writing the saved bytes
-        # through the existing mapping restores only the read marks touched by
-        # this read-only preflight without replacing or truncating the file.
-        with shm_path.open("r+b") as sidecar:
-            mapped = mmap.mmap(sidecar.fileno(), 0, access=mmap.ACCESS_WRITE)
-            try:
-                mapped.seek(0)
-                mapped.write(original_shm)
-                mapped.flush()
-            finally:
-                mapped.close()
 
     def _copy_database_set(self, destination: Path) -> None:
         failures: dict[str, DatabaseSnapshotError] = {}

@@ -305,20 +305,22 @@ def test_legacy_and_v2_semantic_values_are_quarantined_before_writes(
         with pytest.raises(DatabaseCorruptionError, match=error_pattern):
             StateStore(path, secret_key_provider)
 
-        assert connection_modes == ["ro"]
+        assert connection_modes == ["ro", "writable"]
         assert operation_order
         assert operation_order[0] == "quarantine_file_copy"
         assert "file_snapshot" not in operation_order
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
-        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        assert sidecars["-shm"].stat().st_size == len(evidence["-shm"])
         quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
         quarantine_main = next(
             item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
         )
         assert quarantine_main.read_bytes() == evidence[""]
         assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
-        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").stat().st_size == len(
+            evidence["-shm"]
+        )
     finally:
         seed.close()
 
@@ -604,17 +606,19 @@ def test_v1_invalid_config_sha256_is_quarantined_before_migration_writes(
         with pytest.raises(DatabaseCorruptionError, match="config_sha256"):
             StateStore(path, secret_key_provider)
 
-        assert connection_modes == ["ro"]
+        assert connection_modes == ["ro", "writable"]
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
-        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        assert sidecars["-shm"].stat().st_size == len(evidence["-shm"])
         quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
         quarantine_main = next(
             item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
         )
         assert quarantine_main.read_bytes() == evidence[""]
         assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
-        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").stat().st_size == len(
+            evidence["-shm"]
+        )
     finally:
         seed.close()
 
@@ -730,17 +734,19 @@ def test_v1_incomplete_schema_is_quarantined_before_writable_snapshot(
         with pytest.raises(DatabaseCorruptionError, match="schema"):
             StateStore(path, secret_key_provider)
 
-        assert connection_modes == ["ro"]
+        assert connection_modes == ["ro", "writable"]
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
-        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        assert sidecars["-shm"].stat().st_size == len(evidence["-shm"])
         quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
         quarantine_main = next(
             item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
         )
         assert quarantine_main.read_bytes() == evidence[""]
         assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
-        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").stat().st_size == len(
+            evidence["-shm"]
+        )
     finally:
         seed.close()
 
@@ -891,17 +897,19 @@ def test_v2_compact_boundary_semantics_are_quarantined_before_writes(
         with pytest.raises(DatabaseCorruptionError, match="compact boundary"):
             StateStore(path, secret_key_provider)
 
-        assert connection_modes == ["ro"]
+        assert connection_modes == ["ro", "writable"]
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
-        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        assert sidecars["-shm"].stat().st_size == len(evidence["-shm"])
         quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
         quarantine_main = next(
             item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
         )
         assert quarantine_main.read_bytes() == evidence[""]
         assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
-        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").stat().st_size == len(
+            evidence["-shm"]
+        )
     finally:
         seed.close()
 
@@ -951,10 +959,12 @@ def test_incomplete_v3_schema_is_quarantined_before_first_write(
         )
         assert quarantine_main.read_bytes() == evidence[""]
         assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
-        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").stat().st_size == len(
+            evidence["-shm"]
+        )
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
-        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        assert sidecars["-shm"].stat().st_size == len(evidence["-shm"])
     finally:
         seed.close()
 
@@ -1067,17 +1077,19 @@ def test_v3_compact_boundary_sequence_is_required_and_validated(
         with pytest.raises(DatabaseCorruptionError, match=error_pattern):
             StateStore(path, secret_key_provider)
 
-        assert connection_modes == ["ro"]
+        assert connection_modes == ["ro", "writable"]
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
-        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        assert sidecars["-shm"].stat().st_size == len(evidence["-shm"])
         quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
         quarantine_main = next(
             item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
         )
         assert quarantine_main.read_bytes() == evidence[""]
         assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
-        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").stat().st_size == len(
+            evidence["-shm"]
+        )
     finally:
         seed.close()
 
@@ -1136,17 +1148,19 @@ def test_incomplete_v2_schema_is_quarantined_before_wal_setup(
         with pytest.raises(DatabaseCorruptionError, match="schema"):
             StateStore(path, secret_key_provider)
 
-        assert connection_modes == ["ro"]
+        assert connection_modes == ["ro", "writable"]
         quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
         quarantine_main = next(
             item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
         )
         assert quarantine_main.read_bytes() == evidence[""]
         assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
-        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").stat().st_size == len(
+            evidence["-shm"]
+        )
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
-        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        assert sidecars["-shm"].stat().st_size == len(evidence["-shm"])
     finally:
         seed.close()
 
@@ -1858,6 +1872,84 @@ def test_open_failure_closes_connection_before_quarantine(
         )
     finally:
         seed.close()
+
+
+def test_preflight_failure_preserves_writer_commit_and_quarantine_evidence(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    initial = StateStore(path, secret_key_provider)
+    initial.link_response(
+        "local-1", "upstream-1", route_id="chat", codex_task_id="task-1"
+    )
+    initial.close()
+
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE writer_marker (value BLOB NOT NULL)")
+        writer.execute("INSERT INTO writer_marker VALUES (?)", (b"fixture",))
+        writer.commit()
+        quarantine_main_paths: list[Path] = []
+        original_quarantine = StateStore._quarantine_existing
+
+        def fail_after_writer_commit(connection: sqlite3.Connection) -> None:
+            writer.execute(
+                "INSERT INTO response_links VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("local-2", "upstream-2", "chat", 2, "task-1", None, 2),
+            )
+            writer.execute(
+                "UPDATE event_counters SET value = 2 WHERE counter_name = 'state'"
+            )
+            writer.commit()
+            raise DatabaseCorruptionError("injected preflight failure")
+
+        def quarantine_after_failure(store: StateStore, *args, **kwargs):
+            assert store._connection is None
+            quarantine = original_quarantine(store, *args, **kwargs)
+            quarantine_main_paths.append(quarantine)
+            return quarantine
+
+        monkeypatch.setattr(
+            StateStore, "_validate_schema", staticmethod(fail_after_writer_commit)
+        )
+        monkeypatch.setattr(StateStore, "_quarantine_existing", quarantine_after_failure)
+
+        with pytest.raises(
+            DatabaseCorruptionError, match="snapshot/schema validation"
+        ) as error:
+            StateStore(path, secret_key_provider)
+        assert "live evidence was preserved" in str(error.value)
+
+        quarantine_main = quarantine_main_paths[0]
+        live_connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            assert live_connection.execute(
+                "SELECT upstream_response_id FROM response_links "
+                "WHERE local_response_id = 'local-2'"
+            ).fetchone() == ("upstream-2",)
+        finally:
+            live_connection.close()
+        quarantine_connection = sqlite3.connect(
+            f"{quarantine_main.as_uri()}?mode=ro", uri=True
+        )
+        try:
+            assert quarantine_connection.execute(
+                "SELECT upstream_response_id FROM response_links "
+                "WHERE local_response_id = 'local-2'"
+            ).fetchone() == ("upstream-2",)
+        finally:
+            quarantine_connection.close()
+    finally:
+        writer.close()
+
+    monkeypatch.undo()
+    reopened = StateStore(path, secret_key_provider)
+    try:
+        assert reopened.get_response_link("local-2").upstream_id == "upstream-2"
+    finally:
+        reopened.close()
 
 
 def test_concurrent_stores_can_commit_without_losing_links(tmp_path, secret_key_provider) -> None:
