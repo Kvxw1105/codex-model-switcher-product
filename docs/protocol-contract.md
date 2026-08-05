@@ -9,10 +9,10 @@
 - route 的 `model_id`、`provider_id` 和 `upstream_model` 必须是稳定、非空且无空白的标识；display name 必须包含 `Official` 或 `API` lane 标记。
 - 目录生成从调用方提供的模型缓存读取 `client_version`，不会硬编码客户端版本。没有 schema 证据时，候选明确带有 `schema_version: null` 和 `verification_status: UNVERIFIED`；`picker-v1` 不再是默认或通过信号。
 - 配置只写入受管区块中的 `model_provider` 与 `model_catalog_json`。没有写入 upstream URL、Authorization、cookie 或凭据字段。
-- `render_managed_config` 与 `apply_managed_config` 只接受由模块内部可信流程登记的 opaque writer capability；验证同时要求 receipt 对象本身属于私有 identity registry，并校验 schema/version 与候选 catalog SHA-256。`PickerVerificationReceipt` 没有可调用的构造器、`_from_verifier` 或 `issue_receipt` 路径；当前没有真实 receipt 时 render/apply 必须拒绝。
+- `render_managed_config` 与 `apply_managed_config` 只接受由模块内部可信流程登记的 opaque writer capability；验证同时要求 receipt 对象本身的 `id` 命中私有 identity registry、registry 的 `weakref.ref(receipt) is receipt`，并校验 registry 封存字段与候选 catalog SHA-256。`PickerVerificationReceipt` 没有 public/protected 构造器、`_from_verifier` 或 `issue_receipt` 路径；当前没有真实 receipt 时 render/apply 必须拒绝。
 - `TrustedPickerVerifier` 只是未来真实外部 verifier 的证据读取抽象，本项目没有 concrete implementation，也不接受调用方注入 `evidence_provider`，更不会从 untrusted subclass/provider 生成 receipt。私有 registry 不是当前客户端证据，且不向 caller 暴露 registry/seal。
 - 受管区块 start/end marker 必须各自独占完整行且恰好一对；marker 出现在用户注释、TOML 字符串、嵌入文本或重复区块时直接拒绝替换。
-- apply 会创建包含写前字节和时间戳的备份，并以同目录临时文件加 `os.replace` 原子替换目标。receipt 保存写前/写后 SHA-256。
+- apply 会在首次读取到 `os.replace` 之间持有同路径进程锁，并在临时文件替换前用原始字节做 compare-and-swap；发现并发编辑会拒绝覆盖。成功 apply 才创建包含写前字节和时间戳的备份，并以同目录临时文件加 `os.replace` 原子替换目标。receipt 保存写前/写后 SHA-256。
 - restore 仅在当前文件仍匹配本项目最后一次写入的 hash 时执行；外部编辑会拒绝覆盖。备份 hash 也必须匹配，恢复结果按字节保留原文件。
 
 ## Gate 1：当前客户端原生 picker
@@ -28,7 +28,7 @@
 3. `model_catalog_json` 是与候选目录相同的 JSON；
 4. 记录调用方提供的不含隐私的候选 schema/version 来源，但不把该字段当作当前客户端通过信号。
 
-缺少真实外部 receipt 时结果明确为 `FAIL / UNVERIFIED`，即使本地配置语法正确也不能宣称 Gate 1 通过。本测试只验证无 receipt 拒绝、伪造对象拒绝和低层 managed-block 字节行为；没有 in-memory receipt 冒充 picker 证据，也没有真实客户端启动、付费模型请求或 endpoint 猜测。进程内 capability/测试 seam 永远不等于 Gate 1 证据。
+缺少真实外部 receipt 时结果明确为 `FAIL / UNVERIFIED`，即使本地配置语法正确也不能宣称 Gate 1 通过。`_register_receipt_for_registry_test` 只登记一个供 clone/identity contract 使用的内部测试对象，不进入 render/apply，也不代表 picker 证据；没有真实客户端启动、付费模型请求或 endpoint 猜测。进程内 capability/测试 seam 永远不等于 Gate 1 证据。
 
 ## app-server、turn 边界与 compact
 

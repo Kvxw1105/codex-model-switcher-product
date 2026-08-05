@@ -1,3 +1,4 @@
+import copy
 import json
 
 import pytest
@@ -196,6 +197,25 @@ def test_object_new_receipt_copy_is_rejected() -> None:
         object.__setattr__(forged, field_name, value)
 
     assert forged._is_authentic() is False
+
+
+def test_registered_receipt_clones_are_rejected_by_identity_registry() -> None:
+    import codex_model_switcher.catalog as catalog_module
+
+    receipt = catalog_module._register_receipt_for_registry_test(
+        schema_version="picker-v1",
+        client_version="9.9.9",
+        catalog_sha256="0" * 64,
+    )
+    clones = [copy.copy(receipt), copy.deepcopy(receipt)]
+    object_clone = object.__new__(PickerVerificationReceipt)
+    for field_name in ("schema_version", "client_version", "catalog_sha256", "source"):
+        object.__setattr__(object_clone, field_name, getattr(receipt, field_name))
+    clones.append(object_clone)
+
+    assert receipt._is_authentic() is True
+    assert all(clone is not receipt for clone in clones)
+    assert all(clone._is_authentic() is False for clone in clones)
 
 
 def _route_to_record() -> dict[str, object]:

@@ -26,6 +26,7 @@ class CatalogValidationError(ValueError):
 
 
 _RECEIPT_SOURCE = "current-client-artifact"
+_REGISTRY_TEST_SOURCE = "registry-test"
 
 
 @dataclass(frozen=True)
@@ -90,12 +91,19 @@ class PickerVerificationReceipt:
                 self.client_version,
                 self.catalog_sha256,
             )
-            return (
-                self.source == _RECEIPT_SOURCE
-                and _is_registered_receipt(self)
-            )
+            return _is_registered_receipt(self)
         except (AttributeError, TypeError, ValueError):
             return False
+
+
+@dataclass(frozen=True)
+class _ReceiptRegistryEntry:
+    receipt_ref: weakref.ReferenceType[PickerVerificationReceipt]
+    schema_version: str
+    client_version: str
+    catalog_sha256: str
+    source: str
+    guard: object
 
 
 class TrustedPickerVerifier(ABC):
@@ -117,18 +125,78 @@ class TrustedPickerVerifier(ABC):
         raise NotImplementedError
 
 
-def _make_receipt_registry_checker():
-    """Keep the registration set private; this build has no issuing flow."""
+def _make_receipt_registry():
+    """Keep id-keyed registration state private to trusted module flows."""
 
-    registered: weakref.WeakSet[PickerVerificationReceipt] = weakref.WeakSet()
+    entries: dict[int, _ReceiptRegistryEntry] = {}
+    guard = object()
+
+    def register(receipt: PickerVerificationReceipt, guard_token: object) -> None:
+        if guard_token is not guard:
+            raise TypeError("receipt registration requires the internal guard")
+        if type(receipt) is not PickerVerificationReceipt:
+            raise TypeError("only an exact PickerVerificationReceipt can be registered")
+        receipt_id = id(receipt)
+        existing = entries.get(receipt_id)
+        if existing is not None and existing.receipt_ref() is not None:
+            raise ValueError("receipt identity is already registered")
+
+        receipt_ref: weakref.ReferenceType[PickerVerificationReceipt]
+
+        def remove_entry(reference: weakref.ReferenceType[PickerVerificationReceipt]) -> None:
+            current = entries.get(receipt_id)
+            if current is not None and current.receipt_ref is reference:
+                entries.pop(receipt_id, None)
+
+        receipt_ref = weakref.ref(receipt, remove_entry)
+        entries[receipt_id] = _ReceiptRegistryEntry(
+            receipt_ref=receipt_ref,
+            schema_version=receipt.schema_version,
+            client_version=receipt.client_version,
+            catalog_sha256=receipt.catalog_sha256,
+            source=receipt.source,
+            guard=guard,
+        )
+
+    def register_test_receipt(receipt: PickerVerificationReceipt) -> None:
+        if receipt.source != _REGISTRY_TEST_SOURCE:
+            raise ValueError("registry test receipts cannot impersonate client evidence")
+        register(receipt, guard)
 
     def is_registered(receipt: PickerVerificationReceipt) -> bool:
-        return receipt in registered
+        entry = entries.get(id(receipt))
+        if entry is None or entry.receipt_ref() is not receipt:
+            return False
+        return (
+            entry.guard is guard
+            and entry.schema_version == receipt.schema_version
+            and entry.client_version == receipt.client_version
+            and entry.catalog_sha256 == receipt.catalog_sha256
+            and entry.source == receipt.source
+        )
 
-    return is_registered
+    return register_test_receipt, is_registered
 
 
-_is_registered_receipt = _make_receipt_registry_checker()
+_register_test_receipt, _is_registered_receipt = _make_receipt_registry()
+
+
+def _register_receipt_for_registry_test(
+    *,
+    schema_version: str,
+    client_version: str,
+    catalog_sha256: str,
+) -> PickerVerificationReceipt:
+    """Create only a registry-contract object; never use it as picker evidence."""
+
+    _validate_receipt_fields(schema_version, client_version, catalog_sha256)
+    receipt = object.__new__(PickerVerificationReceipt)
+    object.__setattr__(receipt, "schema_version", schema_version)
+    object.__setattr__(receipt, "client_version", client_version)
+    object.__setattr__(receipt, "catalog_sha256", catalog_sha256)
+    object.__setattr__(receipt, "source", _REGISTRY_TEST_SOURCE)
+    _register_test_receipt(receipt)
+    return receipt
 
 
 def _validate_receipt_fields(
@@ -387,7 +455,11 @@ def validate_picker_verification(
         raise CatalogValidationError(
             "cannot apply an UNVERIFIED catalog without current-client-artifact evidence"
         )
-    if type(verification) is not PickerVerificationReceipt or not verification._is_authentic():
+    if (
+        type(verification) is not PickerVerificationReceipt
+        or not verification._is_authentic()
+        or verification.source != _RECEIPT_SOURCE
+    ):
         raise CatalogValidationError("verification must be an authentic verifier-issued receipt")
     if catalog.schema_version is None:
         raise CatalogValidationError(

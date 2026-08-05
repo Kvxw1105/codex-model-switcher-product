@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,8 @@ from .catalog import (
 
 MANAGED_START = "# >>> codex-model-switcher managed start"
 MANAGED_END = "# <<< codex-model-switcher managed end"
+_CONFIG_LOCKS_GUARD = threading.Lock()
+_CONFIG_LOCKS: dict[Path, object] = {}
 
 
 class ConfigError(RuntimeError):
@@ -71,7 +74,20 @@ def apply_managed_config(
     verification: PickerVerificationReceipt | None = None,
 ) -> ConfigReceipt:
     config_path = Path(config_path).resolve()
-    catalog_path = Path(catalog_path)
+    with _config_lock(config_path):
+        return _apply_managed_config_locked(
+            config_path,
+            Path(catalog_path),
+            verification=verification,
+        )
+
+
+def _apply_managed_config_locked(
+    config_path: Path,
+    catalog_path: Path,
+    *,
+    verification: PickerVerificationReceipt | None,
+) -> ConfigReceipt:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         original = config_path.read_bytes() if config_path.exists() else b""
@@ -79,14 +95,16 @@ def apply_managed_config(
     except (OSError, UnicodeDecodeError) as error:
         raise ConfigError("config must be readable UTF-8 bytes") from error
 
+    managed_block = render_managed_config(catalog_path, verification=verification)
+    rendered = _replace_or_append_managed_block(original_text, managed_block)
+    written = rendered.encode("utf-8")
+    _assert_current_bytes(config_path, original)
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_path = config_path.with_name(f"{config_path.name}.bak.{timestamp}")
     _atomic_write(backup_path, original)
     try:
-        managed_block = render_managed_config(catalog_path, verification=verification)
-        rendered = _replace_or_append_managed_block(original_text, managed_block)
-        written = rendered.encode("utf-8")
-        _atomic_write(config_path, written)
+        _atomic_write(config_path, written, expected=original)
     except Exception:
         backup_path.unlink(missing_ok=True)
         raise
@@ -210,7 +228,25 @@ def _skip_toml_single_line_string(line: str, start: int) -> int:
     return len(line)
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
+def _config_lock(path: Path) -> object:
+    with _CONFIG_LOCKS_GUARD:
+        lock = _CONFIG_LOCKS.get(path)
+        if lock is None:
+            lock = threading.RLock()
+            _CONFIG_LOCKS[path] = lock
+        return lock
+
+
+def _assert_current_bytes(path: Path, expected: bytes) -> None:
+    try:
+        current = path.read_bytes() if path.exists() else b""
+    except OSError as error:
+        raise ConfigError("config became unavailable during apply") from error
+    if current != expected:
+        raise ConfigChangedError("config changed during apply; refusing overwrite")
+
+
+def _atomic_write(path: Path, data: bytes, *, expected: bytes | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
@@ -223,6 +259,8 @@ def _atomic_write(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+        if expected is not None:
+            _assert_current_bytes(path, expected)
         os.replace(temporary_path, path)
     finally:
         temporary_path.unlink(missing_ok=True)

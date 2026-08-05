@@ -118,6 +118,44 @@ def test_render_and_apply_reject_without_real_receipt(tmp_path) -> None:
         apply_managed_config(config_path, catalog_path)
 
 
+def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> None:
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_bytes(b'model = "original"\n')
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    external = b'model = "edited concurrently"\n'
+    real_atomic_write = config_module._atomic_write
+
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+
+    def racing_atomic_write(path, data, *, expected=None):
+        if expected is not None and path.resolve() == config_path.resolve():
+            config_path.write_bytes(external)
+        if expected is None:
+            return real_atomic_write(path, data)
+        return real_atomic_write(path, data, expected=expected)
+
+    monkeypatch.setattr(config_module, "_atomic_write", racing_atomic_write)
+
+    with pytest.raises(ConfigChangedError, match="changed"):
+        apply_managed_config(config_path, catalog_path)
+
+    assert config_path.read_bytes() == external
+
+
 def test_public_receipt_construction_cannot_authorize_apply(tmp_path) -> None:
     catalog_path = tmp_path / "safe-picker.json"
     catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
