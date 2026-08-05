@@ -27,6 +27,47 @@ MAX_CONTEXT_FRAGMENT_CHARS = 64 * 1024
 SNAPSHOT_COPY_ATTEMPTS = 4
 SNAPSHOT_COPY_DELAY_SECONDS = 0.01
 SQLITE_HEADER = b"SQLite format 3\x00"
+REQUIRED_SCHEMA_COLUMNS = {
+    "route_selections": {
+        "selection_id",
+        "codex_task_id",
+        "turn_id",
+        "route_id",
+        "selected_at",
+    },
+    "response_links": {
+        "local_response_id",
+        "upstream_response_id",
+        "route_id",
+        "created_at",
+        "codex_task_id",
+        "expires_at",
+        "event_sequence",
+    },
+    "context_fragments": {
+        "fragment_id",
+        "scope_id",
+        "ciphertext",
+        "created_at",
+        "expires_at",
+        "event_sequence",
+    },
+    "config_receipts": {"receipt_id", "config_sha256", "created_at"},
+    "cancel_handles": {
+        "handle_id",
+        "codex_task_id",
+        "route_id",
+        "created_at",
+        "expires_at",
+    },
+    "compact_boundaries": {
+        "codex_task_id",
+        "boundary_response_id",
+        "boundary_created_at",
+        "boundary_event_sequence",
+    },
+    "event_counters": {"counter_name", "value"},
+}
 T = TypeVar("T")
 _DATABASE_INIT_LOCK = RLock()
 
@@ -41,6 +82,10 @@ class DatabaseCorruptionError(StateError):
 
 class DatabaseSnapshotError(DatabaseCorruptionError):
     """Raised when a consistent database snapshot cannot be captured."""
+
+
+class DatabaseSchemaError(DatabaseCorruptionError):
+    """Raised when the database schema is incomplete or inconsistent."""
 
 
 class UnsupportedSchemaError(StateError):
@@ -143,8 +188,15 @@ class StateStore:
                 self._configure_connection()
                 self._verify_integrity()
                 self._migrate()
-            except DatabaseCorruptionError:
+                self._validate_schema(self._require_connection())
+            except DatabaseCorruptionError as exc:
                 self.close()
+                if existed:
+                    quarantine = self._quarantine_existing()
+                    raise DatabaseCorruptionError(
+                        "existing state database schema validation failed; "
+                        f"quarantined as {quarantine.name}"
+                    ) from exc
                 raise
             except UnsupportedSchemaError:
                 self.close()
@@ -188,23 +240,23 @@ class StateStore:
         source: sqlite3.Connection | None = None
         snapshot: sqlite3.Connection | None = None
         with TemporaryDirectory(prefix=".state-preflight-", dir=self.path.parent) as directory:
+            source_dir = Path(directory) / "source"
             snapshot_dir = Path(directory) / "snapshot"
             evidence_dir = Path(directory) / "evidence"
+            source_dir.mkdir()
             snapshot_dir.mkdir()
             evidence_dir.mkdir()
             evidence_captured = False
             try:
                 self._copy_database_set(evidence_dir)
                 evidence_captured = True
-                with self.path.open("rb") as database_file:
+                self._clone_database_set(evidence_dir, source_dir)
+                source_path = source_dir / self.path.name
+                with source_path.open("rb") as database_file:
                     if database_file.read(len(SQLITE_HEADER)) != SQLITE_HEADER:
                         raise DatabaseSnapshotError("state database header is invalid")
-                source = sqlite3.connect(
-                    self.path,
-                    timeout=30.0,
-                    isolation_level=None,
-                    check_same_thread=False,
-                )
+                read_only_uri = f"{source_path.as_uri()}?mode=ro"
+                source = sqlite3.connect(read_only_uri, uri=True, timeout=30.0)
                 source.execute("BEGIN")
                 snapshot_path = snapshot_dir / self.path.name
                 snapshot = sqlite3.connect(snapshot_path)
@@ -212,11 +264,16 @@ class StateStore:
                 result = snapshot.execute("PRAGMA integrity_check").fetchone()
                 if not result or str(result[0]).lower() != "ok":
                     raise sqlite3.DatabaseError("state database integrity check failed")
+                snapshot_version = int(
+                    snapshot.execute("PRAGMA user_version").fetchone()[0]
+                )
+                if snapshot_version == SCHEMA_VERSION:
+                    self._validate_schema(snapshot)
                 snapshot.close()
                 snapshot = None
                 source.close()
                 source = None
-            except (OSError, sqlite3.Error, DatabaseSnapshotError) as original_error:
+            except (OSError, sqlite3.Error, DatabaseCorruptionError) as original_error:
                 failure = original_error
                 if snapshot is not None:
                     snapshot.close()
@@ -233,7 +290,7 @@ class StateStore:
                         failure = evidence_error
                 quarantine = self._quarantine_existing(evidence_dir)
                 raise DatabaseCorruptionError(
-                    "existing state database snapshot failed; "
+                    "existing state database snapshot/schema validation failed; "
                     f"quarantined as {quarantine.name}"
                 ) from failure
             finally:
@@ -249,6 +306,14 @@ class StateStore:
             )
             if source.exists():
                 self._copy_file_with_retry(source, destination / source.name)
+
+    def _clone_database_set(self, source_directory: Path, destination: Path) -> None:
+        for sidecar_suffix in ("", "-wal", "-shm"):
+            source = source_directory / self.path.name
+            if sidecar_suffix:
+                source = source.with_name(f"{source.name}{sidecar_suffix}")
+            if source.exists():
+                shutil.copyfile(source, destination / source.name)
 
     @staticmethod
     def _copy_file_with_retry(source: Path, destination: Path) -> None:
@@ -317,6 +382,37 @@ class StateStore:
                 raise
 
     @staticmethod
+    def _validate_schema(connection: sqlite3.Connection) -> None:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != SCHEMA_VERSION:
+            raise DatabaseSchemaError(
+                f"state database schema version {version} is not {SCHEMA_VERSION}"
+            )
+        missing: list[str] = []
+        for table, required_columns in REQUIRED_SCHEMA_COLUMNS.items():
+            columns = {
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if not columns:
+                missing.append(f"table {table}")
+                continue
+            for column in sorted(required_columns - columns):
+                missing.append(f"{table}.{column}")
+            if (
+                table == "event_counters"
+                and required_columns <= columns
+                and connection.execute(
+                    "SELECT 1 FROM event_counters WHERE counter_name = 'state'"
+                ).fetchone()
+                is None
+            ):
+                missing.append("event_counters.state")
+        if missing:
+            raise DatabaseSchemaError(
+                "state database schema is incomplete: " + ", ".join(missing)
+            )
+
+    @staticmethod
     def _migrate_zero_to_one(connection: sqlite3.Connection) -> None:
         statements = (
             """
@@ -373,6 +469,7 @@ class StateStore:
 
     @staticmethod
     def _migrate_one_to_two(connection: sqlite3.Connection) -> None:
+        StateStore._migrate_zero_to_one(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS response_links (
@@ -431,6 +528,7 @@ class StateStore:
 
     @staticmethod
     def _migrate_two_to_three(connection: sqlite3.Connection) -> None:
+        StateStore._migrate_zero_to_one(connection)
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS event_counters (
@@ -458,30 +556,42 @@ class StateStore:
         StateStore._add_column_if_missing(
             connection, "compact_boundaries", "boundary_event_sequence", "INTEGER"
         )
-        connection.execute(
-            "UPDATE response_links SET event_sequence = rowid WHERE event_sequence IS NULL"
-        )
-        response_max = int(
+        legacy_events = connection.execute(
+            """
+            SELECT local_response_id AS legacy_id, created_at,
+                   0 AS record_type, 'response' AS record_kind
+            FROM response_links
+            UNION ALL
+            SELECT fragment_id AS legacy_id, created_at,
+                   1 AS record_type, 'fragment' AS record_kind
+            FROM context_fragments
+            ORDER BY created_at, record_type, legacy_id
+            """
+        ).fetchall()
+        for event_sequence, (legacy_id, _created_at, _record_type, record_kind) in enumerate(
+            legacy_events, start=1
+        ):
+            table = "response_links" if record_kind == "response" else "context_fragments"
+            identifier_column = (
+                "local_response_id" if record_kind == "response" else "fragment_id"
+            )
             connection.execute(
-                "SELECT COALESCE(MAX(event_sequence), 0) FROM response_links"
-            ).fetchone()[0]
-        )
+                f"UPDATE {table} SET event_sequence = ? WHERE {identifier_column} = ?",
+                (event_sequence, legacy_id),
+            )
         connection.execute(
             """
-            UPDATE context_fragments
-            SET event_sequence = ? + rowid
-            WHERE event_sequence IS NULL
-            """,
-            (response_max,),
-        )
-        context_max = int(
-            connection.execute(
-                "SELECT COALESCE(MAX(event_sequence), 0) FROM context_fragments"
-            ).fetchone()[0]
+            UPDATE compact_boundaries
+            SET boundary_event_sequence = (
+                SELECT event_sequence FROM response_links
+                WHERE local_response_id = compact_boundaries.boundary_response_id
+            )
+            WHERE boundary_event_sequence IS NULL
+            """
         )
         connection.execute(
             "UPDATE event_counters SET value = ? WHERE counter_name = 'state'",
-            (max(response_max, context_max),),
+            (len(legacy_events),),
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS response_links_event_order "

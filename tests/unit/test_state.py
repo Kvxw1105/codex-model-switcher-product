@@ -88,6 +88,158 @@ def test_migration_preserves_v1_response_link(tmp_path, secret_key_provider) -> 
     store.close()
 
 
+def test_v2_migration_interleaves_history_before_compact_prune(
+    tmp_path, secret_key_provider
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        PRAGMA user_version = 2;
+        CREATE TABLE route_selections (
+            selection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codex_task_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            selected_at INTEGER NOT NULL
+        );
+        CREATE TABLE response_links (
+            local_response_id TEXT PRIMARY KEY,
+            upstream_response_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            codex_task_id TEXT,
+            expires_at INTEGER
+        );
+        CREATE TABLE context_fragments (
+            fragment_id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL,
+            ciphertext BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER
+        );
+        CREATE TABLE config_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            config_sha256 TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE cancel_handles (
+            handle_id TEXT PRIMARY KEY,
+            codex_task_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER
+        );
+        CREATE TABLE compact_boundaries (
+            codex_task_id TEXT PRIMARY KEY,
+            boundary_response_id TEXT NOT NULL,
+            boundary_created_at INTEGER NOT NULL
+        );
+        """
+    )
+    connection.executemany(
+        "INSERT INTO response_links VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            ("r-old", "u-old", "chat", 100, "task-1", None),
+            ("r-tie", "u-tie", "chat", 250, "task-1", None),
+            ("r-boundary", "u-boundary", "chat", 300, "task-1", None),
+        ],
+    )
+    cipher = Fernet(secret_key_provider.get_key())
+    connection.executemany(
+        "INSERT INTO context_fragments VALUES (?, ?, ?, ?, ?)",
+        [
+            ("f-old", "task-1", cipher.encrypt(b"old"), 200, None),
+            ("f-tie", "task-1", cipher.encrypt(b"tie"), 250, None),
+            ("f-new", "task-1", cipher.encrypt(b"new"), 400, None),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    store = StateStore(path, secret_key_provider)
+    rows = store._require_connection().execute(
+        """
+        SELECT local_response_id AS legacy_id, event_sequence, 'response' AS record_type
+        FROM response_links
+        UNION ALL
+        SELECT fragment_id, event_sequence, 'fragment'
+        FROM context_fragments
+        ORDER BY event_sequence
+        """
+    ).fetchall()
+    assert [(row[0], row[2]) for row in rows] == [
+        ("r-old", "response"),
+        ("f-old", "fragment"),
+        ("r-tie", "response"),
+        ("f-tie", "fragment"),
+        ("r-boundary", "response"),
+        ("f-new", "fragment"),
+    ]
+    assert [row[1] for row in rows] == list(range(1, 7))
+
+    assert store.prune_after_compact("task-1", "r-boundary") == 4
+    assert store.get_response_link("r-old") is None
+    assert store.get_chat_fragment("f-old") is None
+    assert store.get_chat_fragment("f-tie") is None
+    assert store.get_response_link("r-boundary") is not None
+    assert store.get_chat_fragment("f-new") == "new"
+    store.close()
+
+
+def test_incomplete_v3_schema_is_quarantined_before_first_write(
+    tmp_path, secret_key_provider
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    seed = sqlite3.connect(path)
+    try:
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("PRAGMA wal_autocheckpoint=0")
+        seed.execute(
+            """
+            CREATE TABLE response_links (
+                local_response_id TEXT PRIMARY KEY,
+                upstream_response_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                codex_task_id TEXT,
+                expires_at INTEGER,
+                event_sequence INTEGER
+            )
+            """
+        )
+        seed.execute("PRAGMA user_version = 3")
+        seed.execute(
+            "INSERT INTO response_links VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("local-1", "upstream-1", "chat", 1, "task-1", None, 1),
+        )
+        seed.commit()
+
+        sidecars = {
+            "-wal": path.with_name(f"{path.name}-wal"),
+            "-shm": path.with_name(f"{path.name}-shm"),
+        }
+        assert all(sidecar.exists() for sidecar in sidecars.values())
+        evidence = {"": path.read_bytes()}
+        evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
+
+        with pytest.raises(DatabaseCorruptionError, match="schema"):
+            StateStore(path, secret_key_provider)
+
+        quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+        quarantine_main = next(
+            item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+        )
+        assert quarantine_main.read_bytes() == evidence[""]
+        assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+        assert path.read_bytes() == evidence[""]
+        assert sidecars["-wal"].read_bytes() == evidence["-wal"]
+        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+    finally:
+        seed.close()
+
+
 def test_chat_fragment_is_encrypted_and_reopens(tmp_path, secret_key_provider) -> None:
     path = tmp_path / "state.sqlite3"
     fragment = "只保存第三方 Chat 继续一轮所需的最小文本片段"
