@@ -521,6 +521,146 @@ def test_windows_rollback_failure_retains_backup_and_status(tmp_path, monkeypatc
     assert config_path.read_bytes() == original
 
 
+def test_windows_precommit_handle_close_failures_retain_backup_and_status(
+    tmp_path, monkeypatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows pre-commit handle cleanup is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b"# original bytes\r\n"
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    original_commit = config_module._commit_windows_transaction
+    commit_calls = [0]
+
+    def fail_target_commit(commit_transaction, transaction_handle):
+        commit_calls[0] += 1
+        if commit_calls[0] == 2:
+            return False
+        return original_commit(commit_transaction, transaction_handle)
+
+    monkeypatch.setattr(
+        config_module,
+        "_commit_windows_transaction",
+        fail_target_commit,
+    )
+    monkeypatch.setattr(
+        config_module,
+        "_rollback_windows_transaction",
+        lambda _rollback_transaction, _transaction_handle: True,
+    )
+    close_calls = [0]
+
+    def fail_two_precommit_closes(close_handle, handle):
+        close_calls[0] += 1
+        if close_calls[0] <= 2:
+            return False
+        return bool(close_handle(handle))
+
+    monkeypatch.setattr(
+        config_module,
+        "_close_precommit_handle",
+        fail_two_precommit_closes,
+    )
+
+    with pytest.raises(ConfigTransactionStateError) as caught:
+        apply_managed_config(config_path, catalog_path)
+
+    error = caught.value
+    assert commit_calls == [2]
+    assert close_calls == [2]
+    assert error.committed is False
+    assert error.state_uncertain is True
+    assert error.backup_path is not None
+    assert error.backup_path.read_bytes() == original
+    assert config_path.read_bytes() == original
+
+
+def test_windows_precommit_lease_close_failure_retains_backup_and_status(
+    tmp_path, monkeypatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows lease cleanup is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b"# original bytes\r\n"
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    real_replace_temp_file = config_module._replace_temp_file
+    real_release = config_module._PathLease._release_windows_handle
+    injected = [False]
+
+    def fail_config_replacement(temporary_path, target_path, *, lease=None, expected=None):
+        if target_path.resolve() == config_path.resolve():
+            raise ConfigError("injected pre-commit replacement failure")
+        return real_replace_temp_file(
+            temporary_path,
+            target_path,
+            lease=lease,
+            expected=expected,
+        )
+
+    def fail_main_lease_close(self, kernel32, handle, overlapped):
+        if (
+            self.path == config_path.resolve()
+            and not self._replacement_committed
+            and not injected[0]
+        ):
+            injected[0] = True
+            real_release(self, kernel32, handle, overlapped)
+            return 123
+        return real_release(self, kernel32, handle, overlapped)
+
+    monkeypatch.setattr(config_module, "_replace_temp_file", fail_config_replacement)
+    monkeypatch.setattr(
+        config_module._PathLease,
+        "_release_windows_handle",
+        fail_main_lease_close,
+    )
+
+    with pytest.raises(ConfigTransactionStateError) as caught:
+        apply_managed_config(config_path, catalog_path)
+
+    error = caught.value
+    assert injected == [True]
+    assert error.committed is False
+    assert error.state_uncertain is True
+    assert error.backup_path is not None
+    assert error.backup_path.read_bytes() == original
+    assert config_path.read_bytes() == original
+
+
 def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> None:
     if os.name == "nt":
         pytest.skip("Windows target locking is covered by the OS-level probe")
