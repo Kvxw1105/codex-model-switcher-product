@@ -27,6 +27,7 @@ _LABELED_SECRET_RE = re.compile(
 )
 _KEY_SECRET_RE = re.compile(r"(?i)^sk-[a-z0-9_-]{8,}$")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_MISSING_CREDENTIAL = object()
 
 _SENSITIVE_KEYS = {
     "access_token",
@@ -373,14 +374,24 @@ def configure_credential(
 ) -> dict[str, bool]:
     """Write a credential and expose only a boolean GUI/call-layer result."""
 
+    original: str | object = _MISSING_CREDENTIAL
+    write_attempted = False
     try:
         validate_provider_id(provider_id, provider_id_verifier)
         _validate_secret(secret)
+        original = _snapshot_credential(credential_store, provider_id)
+        write_attempted = True
         credential_store.set(provider_id, secret)
-        readback = credential_store.get(provider_id)
-        _validate_secret(readback)
+        readback = _validated_backend_secret(credential_store.get(provider_id))
+        if readback != secret:
+            raise CredentialStoreError("credential backend verification failed")
         configured = True
     except Exception:
+        if write_attempted:
+            try:
+                _restore_configured_credential(credential_store, provider_id, original)
+            except Exception:
+                pass
         configured = False
     return {"configured": configured}
 
@@ -417,6 +428,8 @@ def resolve_upstream_auth(
             raise CredentialStoreError("credential backend returned an invalid value") from None
         return f"Bearer {secret}"
     if lane == "official":
+        if inbound_authorization is not None:
+            _validate_header_value(inbound_authorization)
         return inbound_authorization
     raise ValueError("lane must be official or third_party")
 
@@ -493,6 +506,42 @@ def _validate_header_value(value: Any) -> None:
         raise CredentialValueError("header value must be text")
     if _CONTROL_CHAR_RE.search(value):
         raise CredentialValueError("header contains control characters")
+
+
+def _snapshot_credential(
+    credential_store: CredentialStore,
+    provider_id: str,
+) -> str | object:
+    try:
+        value = credential_store.get(provider_id)
+    except (CredentialNotConfiguredError, KeyError):
+        return _MISSING_CREDENTIAL
+    except Exception:
+        raise CredentialStoreError("credential backend read failed") from None
+    return _validated_backend_secret(value)
+
+
+def _restore_configured_credential(
+    credential_store: CredentialStore,
+    provider_id: str,
+    original: str | object,
+) -> None:
+    try:
+        if original is _MISSING_CREDENTIAL:
+            credential_store.delete(provider_id)
+            try:
+                credential_store.get(provider_id)
+            except (CredentialNotConfiguredError, KeyError):
+                return
+            raise CredentialStoreError("credential rollback failed")
+        credential_store.set(provider_id, original)
+        restored = _validated_backend_secret(credential_store.get(provider_id))
+        if restored != original:
+            raise CredentialStoreError("credential rollback failed")
+    except CredentialStoreError:
+        raise
+    except Exception:
+        raise CredentialStoreError("credential rollback failed") from None
 
 
 def _canonical_key(key: object) -> str:
@@ -711,7 +760,21 @@ def serialize_provider_record(
 
     if not isinstance(provider, Mapping):
         raise TypeError("provider must be a mapping")
-    candidate = provider_id or provider.get("provider_id") or provider.get("id")
+    explicit_id = (
+        validate_provider_id(provider_id, provider_id_verifier)
+        if provider_id is not None
+        else None
+    )
+    record_ids: list[str] = []
+    for key in ("provider_id", "id"):
+        if key in provider and provider[key] is not None:
+            record_ids.append(validate_provider_id(provider[key], provider_id_verifier))
+    if len(set(record_ids)) > 1:
+        raise ProviderIdError("provider IDs do not match")
+    record_id = record_ids[0] if record_ids else None
+    if explicit_id is not None and record_id is not None and explicit_id != record_id:
+        raise ProviderIdError("provider ID does not match record")
+    candidate = explicit_id or record_id
     if candidate is None:
         candidate = provider.get("credential_ref")
     reference = credential_ref(candidate, provider_id_verifier)  # type: ignore[arg-type]
@@ -823,9 +886,6 @@ def _verify_written_credential(
         raise CredentialMigrationError("credential write or verification failed") from None
     if readback != secret:
         raise CredentialMigrationError("credential write or verification failed")
-
-
-_MISSING_CREDENTIAL = object()
 
 
 def _read_migration_original(

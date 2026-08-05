@@ -129,6 +129,14 @@ def test_unregistered_credential_ref_cannot_become_username() -> None:
         serialize_provider_record({"credential_ref": "unregistered-provider"})
 
 
+def test_serializer_rejects_explicit_provider_id_mismatch() -> None:
+    with pytest.raises(ProviderIdError):
+        serialize_provider_record(
+            {"provider_id": "openai"},
+            provider_id="deepseek",
+        )
+
+
 def test_memory_fake_satisfies_credential_store_protocol() -> None:
     assert isinstance(MemoryCredentialStore(), CredentialStore)
 
@@ -227,6 +235,95 @@ def test_configure_credential_hides_backend_failure() -> None:
 
     assert result == {"configured": False}
     assert_secret_absent(result, "fixture-failing-secret")
+
+
+@pytest.mark.parametrize(
+    "initial_secret",
+    [
+        pytest.param(None, id="new-credential"),
+        pytest.param("fixture-existing-config-secret", id="existing-credential"),
+    ],
+)
+def test_configure_credential_rolls_back_when_readback_mismatches(
+    initial_secret: str | None,
+) -> None:
+    class MismatchingStore(MemoryCredentialStore):
+        def __init__(self) -> None:
+            super().__init__()
+            if initial_secret is not None:
+                self.values["deepseek"] = initial_secret
+            self.return_mismatch = False
+
+        def set(self, provider_id: str, secret: str) -> None:
+            super().set(provider_id, secret)
+            self.return_mismatch = True
+
+        def get(self, provider_id: str) -> str:
+            if self.return_mismatch:
+                self.get_calls.append(provider_id)
+                return "fixture-mismatched-config-readback"
+            return super().get(provider_id)
+
+    store = MismatchingStore()
+    result = configure_credential(store, "deepseek", "fixture-config-new-secret")
+
+    assert result == {"configured": False}
+    if initial_secret is None:
+        assert set(store.values) == set()
+    else:
+        assert set(store.values) == {"deepseek"}
+        assert_secret_equal(store.values["deepseek"], initial_secret)
+    assert_secret_absent(store.values, "fixture-config-new-secret")
+
+
+def test_configure_credential_rolls_back_when_set_mutates_then_fails() -> None:
+    store = FaultInjectingCredentialStore(fail_set_provider="deepseek")
+
+    result = configure_credential(store, "deepseek", "fixture-config-set-failure-secret")
+
+    assert result == {"configured": False}
+    assert set(store.values) == set()
+    assert_secret_absent(store.values, "fixture-config-set-failure-secret")
+
+
+def test_official_resolve_preserves_legal_bearer_without_reading_store() -> None:
+    store = MemoryCredentialStore()
+
+    resolved = resolve_upstream_auth(
+        lane="official",
+        provider_id="deepseek",
+        inbound_authorization="Bearer legal-official-auth",
+        credential_store=store,
+    )
+
+    assert_secret_equal(resolved, "Bearer legal-official-auth")
+    assert store.get_calls == []
+
+
+@pytest.mark.parametrize(
+    "invalid_authorization",
+    [
+        pytest.param("Bearer fixture-official-crlf\r\nInjected", id="crlf"),
+        pytest.param("Bearer fixture-official-nul\x00value", id="nul"),
+        pytest.param("Bearer fixture-official-del\x7fvalue", id="del"),
+    ],
+)
+def test_official_resolve_rejects_control_characters(
+    invalid_authorization: str,
+) -> None:
+    store = MemoryCredentialStore()
+
+    with pytest.raises(CredentialValueError) as error:
+        resolve_upstream_auth(
+            lane="official",
+            provider_id="deepseek",
+            inbound_authorization=invalid_authorization,
+            credential_store=store,
+        )
+
+    assert error.value.__cause__ is None
+    assert store.get_calls == []
+    assert_secret_absent(error.value, invalid_authorization)
 
 
 def test_third_party_credential_ignores_inbound_authorization() -> None:
