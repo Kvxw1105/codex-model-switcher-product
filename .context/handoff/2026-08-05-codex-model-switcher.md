@@ -58,4 +58,3 @@
 ## 新对话恢复指令
 
 请先读取 `C:\Users\kvxkf\Documents\Codex\2026-08-05\new-chat\work\codex-model-switcher-product\.context\handoff\2026-08-05-codex-model-switcher.md` 和 `C:\Users\kvxkf\Documents\Codex\2026-08-05\new-chat\docs\superpowers\plans\2026-08-05-codex-dual-lane-hot-switch.md`，确认当前 Git 状态后从 Task 0 继续；不要重复审查原 ZIP，不要读取或打印真实凭据，不要修改真实 `.codex` 配置。
-
