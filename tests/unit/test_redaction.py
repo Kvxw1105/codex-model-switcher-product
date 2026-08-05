@@ -20,7 +20,7 @@ def assert_secret_absent(value: Any, secret: str) -> None:
 
 def assert_secret_equal(actual: Any, expected: Any) -> None:
     if actual != expected:
-        raise AssertionError("redaction value mismatch")
+        raise AssertionError("secret-safe value mismatch")
 
 
 def test_recursive_redactor_covers_headers_query_and_nested_json() -> None:
@@ -55,7 +55,7 @@ def test_recursive_redactor_covers_camel_case_sensitive_fields_with_safe_counter
         "accessTokenValue": secret,
         "apiKeyValue": secret,
         "apiKey": secret,
-        "tokenLabel": "display-only",
+        "displayLabel": "display-only",
         "credentialRef": secret,
     }
 
@@ -67,7 +67,7 @@ def test_recursive_redactor_covers_camel_case_sensitive_fields_with_safe_counter
     assert "apiKeyValue" not in redacted
     assert "apiKey" not in redacted
     assert "credentialRef" not in redacted
-    assert_secret_equal(redacted["tokenLabel"], "display-only")
+    assert_secret_equal(redacted["displayLabel"], "display-only")
     assert_secret_absent(redacted, secret)
 
 
@@ -76,9 +76,14 @@ def test_recursive_redactor_covers_camel_case_sensitive_fields_with_safe_counter
     [
         "OpenAI-Organization",
         "openai_organization",
+        "OpenAIOrganization",
         "ChatGPT-Account-Id",
         "chat_gpt_account_id",
         "chatgpt_account_id",
+        "X-ChatGPT-Account-Id",
+        "x_chatgpt_account_id",
+        "X-OpenAI-Account-Id",
+        "x_open_ai_account_id",
         "Account-Id",
         "account_id",
         "Account-Email",
@@ -86,6 +91,13 @@ def test_recursive_redactor_covers_camel_case_sensitive_fields_with_safe_counter
         "X-Account-Name",
         "x_account_name",
         "X-OpenAI-Organization",
+        "x_open_ai_organization",
+        "Organization",
+        "organization_name",
+        "CredentialRef",
+        "credential_ref",
+        "AccessTokenValue",
+        "AuthHeader",
     ],
 )
 def test_redact_headers_drops_openai_chatgpt_and_account_identity_variants(
@@ -98,6 +110,13 @@ def test_redact_headers_drops_openai_chatgpt_and_account_identity_variants(
     assert set(redacted) == {"Accept"}
     assert_secret_equal(redacted["Accept"], "application/json")
     assert_secret_absent(redacted, secret)
+
+
+@pytest.mark.parametrize("header_name", ["Accept", "Content-Type", "User-Agent", "Cache-Control"])
+def test_redact_headers_preserves_generic_protocol_headers(header_name: str) -> None:
+    redacted = redact_headers({header_name: "safe-value"})
+
+    assert_secret_equal(redacted[header_name], "safe-value")
 
 
 def test_exception_redaction_hides_secret_url_email_and_nested_attributes() -> None:

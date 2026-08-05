@@ -46,7 +46,7 @@ def assert_secret_absent(value: Any, secret: str) -> None:
 
 def assert_secret_equal(actual: Any, expected: Any) -> None:
     if actual != expected:
-        raise AssertionError("credential value mismatch")
+        raise AssertionError("secret-safe value mismatch")
 
 
 def test_provider_record_persists_credential_ref_instead_of_bearer_value() -> None:
@@ -76,7 +76,7 @@ def test_camel_case_sensitive_fields_are_removed_but_safe_labels_remain() -> Non
             "apiKeyValue": secret,
             "accessToken": secret,
             "apiKey": secret,
-            "tokenLabel": "display-only",
+            "displayLabel": "display-only",
             "credentialRef": secret,
         }
     )
@@ -88,7 +88,7 @@ def test_camel_case_sensitive_fields_are_removed_but_safe_labels_remain() -> Non
     assert "apiKey" not in record
     assert "credentialRef" not in record
     assert_secret_equal(record["credential_ref"], "deepseek")
-    assert record["tokenLabel"] == "display-only"
+    assert record["displayLabel"] == "display-only"
     assert_secret_absent(record, secret)
 
 

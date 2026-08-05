@@ -119,9 +119,29 @@ _CREDENTIAL_KEYS = {
 }
 _SENSITIVE_KEY_SUFFIXES = (
     "_api_key",
+    "_key",
     "_password",
     "_secret",
     "_token",
+)
+_SAFE_PROTOCOL_KEYS = {
+    "accept",
+    "accept_encoding",
+    "cache_control",
+    "content_type",
+    "user_agent",
+}
+_SENSITIVE_KEY_SEMANTICS = (
+    "openai",
+    "chatgpt",
+    "account",
+    "organization",
+    "credential",
+    "token",
+    "auth",
+    "bearer",
+    "secret",
+    "password",
 )
 _URL_KEYS = {
     "base_url",
@@ -465,10 +485,14 @@ def _is_noncanonical_credential_ref_key(key: object) -> bool:
 
 def _is_sensitive_key(key: object) -> bool:
     normalized = _normal_key(key)
+    if normalized in _SAFE_PROTOCOL_KEYS:
+        return False
+    compact = normalized.replace("_", "")
     return (
         normalized in _SENSITIVE_KEYS
         or normalized.endswith(_SENSITIVE_KEY_SUFFIXES)
         or normalized.startswith("authorization_")
+        or any(term in compact for term in _SENSITIVE_KEY_SEMANTICS)
     )
 
 
@@ -495,12 +519,6 @@ def _redact_text(value: str) -> str:
 def redact_sensitive(value: Any, *, key: object | None = None) -> Any:
     """Recursively redact credentials, URLs, and private content from data."""
 
-    if _is_noncanonical_credential_ref_key(key):
-        return REDACTED
-    if _is_credential_ref_key(key):
-        if not isinstance(value, str) or not _is_registered_provider(value, None):
-            return REDACTED
-        return value
     if _is_sensitive_key(key) or _is_private_content_key(key):
         return REDACTED
     if _is_url_key(key):
@@ -510,7 +528,7 @@ def redact_sensitive(value: Any, *, key: object | None = None) -> Any:
             item_key: redact_sensitive(item_value, key=item_key)
             for item_key, item_value in value.items()
             if not _is_sensitive_key(item_key)
-            and not _is_noncanonical_credential_ref_key(item_key)
+            and not _is_credential_ref_key(item_key)
         }
     if isinstance(value, list):
         return [redact_sensitive(item) for item in value]
