@@ -1,9 +1,11 @@
+import builtins
 import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from codex_model_switcher import credentials as credentials_module
 from codex_model_switcher.credentials import (
     CredentialMigrationError,
     CredentialNotConfiguredError,
@@ -206,6 +208,76 @@ def test_serializer_accepts_matching_canonical_and_legacy_id_refs() -> None:
     assert "credentialRef" not in record
 
 
+def test_serializer_output_keeps_only_canonical_provider_identity_fields() -> None:
+    record = serialize_provider_record(
+        {
+            "provider_id": "openai",
+            "providerId": "openai",
+            "id": "openai",
+            "credential_ref": "openai",
+            "credentialRef": "openai",
+        }
+    )
+
+    assert set(record) == {"provider_id", "credential_ref"}
+    assert_secret_equal(record["provider_id"], "openai")
+    assert_secret_equal(record["credential_ref"], "openai")
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [
+        pytest.param(
+            {"providerId": "openai", "credential_ref": "deepseek"},
+            id="camel-id-canonical-ref",
+        ),
+        pytest.param(
+            {"provider_id": "openai", "credentialRef": "deepseek"},
+            id="canonical-id-camel-ref",
+        ),
+        pytest.param(
+            {"provider_id": "openai", "providerId": "deepseek"},
+            id="canonical-id-camel-id",
+        ),
+    ],
+)
+def test_migration_rejects_provider_identity_alias_conflicts(
+    tmp_path: Path,
+    provider: dict[str, str],
+) -> None:
+    source = tmp_path / "legacy-catalog.json"
+    provider = {**provider, "token": "fixture-migration-conflict-secret"}
+    source.write_text(json.dumps({"providers": [provider]}), encoding="utf-8")
+    store = MemoryCredentialStore()
+
+    with pytest.raises(CredentialMigrationError) as error:
+        migrate_legacy_catalog(source, store)
+
+    assert error.value.__cause__ is None
+    assert set(store.values) == set()
+
+
+def test_migration_accepts_provider_id_camel_case_fixture(tmp_path: Path) -> None:
+    secret = "fixture-provider-id-camel-case-secret"
+    source = tmp_path / "legacy-catalog.json"
+    source.write_text(
+        json.dumps(
+            {"providers": [{"providerId": "deepseek", "token": secret}]}
+        ),
+        encoding="utf-8",
+    )
+    store = MemoryCredentialStore()
+
+    migrated = migrate_legacy_catalog(source, store)
+
+    provider = migrated["providers"][0]
+    assert set(provider) == {"provider_id", "credential_ref"}
+    assert_secret_equal(provider["provider_id"], "deepseek")
+    assert_secret_equal(provider["credential_ref"], "deepseek")
+    assert_secret_equal(store.get("deepseek"), secret)
+    assert source.exists()
+
+
 def test_memory_fake_satisfies_credential_store_protocol() -> None:
     assert isinstance(MemoryCredentialStore(), CredentialStore)
 
@@ -252,6 +324,30 @@ def test_keyring_store_rejects_unvalidated_provider_username() -> None:
 
     with pytest.raises(ProviderIdError):
         store.set("user@example.com", "fixture-secret")
+
+
+def test_keyring_store_requires_explicit_backend_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_import = builtins.__import__
+
+    def reject_implicit_keyring_import(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        if name == "keyring":
+            raise AssertionError("implicit keyring import")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", reject_implicit_keyring_import)
+
+    with pytest.raises(CredentialStoreError) as error:
+        KeyringCredentialStore()
+
+    assert error.value.__cause__ is None
 
 
 def test_keyring_store_requires_registered_provider_id_and_rejects_secret_like_id() -> None:
@@ -322,14 +418,18 @@ def test_configure_credential_rolls_back_when_readback_mismatches(
             if initial_secret is not None:
                 self.values["deepseek"] = initial_secret
             self.return_mismatch = False
+            self.mismatch_used = False
 
         def set(self, provider_id: str, secret: str) -> None:
             super().set(provider_id, secret)
-            self.return_mismatch = True
+            if not self.mismatch_used:
+                self.return_mismatch = True
+                self.mismatch_used = True
 
         def get(self, provider_id: str) -> str:
             if self.return_mismatch:
                 self.get_calls.append(provider_id)
+                self.return_mismatch = False
                 return "fixture-mismatched-config-readback"
             return super().get(provider_id)
 
@@ -355,6 +455,47 @@ def test_configure_credential_rolls_back_when_set_mutates_then_fails() -> None:
     assert_secret_absent(store.values, "fixture-config-set-failure-secret")
 
 
+def test_configure_credential_surfaces_rollback_failure_without_claiming_unconfigured() -> None:
+    secret = "fixture-config-rollback-failure-secret"
+
+    class RollbackFailingStore(MemoryCredentialStore):
+        def get(self, provider_id: str) -> str:
+            if provider_id in self.values:
+                self.get_calls.append(provider_id)
+                return "fixture-config-mismatched-readback"
+            return super().get(provider_id)
+
+        def delete(self, provider_id: str) -> None:
+            raise RuntimeError("injected cleanup failure")
+
+    store = RollbackFailingStore()
+
+    with pytest.raises(CredentialStoreError) as error:
+        configure_credential(store, "deepseek", secret)
+
+    assert error.value.__cause__ is None
+    assert "deepseek" in store.values
+    assert_secret_equal(store.values["deepseek"], secret)
+    assert_secret_absent(error.value, secret)
+
+
+@pytest.mark.parametrize(
+    "invalid_secret",
+    [
+        pytest.param("fixture-config-c1-secret\x80value", id="c1-low"),
+        pytest.param("fixture-config-c1-secret\x9fvalue", id="c1-high"),
+    ],
+)
+def test_configure_credential_rejects_unicode_c1_controls(invalid_secret: str) -> None:
+    store = MemoryCredentialStore()
+
+    result = configure_credential(store, "deepseek", invalid_secret)
+
+    assert result == {"configured": False}
+    assert set(store.values) == set()
+    assert_secret_absent(store.values, invalid_secret)
+
+
 def test_official_resolve_preserves_legal_bearer_without_reading_store() -> None:
     store = MemoryCredentialStore()
 
@@ -375,6 +516,8 @@ def test_official_resolve_preserves_legal_bearer_without_reading_store() -> None
         pytest.param("Bearer fixture-official-crlf\r\nInjected", id="crlf"),
         pytest.param("Bearer fixture-official-nul\x00value", id="nul"),
         pytest.param("Bearer fixture-official-del\x7fvalue", id="del"),
+        pytest.param("Bearer fixture-official-c1-low\x80value", id="c1-low"),
+        pytest.param("Bearer fixture-official-c1-high\x9fvalue", id="c1-high"),
     ],
 )
 def test_official_resolve_rejects_control_characters(
@@ -773,6 +916,8 @@ def test_migrate_multi_provider_rolls_back_when_catalog_write_fails(tmp_path: Pa
         pytest.param("fixture-migration-control-secret\r\nheader", id="crlf"),
         pytest.param("fixture-migration-control-secret\x00value", id="nul"),
         pytest.param("fixture-migration-control-secret\x7fvalue", id="del"),
+        pytest.param("fixture-migration-control-secret\x80value", id="c1-low"),
+        pytest.param("fixture-migration-control-secret\x9fvalue", id="c1-high"),
     ],
 )
 def test_migrate_rejects_control_characters_before_writing(
@@ -875,3 +1020,57 @@ def test_build_third_party_headers_rejects_control_characters_before_injection()
 
     assert error.value.__cause__ is None
     assert_secret_absent(error.value, invalid_secret)
+
+
+def test_migration_write_interruption_preserves_existing_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "fixture-atomic-write-interruption-secret"
+    source = tmp_path / "legacy-catalog.json"
+    destination = tmp_path / "migrated-catalog.json"
+    source.write_text(
+        json.dumps({"providers": [{"provider_id": "deepseek", "token": secret}]}),
+        encoding="utf-8",
+    )
+    destination.write_text("previous destination", encoding="utf-8")
+
+    def fail_fsync(_file_descriptor: int) -> None:
+        raise OSError("injected write interruption")
+
+    monkeypatch.setattr(credentials_module.os, "fsync", fail_fsync)
+
+    with pytest.raises(CredentialMigrationError) as error:
+        migrate_legacy_catalog(source, MemoryCredentialStore(), destination=destination)
+
+    assert error.value.__cause__ is None
+    assert_secret_equal(destination.read_text(encoding="utf-8"), "previous destination")
+    assert list(tmp_path.glob(".migrated-catalog.json.*.tmp")) == []
+    assert_secret_absent(error.value, secret)
+
+
+def test_migration_replace_failure_preserves_existing_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "fixture-atomic-replace-failure-secret"
+    source = tmp_path / "legacy-catalog.json"
+    destination = tmp_path / "migrated-catalog.json"
+    source.write_text(
+        json.dumps({"providers": [{"provider_id": "deepseek", "token": secret}]}),
+        encoding="utf-8",
+    )
+    destination.write_text("previous destination", encoding="utf-8")
+
+    def fail_replace(_source: str, _destination: Path) -> None:
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(credentials_module.os, "replace", fail_replace)
+
+    with pytest.raises(CredentialMigrationError) as error:
+        migrate_legacy_catalog(source, MemoryCredentialStore(), destination=destination)
+
+    assert error.value.__cause__ is None
+    assert_secret_equal(destination.read_text(encoding="utf-8"), "previous destination")
+    assert list(tmp_path.glob(".migrated-catalog.json.*.tmp")) == []
+    assert_secret_absent(error.value, secret)

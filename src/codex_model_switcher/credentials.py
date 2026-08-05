@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import tempfile
 from collections.abc import Callable, Collection, Iterable
 from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
@@ -26,7 +28,7 @@ _LABELED_SECRET_RE = re.compile(
     r"(?:bearer\s+)?[^\s,;]+"
 )
 _KEY_SECRET_RE = re.compile(r"(?i)^sk-[a-z0-9_-]{8,}$")
-_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _MISSING_CREDENTIAL = object()
 
 _SENSITIVE_KEYS = {
@@ -316,10 +318,9 @@ class KeyringCredentialStore:
         provider_id_verifier: ProviderIdVerifierSpec = None,
     ) -> None:
         if keyring_module is None:
-            try:
-                import keyring as keyring_module
-            except ImportError:
-                raise CredentialStoreError("keyring package is required") from None
+            raise CredentialStoreError(
+                "keyring backend must be explicitly injected"
+            ) from None
         self._keyring = keyring_module
         self._provider_id_verifier = provider_id_verifier
 
@@ -391,7 +392,7 @@ def configure_credential(
             try:
                 _restore_configured_credential(credential_store, provider_id, original)
             except Exception:
-                pass
+                raise CredentialStoreError("credential rollback failed") from None
         configured = False
     return {"configured": configured}
 
@@ -614,6 +615,10 @@ def _resolve_provider_reference(
     return credential_ref(candidate, provider_id_verifier)  # type: ignore[arg-type]
 
 
+def _has_credential_ref_key(provider: Mapping[str, Any]) -> bool:
+    return any(_canonical_key(raw_key) == "credential_ref" for raw_key in provider)
+
+
 def _is_url_key(key: object) -> bool:
     return _normal_key(key) in _URL_KEYS
 
@@ -803,8 +808,11 @@ def serialize_provider_record(
     if not isinstance(result, dict):
         raise TypeError("provider must serialize to an object")
     for item_key in list(result):
-        if isinstance(result[item_key], dict) and not result[item_key]:
+        if _canonical_key(item_key) in {"provider_id", "id", "credential_ref"}:
             del result[item_key]
+        elif isinstance(result[item_key], dict) and not result[item_key]:
+            del result[item_key]
+    result["provider_id"] = reference
     result["credential_ref"] = reference
     return result
 
@@ -854,11 +862,10 @@ def _provider_id_from_record(
     provider: Mapping[str, Any],
     provider_id_verifier: ProviderIdVerifierSpec = None,
 ) -> str:
-    candidate = provider.get("provider_id") or provider.get("id") or provider.get("credential_ref")
     try:
-        return validate_provider_id(candidate, provider_id_verifier)
+        return _resolve_provider_reference(provider, None, provider_id_verifier)
     except ProviderIdError:
-        raise CredentialMigrationError("legacy provider has no valid provider ID") from None
+        raise CredentialMigrationError("legacy provider has invalid identity") from None
 
 
 def _secret_from_legacy_value(value: Any) -> str | None:
@@ -952,6 +959,44 @@ def _rollback_migration_credentials(
         raise CredentialMigrationError("credential rollback failed") from None
 
 
+def _write_migrated_catalog(destination: Path, serialized_catalog: str) -> None:
+    temporary_path: Path | None = None
+    file_descriptor: int | None = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=str(destination.parent),
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(
+            file_descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as stream:
+            file_descriptor = None
+            stream.write(serialized_catalog)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, destination)
+        temporary_path = None
+    except OSError:
+        raise CredentialMigrationError("could not write migrated catalog") from None
+    finally:
+        if file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+
 def migrate_legacy_catalog(
     source: Mapping[str, Any] | str | Path,
     credential_store: CredentialStore,
@@ -990,7 +1035,7 @@ def migrate_legacy_catalog(
             except CredentialValueError:
                 raise CredentialMigrationError("legacy credential is invalid") from None
             planned_credentials.append((provider_id, secret))
-        elif not provider.get("credential_ref"):
+        elif not _has_credential_ref_key(provider):
             raise CredentialMigrationError("legacy provider has no credential")
 
     try:
@@ -1009,12 +1054,7 @@ def migrate_legacy_catalog(
             touched_provider_ids.append(provider_id)
             _verify_written_credential(credential_store, provider_id, secret)
         if destination is not None:
-            destination_path = Path(destination)
-            try:
-                destination_path.parent.mkdir(parents=True, exist_ok=True)
-                destination_path.write_text(serialized_catalog, encoding="utf-8")
-            except OSError:
-                raise CredentialMigrationError("could not write migrated catalog") from None
+            _write_migrated_catalog(Path(destination), serialized_catalog)
     except Exception as error:
         try:
             _rollback_migration_credentials(
