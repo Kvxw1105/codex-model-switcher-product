@@ -1,0 +1,97 @@
+import hashlib
+import json
+
+import pytest
+
+from codex_model_switcher.config import (
+    ConfigChangedError,
+    apply_managed_config,
+    restore_managed_config,
+)
+
+
+def _safe_catalog() -> dict[str, object]:
+    return {
+        "schema_version": "picker-v1",
+        "client_version": "9.9.9",
+        "provider_id": "example-provider",
+        "models": [
+            {
+                "id": "cms-example-chat",
+                "display_name": "Example API",
+                "lane": "third_party",
+                "provider_id": "example-provider",
+                "upstream_model": "example-chat",
+                "capability": {
+                    "context_window": 32_000,
+                    "supports_responses": True,
+                    "supports_streaming": True,
+                    "supports_tools": True,
+                    "supports_images": False,
+                    "supports_files": True,
+                    "supports_compaction_context": False,
+                },
+            }
+        ],
+    }
+
+
+def test_apply_then_restore_is_byte_exact(tmp_path, monkeypatch) -> None:
+    isolated_home = tmp_path / "isolated-codex-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
+    config_path = isolated_home / "config.toml"
+    original = b"# user comment\r\nmodel = \"gpt-5.6\"\r\n"
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+
+    receipt = apply_managed_config(config_path, catalog_path)
+
+    assert config_path.read_bytes() != original
+    assert receipt.original_hash == hashlib.sha256(original).hexdigest()
+    assert receipt.written_hash == hashlib.sha256(config_path.read_bytes()).hexdigest()
+    assert receipt.backup_path.read_bytes() == original
+    assert b"codex-model-switcher managed start" in config_path.read_bytes()
+
+    restore_managed_config(config_path, receipt)
+
+    assert config_path.read_bytes() == original
+
+
+def test_restore_refuses_to_overwrite_external_edits(tmp_path, monkeypatch) -> None:
+    isolated_home = tmp_path / "isolated-codex-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
+    config_path = isolated_home / "config.toml"
+    config_path.write_bytes(b"model = \"original\"\n")
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+
+    receipt = apply_managed_config(config_path, catalog_path)
+    config_path.write_bytes(config_path.read_bytes() + b"# external edit\n")
+
+    with pytest.raises(ConfigChangedError, match="changed"):
+        restore_managed_config(config_path, receipt)
+
+
+def test_reapplying_replaces_only_the_managed_block(tmp_path, monkeypatch) -> None:
+    isolated_home = tmp_path / "isolated-codex-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
+    config_path = isolated_home / "config.toml"
+    config_path.write_bytes(b"# keep this\nmodel = \"original\"\n")
+    first_catalog_path = tmp_path / "first-picker.json"
+    first_catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+    second_catalog = _safe_catalog()
+    second_catalog["client_version"] = "10.0.0"
+    second_catalog_path = tmp_path / "second-picker.json"
+    second_catalog_path.write_text(json.dumps(second_catalog), encoding="utf-8")
+
+    apply_managed_config(config_path, first_catalog_path)
+    apply_managed_config(config_path, second_catalog_path)
+
+    rendered = config_path.read_text(encoding="utf-8")
+    assert rendered.count("codex-model-switcher managed start") == 1
+    assert "# keep this\nmodel = \"original\"\n" in rendered
+    assert "10.0.0" in rendered
