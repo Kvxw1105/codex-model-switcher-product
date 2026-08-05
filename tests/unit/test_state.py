@@ -28,6 +28,105 @@ def secret_key_provider() -> FakeSecretKeyProvider:
     return FakeSecretKeyProvider()
 
 
+def _seed_semantically_invalid_source(
+    path: Path, version: int, response_values: tuple[object, ...]
+) -> sqlite3.Connection:
+    seed = sqlite3.connect(path)
+    seed.execute("PRAGMA journal_mode=WAL")
+    seed.execute("PRAGMA wal_autocheckpoint=0")
+    if version == 1:
+        seed.executescript(
+            """
+            CREATE TABLE route_selections (
+                selection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codex_task_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                selected_at INTEGER NOT NULL
+            );
+            CREATE TABLE response_links (
+                local_response_id TEXT PRIMARY KEY,
+                upstream_response_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE context_fragments (
+                fragment_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE config_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                config_sha256 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE cancel_handles (
+                handle_id TEXT PRIMARY KEY,
+                codex_task_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            """
+        )
+        response_sql = "INSERT INTO response_links VALUES (?, ?, ?, ?)"
+    elif version == 2:
+        seed.executescript(
+            """
+            CREATE TABLE route_selections (
+                selection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codex_task_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                selected_at INTEGER NOT NULL
+            );
+            CREATE TABLE response_links (
+                local_response_id TEXT PRIMARY KEY,
+                upstream_response_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                codex_task_id TEXT,
+                expires_at INTEGER
+            );
+            CREATE TABLE context_fragments (
+                fragment_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER
+            );
+            CREATE TABLE config_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                config_sha256 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE cancel_handles (
+                handle_id TEXT PRIMARY KEY,
+                codex_task_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER
+            );
+            CREATE TABLE compact_boundaries (
+                codex_task_id TEXT PRIMARY KEY,
+                boundary_response_id TEXT NOT NULL,
+                boundary_created_at INTEGER NOT NULL
+            );
+            """
+        )
+        response_sql = "INSERT INTO response_links VALUES (?, ?, ?, ?, ?, ?)"
+    else:
+        raise AssertionError(f"unsupported test fixture version: {version}")
+    seed.execute(f"PRAGMA user_version = {version}")
+    seed.execute(response_sql, response_values)
+    seed.execute(
+        "INSERT INTO config_receipts VALUES (?, ?, ?)",
+        ("receipt-1", "a" * 64, 2),
+    )
+    seed.commit()
+    return seed
+
+
 def test_new_database_uses_wal_and_current_schema(tmp_path, secret_key_provider) -> None:
     path = tmp_path / "state.sqlite3"
 
@@ -36,6 +135,97 @@ def test_new_database_uses_wal_and_current_schema(tmp_path, secret_key_provider)
     assert store.schema_version == 3
     assert store.journal_mode == "wal"
     store.close()
+
+
+@pytest.mark.parametrize(
+    ("version", "response_values", "error_pattern"),
+    [
+        pytest.param(
+            1,
+            ("", "upstream-valid", "route-valid", 1),
+            "identifier",
+            id="v1-empty-id",
+        ),
+        pytest.param(
+            1,
+            ("local-valid", "upstream-valid", "route\x00invalid", 1),
+            "identifier",
+            id="v1-nul-id",
+        ),
+        pytest.param(
+            1,
+            ("local-valid", "x" * 513, "route-valid", 1),
+            "identifier",
+            id="v1-oversize-id",
+        ),
+        pytest.param(
+            1,
+            ("local-valid", "upstream-valid", "route-valid", -1),
+            "non-negative",
+            id="v1-negative-created-at",
+        ),
+        pytest.param(
+            2,
+            ("local-valid", "upstream-valid", "route-valid", 1, "\x00task", None),
+            "identifier",
+            id="v2-nul-id",
+        ),
+        pytest.param(
+            2,
+            ("local-valid", "upstream-valid", "route-valid", -1, "task-valid", None),
+            "non-negative",
+            id="v2-negative-created-at",
+        ),
+        pytest.param(
+            2,
+            ("local-valid", "upstream-valid", "route-valid", 1, "task-valid", -1),
+            "non-negative",
+            id="v2-negative-expiry",
+        ),
+    ],
+)
+def test_legacy_and_v2_semantic_values_are_quarantined_before_writes(
+    tmp_path, secret_key_provider, monkeypatch, version, response_values, error_pattern
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    seed = _seed_semantically_invalid_source(path, version, response_values)
+    try:
+        sidecars = {
+            "-wal": path.with_name(f"{path.name}-wal"),
+            "-shm": path.with_name(f"{path.name}-shm"),
+        }
+        assert all(sidecar.exists() for sidecar in sidecars.values())
+        evidence = {"": path.read_bytes()}
+        evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
+        connection_modes: list[str] = []
+        original_connect = state_module.sqlite3.connect
+
+        def record_connect(database, *args, **kwargs):
+            connection_modes.append(
+                "ro"
+                if kwargs.get("uri") and "?mode=ro" in str(database)
+                else "writable"
+            )
+            return original_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(state_module.sqlite3, "connect", record_connect)
+
+        with pytest.raises(DatabaseCorruptionError, match=error_pattern):
+            StateStore(path, secret_key_provider)
+
+        assert connection_modes == ["ro"]
+        assert path.read_bytes() == evidence[""]
+        assert sidecars["-wal"].read_bytes() == evidence["-wal"]
+        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+        quarantine_main = next(
+            item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+        )
+        assert quarantine_main.read_bytes() == evidence[""]
+        assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+    finally:
+        seed.close()
 
 
 def test_response_link_survives_process_reopen(tmp_path, secret_key_provider) -> None:

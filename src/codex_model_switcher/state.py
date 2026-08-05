@@ -27,6 +27,8 @@ class _ColumnSpec:
     sqlite_type: str
     not_null: bool = False
     primary_key: bool = False
+    identifier: bool = False
+    timestamp: bool = False
 
 
 SCHEMA_VERSION = 3
@@ -40,55 +42,57 @@ SHM_PAGE_SIZE = 32 * 1024
 V1_SCHEMA_COLUMN_SPECS = {
     "route_selections": {
         "selection_id": _ColumnSpec("INTEGER", primary_key=True),
-        "codex_task_id": _ColumnSpec("TEXT", not_null=True),
-        "turn_id": _ColumnSpec("TEXT", not_null=True),
-        "route_id": _ColumnSpec("TEXT", not_null=True),
-        "selected_at": _ColumnSpec("INTEGER", not_null=True),
+        "codex_task_id": _ColumnSpec("TEXT", not_null=True, identifier=True),
+        "turn_id": _ColumnSpec("TEXT", not_null=True, identifier=True),
+        "route_id": _ColumnSpec("TEXT", not_null=True, identifier=True),
+        "selected_at": _ColumnSpec("INTEGER", not_null=True, timestamp=True),
     },
     "response_links": {
-        "local_response_id": _ColumnSpec("TEXT", primary_key=True),
-        "upstream_response_id": _ColumnSpec("TEXT", not_null=True),
-        "route_id": _ColumnSpec("TEXT", not_null=True),
-        "created_at": _ColumnSpec("INTEGER", not_null=True),
+        "local_response_id": _ColumnSpec("TEXT", primary_key=True, identifier=True),
+        "upstream_response_id": _ColumnSpec("TEXT", not_null=True, identifier=True),
+        "route_id": _ColumnSpec("TEXT", not_null=True, identifier=True),
+        "created_at": _ColumnSpec("INTEGER", not_null=True, timestamp=True),
     },
     "context_fragments": {
-        "fragment_id": _ColumnSpec("TEXT", primary_key=True),
-        "scope_id": _ColumnSpec("TEXT", not_null=True),
+        "fragment_id": _ColumnSpec("TEXT", primary_key=True, identifier=True),
+        "scope_id": _ColumnSpec("TEXT", not_null=True, identifier=True),
         "ciphertext": _ColumnSpec("BLOB", not_null=True),
-        "created_at": _ColumnSpec("INTEGER", not_null=True),
+        "created_at": _ColumnSpec("INTEGER", not_null=True, timestamp=True),
     },
     "config_receipts": {
-        "receipt_id": _ColumnSpec("TEXT", primary_key=True),
+        "receipt_id": _ColumnSpec("TEXT", primary_key=True, identifier=True),
         "config_sha256": _ColumnSpec("TEXT", not_null=True),
-        "created_at": _ColumnSpec("INTEGER", not_null=True),
+        "created_at": _ColumnSpec("INTEGER", not_null=True, timestamp=True),
     },
     "cancel_handles": {
-        "handle_id": _ColumnSpec("TEXT", primary_key=True),
-        "codex_task_id": _ColumnSpec("TEXT", not_null=True),
-        "route_id": _ColumnSpec("TEXT", not_null=True),
-        "created_at": _ColumnSpec("INTEGER", not_null=True),
+        "handle_id": _ColumnSpec("TEXT", primary_key=True, identifier=True),
+        "codex_task_id": _ColumnSpec("TEXT", not_null=True, identifier=True),
+        "route_id": _ColumnSpec("TEXT", not_null=True, identifier=True),
+        "created_at": _ColumnSpec("INTEGER", not_null=True, timestamp=True),
     },
 }
 V2_SCHEMA_COLUMN_SPECS = {
     "route_selections": dict(V1_SCHEMA_COLUMN_SPECS["route_selections"]),
     "response_links": {
         **V1_SCHEMA_COLUMN_SPECS["response_links"],
-        "codex_task_id": _ColumnSpec("TEXT"),
-        "expires_at": _ColumnSpec("INTEGER"),
+        "codex_task_id": _ColumnSpec("TEXT", identifier=True),
+        "expires_at": _ColumnSpec("INTEGER", timestamp=True),
     },
     "context_fragments": {
         **V1_SCHEMA_COLUMN_SPECS["context_fragments"],
-        "expires_at": _ColumnSpec("INTEGER"),
+        "expires_at": _ColumnSpec("INTEGER", timestamp=True),
     },
     "config_receipts": dict(V1_SCHEMA_COLUMN_SPECS["config_receipts"]),
     "cancel_handles": {
         **V1_SCHEMA_COLUMN_SPECS["cancel_handles"],
-        "expires_at": _ColumnSpec("INTEGER"),
+        "expires_at": _ColumnSpec("INTEGER", timestamp=True),
     },
     "compact_boundaries": {
-        "codex_task_id": _ColumnSpec("TEXT", primary_key=True),
-        "boundary_response_id": _ColumnSpec("TEXT", not_null=True),
-        "boundary_created_at": _ColumnSpec("INTEGER", not_null=True),
+        "codex_task_id": _ColumnSpec("TEXT", primary_key=True, identifier=True),
+        "boundary_response_id": _ColumnSpec("TEXT", not_null=True, identifier=True),
+        "boundary_created_at": _ColumnSpec(
+            "INTEGER", not_null=True, timestamp=True
+        ),
     },
 }
 SCHEMA_COLUMN_SPECS = {
@@ -108,7 +112,7 @@ SCHEMA_COLUMN_SPECS = {
         "boundary_event_sequence": _ColumnSpec("INTEGER"),
     },
     "event_counters": {
-        "counter_name": _ColumnSpec("TEXT", primary_key=True),
+        "counter_name": _ColumnSpec("TEXT", primary_key=True, identifier=True),
         "value": _ColumnSpec("INTEGER", not_null=True),
     },
 }
@@ -619,6 +623,17 @@ class StateStore:
                         raise DatabaseSchemaError(
                             f"{label} {table}.{column} values must be "
                             f"{specification.sqlite_type}"
+                        )
+                    if specification.identifier:
+                        try:
+                            _identifier(value, f"{table}.{column}")
+                        except (TypeError, ValueError) as exc:
+                            raise DatabaseSchemaError(
+                                f"{label} {table}.{column} is not a valid identifier"
+                            ) from exc
+                    if specification.timestamp and value < 0:
+                        raise DatabaseSchemaError(
+                            f"{label} {table}.{column} must be non-negative"
                         )
 
     @staticmethod
