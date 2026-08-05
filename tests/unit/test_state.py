@@ -127,6 +127,63 @@ def test_migration_preserves_v1_response_link(tmp_path, secret_key_provider) -> 
     store.close()
 
 
+def test_v1_invalid_config_sha256_is_quarantined_before_migration_writes(
+    tmp_path, secret_key_provider
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    seed = sqlite3.connect(path)
+    try:
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("PRAGMA wal_autocheckpoint=0")
+        seed.executescript(
+            """
+            PRAGMA user_version = 1;
+            CREATE TABLE response_links (
+                local_response_id TEXT PRIMARY KEY,
+                upstream_response_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE config_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                config_sha256 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO response_links VALUES (
+                'old-local', 'old-upstream', 'legacy-route', 1
+            );
+            INSERT INTO config_receipts VALUES (
+                'receipt-1', 'invalid-fixture', 2
+            );
+            """
+        )
+        seed.commit()
+
+        sidecars = {
+            "-wal": path.with_name(f"{path.name}-wal"),
+            "-shm": path.with_name(f"{path.name}-shm"),
+        }
+        assert all(sidecar.exists() for sidecar in sidecars.values())
+        evidence = {"": path.read_bytes()}
+        evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
+
+        with pytest.raises(DatabaseCorruptionError, match="config_sha256"):
+            StateStore(path, secret_key_provider)
+
+        assert path.read_bytes() == evidence[""]
+        assert sidecars["-wal"].read_bytes() == evidence["-wal"]
+        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+        quarantine_main = next(
+            item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+        )
+        assert quarantine_main.read_bytes() == evidence[""]
+        assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+    finally:
+        seed.close()
+
+
 def test_v2_migration_interleaves_history_before_compact_prune(
     tmp_path, secret_key_provider
 ) -> None:

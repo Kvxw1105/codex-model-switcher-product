@@ -339,6 +339,18 @@ class StateStore:
                     self._validate_v2_schema(snapshot)
                 elif snapshot_version == SCHEMA_VERSION:
                     self._validate_schema(snapshot)
+                else:
+                    config_columns = {
+                        row[1]
+                        for row in snapshot.execute("PRAGMA table_info(config_receipts)")
+                    }
+                    if config_columns and "config_sha256" not in config_columns:
+                        raise DatabaseSchemaError(
+                            "state database migration source is missing "
+                            "config_receipts.config_sha256"
+                        )
+                    if "config_sha256" in config_columns:
+                        self._validate_config_hashes(snapshot)
                 snapshot.close()
                 snapshot = None
                 source.close()
