@@ -21,6 +21,14 @@ from typing import Callable, TypeVar
 
 from .crypto import FernetCipher, SecretKeyProvider
 
+
+@dataclass(frozen=True, slots=True)
+class _ColumnSpec:
+    sqlite_type: str
+    not_null: bool = False
+    primary_key: bool = False
+
+
 SCHEMA_VERSION = 3
 MAX_IDENTIFIER_LENGTH = 512
 MAX_CONTEXT_FRAGMENT_CHARS = 64 * 1024
@@ -29,90 +37,96 @@ SNAPSHOT_COPY_DELAY_SECONDS = 0.01
 SQLITE_HEADER = b"SQLite format 3\x00"
 SHM_MAGIC = b"\x18\xe2\x2d\x00"
 SHM_PAGE_SIZE = 32 * 1024
-REQUIRED_SCHEMA_COLUMNS = {
+V1_SCHEMA_COLUMN_SPECS = {
     "route_selections": {
-        "selection_id",
-        "codex_task_id",
-        "turn_id",
-        "route_id",
-        "selected_at",
+        "selection_id": _ColumnSpec("INTEGER", primary_key=True),
+        "codex_task_id": _ColumnSpec("TEXT", not_null=True),
+        "turn_id": _ColumnSpec("TEXT", not_null=True),
+        "route_id": _ColumnSpec("TEXT", not_null=True),
+        "selected_at": _ColumnSpec("INTEGER", not_null=True),
     },
     "response_links": {
-        "local_response_id",
-        "upstream_response_id",
-        "route_id",
-        "created_at",
-        "codex_task_id",
-        "expires_at",
-        "event_sequence",
+        "local_response_id": _ColumnSpec("TEXT", primary_key=True),
+        "upstream_response_id": _ColumnSpec("TEXT", not_null=True),
+        "route_id": _ColumnSpec("TEXT", not_null=True),
+        "created_at": _ColumnSpec("INTEGER", not_null=True),
     },
     "context_fragments": {
-        "fragment_id",
-        "scope_id",
-        "ciphertext",
-        "created_at",
-        "expires_at",
-        "event_sequence",
+        "fragment_id": _ColumnSpec("TEXT", primary_key=True),
+        "scope_id": _ColumnSpec("TEXT", not_null=True),
+        "ciphertext": _ColumnSpec("BLOB", not_null=True),
+        "created_at": _ColumnSpec("INTEGER", not_null=True),
     },
-    "config_receipts": {"receipt_id", "config_sha256", "created_at"},
+    "config_receipts": {
+        "receipt_id": _ColumnSpec("TEXT", primary_key=True),
+        "config_sha256": _ColumnSpec("TEXT", not_null=True),
+        "created_at": _ColumnSpec("INTEGER", not_null=True),
+    },
     "cancel_handles": {
-        "handle_id",
-        "codex_task_id",
-        "route_id",
-        "created_at",
-        "expires_at",
+        "handle_id": _ColumnSpec("TEXT", primary_key=True),
+        "codex_task_id": _ColumnSpec("TEXT", not_null=True),
+        "route_id": _ColumnSpec("TEXT", not_null=True),
+        "created_at": _ColumnSpec("INTEGER", not_null=True),
+    },
+}
+V2_SCHEMA_COLUMN_SPECS = {
+    "route_selections": dict(V1_SCHEMA_COLUMN_SPECS["route_selections"]),
+    "response_links": {
+        **V1_SCHEMA_COLUMN_SPECS["response_links"],
+        "codex_task_id": _ColumnSpec("TEXT"),
+        "expires_at": _ColumnSpec("INTEGER"),
+    },
+    "context_fragments": {
+        **V1_SCHEMA_COLUMN_SPECS["context_fragments"],
+        "expires_at": _ColumnSpec("INTEGER"),
+    },
+    "config_receipts": dict(V1_SCHEMA_COLUMN_SPECS["config_receipts"]),
+    "cancel_handles": {
+        **V1_SCHEMA_COLUMN_SPECS["cancel_handles"],
+        "expires_at": _ColumnSpec("INTEGER"),
     },
     "compact_boundaries": {
-        "codex_task_id",
-        "boundary_response_id",
-        "boundary_created_at",
-        "boundary_event_sequence",
+        "codex_task_id": _ColumnSpec("TEXT", primary_key=True),
+        "boundary_response_id": _ColumnSpec("TEXT", not_null=True),
+        "boundary_created_at": _ColumnSpec("INTEGER", not_null=True),
     },
-    "event_counters": {"counter_name", "value"},
+}
+SCHEMA_COLUMN_SPECS = {
+    "route_selections": dict(V2_SCHEMA_COLUMN_SPECS["route_selections"]),
+    "response_links": {
+        **V2_SCHEMA_COLUMN_SPECS["response_links"],
+        "event_sequence": _ColumnSpec("INTEGER"),
+    },
+    "context_fragments": {
+        **V2_SCHEMA_COLUMN_SPECS["context_fragments"],
+        "event_sequence": _ColumnSpec("INTEGER"),
+    },
+    "config_receipts": dict(V2_SCHEMA_COLUMN_SPECS["config_receipts"]),
+    "cancel_handles": dict(V2_SCHEMA_COLUMN_SPECS["cancel_handles"]),
+    "compact_boundaries": {
+        **V2_SCHEMA_COLUMN_SPECS["compact_boundaries"],
+        "boundary_event_sequence": _ColumnSpec("INTEGER"),
+    },
+    "event_counters": {
+        "counter_name": _ColumnSpec("TEXT", primary_key=True),
+        "value": _ColumnSpec("INTEGER", not_null=True),
+    },
+}
+REQUIRED_SCHEMA_COLUMNS = {
+    table: set(columns) for table, columns in SCHEMA_COLUMN_SPECS.items()
 }
 REQUIRED_V2_SCHEMA_COLUMNS = {
-    "route_selections": {
-        "selection_id",
-        "codex_task_id",
-        "turn_id",
-        "route_id",
-        "selected_at",
-    },
-    "response_links": {
-        "local_response_id",
-        "upstream_response_id",
-        "route_id",
-        "created_at",
-        "codex_task_id",
-        "expires_at",
-    },
-    "context_fragments": {
-        "fragment_id",
-        "scope_id",
-        "ciphertext",
-        "created_at",
-        "expires_at",
-    },
-    "config_receipts": {"receipt_id", "config_sha256", "created_at"},
-    "cancel_handles": {
-        "handle_id",
-        "codex_task_id",
-        "route_id",
-        "created_at",
-        "expires_at",
-    },
-    "compact_boundaries": {
-        "codex_task_id",
-        "boundary_response_id",
-        "boundary_created_at",
-    },
+    table: set(columns) for table, columns in V2_SCHEMA_COLUMN_SPECS.items()
 }
-V2_TIMESTAMP_COLUMNS = {
+V1_TIMESTAMP_COLUMNS = {
     "route_selections": "selected_at",
     "response_links": "created_at",
     "context_fragments": "created_at",
     "config_receipts": "created_at",
     "cancel_handles": "created_at",
+}
+V2_TIMESTAMP_COLUMNS = {
+    **V1_TIMESTAMP_COLUMNS,
     "compact_boundaries": "boundary_created_at",
 }
 T = TypeVar("T")
@@ -330,22 +344,16 @@ class StateStore:
                 if not result or str(result[0]).lower() != "ok":
                     raise sqlite3.DatabaseError("state database integrity check failed")
                 snapshot_version = int(source.execute("PRAGMA user_version").fetchone()[0])
-                if snapshot_version == 2:
+                if snapshot_version in (0, 1):
+                    self._validate_legacy_schema(source)
+                elif snapshot_version == 2:
                     self._validate_v2_schema(source)
                 elif snapshot_version == SCHEMA_VERSION:
                     self._validate_schema(source)
                 else:
-                    config_columns = {
-                        row[1]
-                        for row in source.execute("PRAGMA table_info(config_receipts)")
-                    }
-                    if config_columns and "config_sha256" not in config_columns:
-                        raise DatabaseSchemaError(
-                            "state database migration source is missing "
-                            "config_receipts.config_sha256"
-                        )
-                    if "config_sha256" in config_columns:
-                        self._validate_config_hashes(source)
+                    raise UnsupportedSchemaError(
+                        f"state database schema {snapshot_version} is unsupported"
+                    )
                 snapshot_path = snapshot_dir / self.path.name
                 snapshot = sqlite3.connect(snapshot_path)
                 source.backup(snapshot, pages=0, sleep=SNAPSHOT_COPY_DELAY_SECONDS)
@@ -510,34 +518,27 @@ class StateStore:
             raise DatabaseSchemaError(
                 f"state database schema version {version} is not {SCHEMA_VERSION}"
             )
-        missing: list[str] = []
-        for table, required_columns in REQUIRED_SCHEMA_COLUMNS.items():
-            columns = {
-                row[1] for row in connection.execute(f"PRAGMA table_info({table})")
-            }
-            if not columns:
-                missing.append(f"table {table}")
-                continue
-            for column in sorted(required_columns - columns):
-                missing.append(f"{table}.{column}")
-            if (
-                table == "event_counters"
-                and required_columns <= columns
-                and len(
-                    connection.execute(
-                        "SELECT value FROM event_counters "
-                        "WHERE counter_name = 'state'"
-                    ).fetchall()
-                )
-                != 1
-            ):
-                missing.append("event_counters.state")
-        if missing:
-            raise DatabaseSchemaError(
-                "state database schema is incomplete: " + ", ".join(missing)
-            )
+        StateStore._validate_declared_schema(
+            connection, SCHEMA_COLUMN_SPECS, "state database"
+        )
+        StateStore._validate_schema_values(connection, SCHEMA_COLUMN_SPECS, "state database")
         StateStore._validate_config_hashes(connection)
         StateStore._validate_event_state(connection)
+
+    @staticmethod
+    def _validate_legacy_schema(connection: sqlite3.Connection) -> None:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version not in (0, 1):
+            raise DatabaseSchemaError(
+                f"state database schema version {version} is not a legacy/v1 source"
+            )
+        StateStore._validate_declared_schema(
+            connection, V1_SCHEMA_COLUMN_SPECS, "legacy/v1 state database"
+        )
+        StateStore._validate_schema_values(
+            connection, V1_SCHEMA_COLUMN_SPECS, "legacy/v1 state database"
+        )
+        StateStore._validate_config_hashes(connection)
 
     @staticmethod
     def _validate_v2_schema(connection: sqlite3.Connection) -> None:
@@ -546,27 +547,79 @@ class StateStore:
             raise DatabaseSchemaError(
                 f"state database schema version {version} is not the v2 migration source"
             )
-        missing: list[str] = []
-        for table, required_columns in REQUIRED_V2_SCHEMA_COLUMNS.items():
-            columns = {
-                row[1] for row in connection.execute(f"PRAGMA table_info({table})")
-            }
-            if not columns:
-                missing.append(f"table {table}")
-                continue
-            for column in sorted(required_columns - columns):
-                missing.append(f"{table}.{column}")
-        if missing:
-            raise DatabaseSchemaError(
-                "state database v2 schema is incomplete: " + ", ".join(missing)
-            )
+        StateStore._validate_declared_schema(
+            connection, V2_SCHEMA_COLUMN_SPECS, "state database v2"
+        )
+        StateStore._validate_schema_values(
+            connection, V2_SCHEMA_COLUMN_SPECS, "state database v2"
+        )
         StateStore._validate_config_hashes(connection)
-        for table, column in V2_TIMESTAMP_COLUMNS.items():
-            for (value,) in connection.execute(f"SELECT {column} FROM {table}"):
-                if not isinstance(value, int) or isinstance(value, bool):
-                    raise DatabaseSchemaError(
-                        f"state database v2 {table}.{column} must be an integer"
+
+    @staticmethod
+    def _validate_declared_schema(
+        connection: sqlite3.Connection,
+        specifications: dict[str, dict[str, _ColumnSpec]],
+        label: str,
+    ) -> None:
+        failures: list[str] = []
+        for table, columns in specifications.items():
+            table_info = {
+                row[1]: row for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if not table_info:
+                failures.append(f"table {table}")
+                continue
+            for column, specification in columns.items():
+                info = table_info.get(column)
+                if info is None:
+                    failures.append(f"{table}.{column}")
+                    continue
+                declared_type = str(info[2]).strip().upper()
+                if declared_type != specification.sqlite_type:
+                    failures.append(
+                        f"{table}.{column} type {declared_type or '<empty>'} "
+                        f"is not {specification.sqlite_type}"
                     )
+                if specification.not_null and info[3] != 1:
+                    failures.append(f"{table}.{column} must be NOT NULL")
+                if specification.primary_key and info[5] != 1:
+                    failures.append(f"{table}.{column} must be a PRIMARY KEY")
+        if failures:
+            raise DatabaseSchemaError(
+                f"{label} schema is incomplete or invalid: " + ", ".join(failures)
+            )
+
+    @staticmethod
+    def _validate_schema_values(
+        connection: sqlite3.Connection,
+        specifications: dict[str, dict[str, _ColumnSpec]],
+        label: str,
+    ) -> None:
+        for table, columns in specifications.items():
+            column_names = ", ".join(columns)
+            for row in connection.execute(f"SELECT {column_names} FROM {table}"):
+                for (column, specification), value in zip(columns.items(), row):
+                    if value is None:
+                        if specification.not_null or specification.primary_key:
+                            raise DatabaseSchemaError(
+                                f"{label} {table}.{column} must not contain NULL"
+                            )
+                        continue
+                    valid_type = (
+                        specification.sqlite_type == "INTEGER"
+                        and isinstance(value, int)
+                        and not isinstance(value, bool)
+                    ) or (
+                        specification.sqlite_type == "TEXT" and isinstance(value, str)
+                    ) or (
+                        specification.sqlite_type == "BLOB"
+                        and isinstance(value, (bytes, bytearray, memoryview))
+                    )
+                    if not valid_type:
+                        raise DatabaseSchemaError(
+                            f"{label} {table}.{column} values must be "
+                            f"{specification.sqlite_type}"
+                        )
 
     @staticmethod
     def _validate_config_hashes(connection: sqlite3.Connection) -> None:

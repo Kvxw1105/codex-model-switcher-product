@@ -114,7 +114,36 @@ def test_migration_preserves_v1_response_link(tmp_path, secret_key_provider) -> 
             route_id TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE route_selections (
+            selection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codex_task_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            selected_at INTEGER NOT NULL
+        );
+        CREATE TABLE context_fragments (
+            fragment_id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL,
+            ciphertext BLOB NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE config_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            config_sha256 TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE cancel_handles (
+            handle_id TEXT PRIMARY KEY,
+            codex_task_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
         INSERT INTO response_links VALUES ('old-local', 'old-upstream', 'legacy-route', 1);
+        INSERT INTO config_receipts VALUES (
+            'receipt-1',
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            2
+        );
         """
     )
     connection.commit()
@@ -149,6 +178,25 @@ def test_v1_invalid_config_sha256_is_quarantined_before_migration_writes(
                 config_sha256 TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+            CREATE TABLE route_selections (
+                selection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codex_task_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                selected_at INTEGER NOT NULL
+            );
+            CREATE TABLE context_fragments (
+                fragment_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE cancel_handles (
+                handle_id TEXT PRIMARY KEY,
+                codex_task_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
             INSERT INTO response_links VALUES (
                 'old-local', 'old-upstream', 'legacy-route', 1
             );
@@ -180,6 +228,132 @@ def test_v1_invalid_config_sha256_is_quarantined_before_migration_writes(
         monkeypatch.setattr(state_module.sqlite3, "connect", record_connect)
 
         with pytest.raises(DatabaseCorruptionError, match="config_sha256"):
+            StateStore(path, secret_key_provider)
+
+        assert connection_modes == ["ro"]
+        assert path.read_bytes() == evidence[""]
+        assert sidecars["-wal"].read_bytes() == evidence["-wal"]
+        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+        quarantine_main = next(
+            item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+        )
+        assert quarantine_main.read_bytes() == evidence[""]
+        assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+    finally:
+        seed.close()
+
+
+@pytest.mark.parametrize(
+    ("response_link_definition", "response_link_values"),
+    [
+        pytest.param(
+            """
+            CREATE TABLE response_links (
+                local_response_id TEXT PRIMARY KEY,
+                upstream_response_id TEXT NOT NULL,
+                route_id TEXT NOT NULL
+            )
+            """,
+            ("old-local", "old-upstream", "legacy-route"),
+            id="missing-created-at",
+        ),
+        pytest.param(
+            """
+            CREATE TABLE response_links (
+                local_response_id TEXT PRIMARY KEY,
+                upstream_response_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+            ("old-local", "old-upstream", "legacy-route", "not-an-integer"),
+            id="created-at-wrong-type",
+        ),
+        pytest.param(
+            """
+            CREATE TABLE response_links (
+                local_response_id TEXT PRIMARY KEY,
+                upstream_response_id TEXT NOT NULL,
+                route_id TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """,
+            ("old-local", "old-upstream", None, 1),
+            id="route-id-nullable",
+        ),
+    ],
+)
+def test_v1_incomplete_schema_is_quarantined_before_writable_snapshot(
+    tmp_path, secret_key_provider, monkeypatch, response_link_definition, response_link_values
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    seed = sqlite3.connect(path)
+    try:
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("PRAGMA wal_autocheckpoint=0")
+        seed.executescript(
+            """
+            CREATE TABLE route_selections (
+                selection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codex_task_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                selected_at INTEGER NOT NULL
+            );
+            CREATE TABLE context_fragments (
+                fragment_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE config_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                config_sha256 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE cancel_handles (
+                handle_id TEXT PRIMARY KEY,
+                codex_task_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            PRAGMA user_version = 1;
+            """
+        )
+        seed.execute(response_link_definition)
+        placeholders = ", ".join("?" for _ in response_link_values)
+        seed.execute(
+            f"INSERT INTO response_links VALUES ({placeholders})", response_link_values
+        )
+        seed.execute(
+            "INSERT INTO config_receipts VALUES (?, ?, ?)",
+            ("receipt-1", "a" * 64, 2),
+        )
+        seed.commit()
+
+        sidecars = {
+            "-wal": path.with_name(f"{path.name}-wal"),
+            "-shm": path.with_name(f"{path.name}-shm"),
+        }
+        assert all(sidecar.exists() for sidecar in sidecars.values())
+        evidence = {"": path.read_bytes()}
+        evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
+        connection_modes: list[str] = []
+        original_connect = state_module.sqlite3.connect
+
+        def record_connect(database, *args, **kwargs):
+            connection_modes.append(
+                "ro"
+                if kwargs.get("uri") and "?mode=ro" in str(database)
+                else "writable"
+            )
+            return original_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(state_module.sqlite3, "connect", record_connect)
+
+        with pytest.raises(DatabaseCorruptionError, match="schema"):
             StateStore(path, secret_key_provider)
 
         assert connection_modes == ["ro"]
@@ -382,6 +556,18 @@ def test_incomplete_v2_schema_is_quarantined_before_wal_setup(
         assert all(sidecar.exists() for sidecar in sidecars.values())
         evidence = {"": path.read_bytes()}
         evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
+        connection_modes: list[str] = []
+        original_connect = state_module.sqlite3.connect
+
+        def record_connect(database, *args, **kwargs):
+            connection_modes.append(
+                "ro"
+                if kwargs.get("uri") and "?mode=ro" in str(database)
+                else "writable"
+            )
+            return original_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(state_module.sqlite3, "connect", record_connect)
         monkeypatch.setattr(
             StateStore,
             "_configure_connection",
@@ -391,6 +577,7 @@ def test_incomplete_v2_schema_is_quarantined_before_wal_setup(
         with pytest.raises(DatabaseCorruptionError, match="schema"):
             StateStore(path, secret_key_provider)
 
+        assert connection_modes == ["ro"]
         quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
         quarantine_main = next(
             item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
