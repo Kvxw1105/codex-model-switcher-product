@@ -9,8 +9,8 @@
 - route 的 `model_id`、`provider_id` 和 `upstream_model` 必须是稳定、非空且无空白的标识；display name 必须包含 `Official` 或 `API` lane 标记。
 - 目录生成从调用方提供的模型缓存读取 `client_version`，不会硬编码客户端版本。没有 schema 证据时，候选明确带有 `schema_version: null` 和 `verification_status: UNVERIFIED`；`picker-v1` 不再是默认或通过信号。
 - 配置只写入受管区块中的 `model_provider` 与 `model_catalog_json`。没有写入 upstream URL、Authorization、cookie 或凭据字段。
-- `render_managed_config` 与 `apply_managed_config` 必须收到 `TrustedPickerVerifier.issue_receipt` 产生的 opaque writer capability，并校验 capability 身份、schema/version 与候选 catalog SHA-256；`PickerVerificationReceipt` 没有可调用的构造器或 `_from_verifier` 工厂，缺失真实 verifier receipt 时拒绝 render/apply。
-- `TrustedPickerVerifier` 只是未来真实外部 verifier 的抽象边界，本项目没有 concrete implementation；它不接受调用方注入的 `evidence_provider`。测试中的 fixture subclass 只验证 writer capability seam，进程内 identity token 也不等于当前客户端证据。
+- `render_managed_config` 与 `apply_managed_config` 只接受由模块内部可信流程登记的 opaque writer capability；验证同时要求 receipt 对象本身属于私有 identity registry，并校验 schema/version 与候选 catalog SHA-256。`PickerVerificationReceipt` 没有可调用的构造器、`_from_verifier` 或 `issue_receipt` 路径；当前没有真实 receipt 时 render/apply 必须拒绝。
+- `TrustedPickerVerifier` 只是未来真实外部 verifier 的证据读取抽象，本项目没有 concrete implementation，也不接受调用方注入 `evidence_provider`，更不会从 untrusted subclass/provider 生成 receipt。私有 registry 不是当前客户端证据，且不向 caller 暴露 registry/seal。
 - 受管区块 start/end marker 必须各自独占完整行且恰好一对；marker 出现在用户注释、TOML 字符串、嵌入文本或重复区块时直接拒绝替换。
 - apply 会创建包含写前字节和时间戳的备份，并以同目录临时文件加 `os.replace` 原子替换目标。receipt 保存写前/写后 SHA-256。
 - restore 仅在当前文件仍匹配本项目最后一次写入的 hash 时执行；外部编辑会拒绝覆盖。备份 hash 也必须匹配，恢复结果按字节保留原文件。
@@ -28,7 +28,7 @@
 3. `model_catalog_json` 是与候选目录相同的 JSON；
 4. 记录调用方提供的不含隐私的候选 schema/version 来源，但不把该字段当作当前客户端通过信号。
 
-缺少真实外部 receipt 时结果明确为 `FAIL / UNVERIFIED`，即使本地配置语法正确也不能宣称 Gate 1 通过。测试中的 in-memory verifier 只覆盖 capability/writer seam，不代表当前客户端通过；没有真实客户端启动、付费模型请求或 endpoint 猜测。
+缺少真实外部 receipt 时结果明确为 `FAIL / UNVERIFIED`，即使本地配置语法正确也不能宣称 Gate 1 通过。本测试只验证无 receipt 拒绝、伪造对象拒绝和低层 managed-block 字节行为；没有 in-memory receipt 冒充 picker 证据，也没有真实客户端启动、付费模型请求或 endpoint 猜测。进程内 capability/测试 seam 永远不等于 Gate 1 证据。
 
 ## app-server、turn 边界与 compact
 

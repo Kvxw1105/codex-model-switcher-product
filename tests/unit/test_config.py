@@ -4,32 +4,21 @@ import json
 import pytest
 
 from codex_model_switcher.catalog import (
-    PickerSchemaEvidence,
     PickerVerificationReceipt,
-    TrustedPickerVerifier,
     catalog_fingerprint,
     load_catalog,
 )
 from codex_model_switcher.config import (
+    MANAGED_END,
+    MANAGED_START,
     ConfigChangedError,
     ConfigError,
+    ConfigReceipt,
+    _replace_or_append_managed_block,
     apply_managed_config,
+    render_managed_config,
     restore_managed_config,
 )
-
-
-def _verification(catalog_path):
-    catalog = load_catalog(catalog_path)
-    class FixtureTrustedVerifier(TrustedPickerVerifier):
-        def _read_current_client_evidence(self, candidate):
-            return PickerSchemaEvidence(
-                schema_version=candidate.schema_version,
-                client_version=candidate.client_version,
-                source="fixture-verifier",
-            )
-
-    verifier = FixtureTrustedVerifier()
-    return verifier.issue_receipt(catalog)
 
 
 def _safe_catalog() -> dict[str, object]:
@@ -58,95 +47,73 @@ def _safe_catalog() -> dict[str, object]:
     }
 
 
-def test_apply_then_restore_is_byte_exact(tmp_path, monkeypatch) -> None:
-    isolated_home = tmp_path / "isolated-codex-home"
-    isolated_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
-    config_path = isolated_home / "config.toml"
-    original = b"# user comment\r\nmodel = \"gpt-5.6\"\r\n"
-    config_path.write_bytes(original)
-    catalog_path = tmp_path / "safe-picker.json"
-    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
-
-    receipt = apply_managed_config(
-        config_path,
-        catalog_path,
-        verification=_verification(catalog_path),
+def test_managed_block_replacement_round_trips_user_bytes() -> None:
+    original_block = "\r\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "old-provider"',
+            'model_catalog_json = "old-catalog"',
+            MANAGED_END,
+        )
+    )
+    original = "# user comment\r\n" + original_block + "\r\n"
+    new_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "example-catalog"',
+            MANAGED_END,
+        )
     )
 
-    assert config_path.read_bytes() != original
-    assert receipt.original_hash == hashlib.sha256(original).hexdigest()
-    assert receipt.written_hash == hashlib.sha256(config_path.read_bytes()).hexdigest()
-    assert receipt.backup_path.read_bytes() == original
-    assert b"codex-model-switcher managed start" in config_path.read_bytes()
+    written = _replace_or_append_managed_block(original, new_block)
+    restored = _replace_or_append_managed_block(written, original_block)
 
-    restore_managed_config(config_path, receipt)
-
-    assert config_path.read_bytes() == original
+    assert written.encode("utf-8") != original.encode("utf-8")
+    assert restored.encode("utf-8") == original.encode("utf-8")
 
 
-def test_restore_refuses_to_overwrite_external_edits(tmp_path, monkeypatch) -> None:
-    isolated_home = tmp_path / "isolated-codex-home"
-    isolated_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
-    config_path = isolated_home / "config.toml"
-    config_path.write_bytes(b"model = \"original\"\n")
-    catalog_path = tmp_path / "safe-picker.json"
-    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
-
-    receipt = apply_managed_config(
-        config_path,
-        catalog_path,
-        verification=_verification(catalog_path),
+def test_restore_refuses_to_overwrite_external_edits(tmp_path) -> None:
+    config_path = tmp_path / "config.toml"
+    original = b'model = "original"\n'
+    written = b'model = "managed"\n'
+    config_path.write_bytes(written)
+    backup_path = tmp_path / "config.toml.bak"
+    backup_path.write_bytes(original)
+    receipt = ConfigReceipt(
+        config_path=config_path,
+        backup_path=backup_path,
+        original_hash=hashlib.sha256(original).hexdigest(),
+        written_hash=hashlib.sha256(written).hexdigest(),
+        timestamp="20260805T000000000000Z",
     )
-    config_path.write_bytes(config_path.read_bytes() + b"# external edit\n")
+    config_path.write_bytes(written + b"# external edit\n")
 
     with pytest.raises(ConfigChangedError, match="changed"):
         restore_managed_config(config_path, receipt)
 
 
-def test_reapplying_replaces_only_the_managed_block(tmp_path, monkeypatch) -> None:
-    isolated_home = tmp_path / "isolated-codex-home"
-    isolated_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
-    config_path = isolated_home / "config.toml"
-    config_path.write_bytes(b"# keep this\nmodel = \"original\"\n")
-    first_catalog_path = tmp_path / "first-picker.json"
-    first_catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
-    second_catalog = _safe_catalog()
-    second_catalog["client_version"] = "10.0.0"
-    second_catalog_path = tmp_path / "second-picker.json"
-    second_catalog_path.write_text(json.dumps(second_catalog), encoding="utf-8")
+def test_replacement_replaces_only_the_managed_block() -> None:
+    first_block = "\n".join((MANAGED_START, 'version = "9.9.9"', MANAGED_END))
+    second_block = "\n".join((MANAGED_START, 'version = "10.0.0"', MANAGED_END))
+    original = '# keep this\nmodel = "original"\n'
 
-    apply_managed_config(
-        config_path,
-        first_catalog_path,
-        verification=_verification(first_catalog_path),
-    )
-    apply_managed_config(
-        config_path,
-        second_catalog_path,
-        verification=_verification(second_catalog_path),
-    )
+    first = _replace_or_append_managed_block(original, first_block)
+    second = _replace_or_append_managed_block(first, second_block)
 
-    rendered = config_path.read_text(encoding="utf-8")
-    assert rendered.count("codex-model-switcher managed start") == 1
-    assert "# keep this\nmodel = \"original\"\n" in rendered
-    assert "10.0.0" in rendered
+    assert second.count(MANAGED_START) == 1
+    assert '# keep this\nmodel = "original"\n' in second
+    assert 'version = "10.0.0"' in second
 
 
-def test_apply_rejects_unverified_candidate_without_external_attestation(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    isolated_home = tmp_path / "isolated-codex-home"
-    isolated_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
-    config_path = isolated_home / "config.toml"
-    config_path.write_bytes(b"model = \"original\"\n")
+def test_render_and_apply_reject_without_real_receipt(tmp_path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_bytes(b'model = "original"\n')
     catalog_path = tmp_path / "safe-picker.json"
     catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
 
+    with pytest.raises(ConfigError, match="UNVERIFIED"):
+        render_managed_config(catalog_path)
     with pytest.raises(ConfigError, match="UNVERIFIED"):
         apply_managed_config(config_path, catalog_path)
 
@@ -165,12 +132,9 @@ def test_public_receipt_construction_cannot_authorize_apply(tmp_path) -> None:
         )
 
 
-def test_caller_forged_receipt_is_rejected(tmp_path, monkeypatch) -> None:
-    isolated_home = tmp_path / "isolated-codex-home"
-    isolated_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
-    config_path = isolated_home / "config.toml"
-    config_path.write_bytes(b"model = \"original\"\n")
+def test_caller_forged_receipt_is_rejected(tmp_path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_bytes(b'model = "original"\n')
     catalog_path = tmp_path / "safe-picker.json"
     catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
     catalog = load_catalog(catalog_path)
@@ -185,6 +149,29 @@ def test_caller_forged_receipt_is_rejected(tmp_path, monkeypatch) -> None:
         apply_managed_config(config_path, catalog_path, verification=CallerForgedReceipt())
 
 
+def test_object_new_receipt_copy_is_rejected_by_apply(tmp_path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_bytes(b'model = "original"\n')
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+    catalog = load_catalog(catalog_path)
+
+    import codex_model_switcher.catalog as catalog_module
+
+    forged = object.__new__(PickerVerificationReceipt)
+    for field_name, value in {
+        "schema_version": catalog.schema_version,
+        "client_version": catalog.client_version,
+        "catalog_sha256": catalog_fingerprint(catalog),
+        "source": "current-client-artifact",
+        "_writer_capability": getattr(catalog_module, "_WRITER_CAPABILITY_TOKEN", object()),
+    }.items():
+        object.__setattr__(forged, field_name, value)
+
+    with pytest.raises(ConfigError, match="verifier-issued|authentic"):
+        apply_managed_config(config_path, catalog_path, verification=forged)
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -192,51 +179,25 @@ def test_caller_forged_receipt_is_rejected(tmp_path, monkeypatch) -> None:
         'note = "# <<< codex-model-switcher managed end"',
     ],
 )
-def test_marker_substrings_inside_user_content_are_rejected(tmp_path, monkeypatch, line) -> None:
-    isolated_home = tmp_path / "isolated-codex-home"
-    isolated_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
-    config_path = isolated_home / "config.toml"
-    config_path.write_text(line + "\n", encoding="utf-8")
-    catalog_path = tmp_path / "safe-picker.json"
-    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
-
+def test_marker_substrings_inside_user_content_are_rejected(line) -> None:
     with pytest.raises(ConfigError, match="marker"):
-        apply_managed_config(config_path, catalog_path, verification=_verification(catalog_path))
+        _replace_or_append_managed_block(line + "\n", "managed")
 
 
-def test_duplicate_managed_blocks_are_rejected(tmp_path, monkeypatch) -> None:
-    isolated_home = tmp_path / "isolated-codex-home"
-    isolated_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
-    config_path = isolated_home / "config.toml"
-    config_path.write_bytes(b"model = \"original\"\n")
-    catalog_path = tmp_path / "safe-picker.json"
-    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
-    verification = _verification(catalog_path)
-
-    apply_managed_config(config_path, catalog_path, verification=verification)
-    existing = config_path.read_text(encoding="utf-8")
-    config_path.write_text(existing + existing, encoding="utf-8")
+def test_duplicate_managed_blocks_are_rejected() -> None:
+    block = "\n".join((MANAGED_START, "managed", MANAGED_END))
 
     with pytest.raises(ConfigError, match="exactly one|duplicate|marker"):
-        apply_managed_config(config_path, catalog_path, verification=verification)
+        _replace_or_append_managed_block(block + "\n" + block, "managed")
 
 
-def test_marker_lines_inside_toml_multiline_string_are_rejected(tmp_path, monkeypatch) -> None:
-    isolated_home = tmp_path / "isolated-codex-home"
-    isolated_home.mkdir()
-    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
-    config_path = isolated_home / "config.toml"
-    config_path.write_text(
+def test_marker_lines_inside_toml_multiline_string_are_rejected() -> None:
+    config_text = (
         'notes = """\n'
         "# >>> codex-model-switcher managed start\n"
         "# <<< codex-model-switcher managed end\n"
-        '"""\n',
-        encoding="utf-8",
+        '"""\n'
     )
-    catalog_path = tmp_path / "safe-picker.json"
-    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
 
     with pytest.raises(ConfigError, match="multiline"):
-        apply_managed_config(config_path, catalog_path, verification=_verification(catalog_path))
+        _replace_or_append_managed_block(config_text, "managed")

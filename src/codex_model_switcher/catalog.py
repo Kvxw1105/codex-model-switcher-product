@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import tomllib
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -25,11 +26,6 @@ class CatalogValidationError(ValueError):
 
 
 _RECEIPT_SOURCE = "current-client-artifact"
-# This opaque identity is the writer capability.  It is deliberately separate
-# from candidate evidence and from any process-local signing scheme.  A receipt
-# can only obtain it inside the trusted-verifier operation below; no constructor
-# or receipt factory exposes it to callers.
-_WRITER_CAPABILITY_TOKEN = object()
 
 
 @dataclass(frozen=True)
@@ -75,13 +71,12 @@ class PickerSchemaEvidence:
 
 @dataclass(frozen=True, init=False)
 class PickerVerificationReceipt:
-    """An opaque writer capability issued by a trusted verifier."""
+    """An opaque writer capability registered by an internal trusted flow."""
 
     schema_version: str
     client_version: str
     catalog_sha256: str
     source: str
-    _writer_capability: object
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("PickerVerificationReceipt is verifier-issued")
@@ -97,20 +92,20 @@ class PickerVerificationReceipt:
             )
             return (
                 self.source == _RECEIPT_SOURCE
-                and self._writer_capability is _WRITER_CAPABILITY_TOKEN
+                and _is_registered_receipt(self)
             )
         except (AttributeError, TypeError, ValueError):
             return False
 
 
 class TrustedPickerVerifier(ABC):
-    """Future external-verifier boundary for issuing the writer capability.
+    """Future external-verifier boundary for reading client evidence.
 
-    The package intentionally ships no concrete implementation.  A real
-    adapter must obtain non-sensitive evidence from the current client across
-    its trusted boundary; callers cannot inject an evidence callback into this
-    class.  A test subclass may exercise the writer seam, but its receipt is
-    not native-client evidence and never makes Gate 1 pass.
+    The package intentionally ships no concrete implementation and this
+    interface deliberately has no receipt factory.  A real adapter must obtain
+    non-sensitive evidence from the current client across its trusted boundary;
+    callers cannot inject an evidence callback or obtain a writer capability
+    from a subclass.
     """
 
     @abstractmethod
@@ -121,30 +116,19 @@ class TrustedPickerVerifier(ABC):
         """Read evidence from a trusted external client adapter."""
         raise NotImplementedError
 
-    def issue_receipt(self, catalog: CatalogDocument) -> PickerVerificationReceipt:
-        if not isinstance(catalog, CatalogDocument):
-            raise TypeError("catalog must be a CatalogDocument")
-        evidence = self._read_current_client_evidence(catalog)
-        if not isinstance(evidence, PickerSchemaEvidence):
-            raise CatalogValidationError("verifier must return PickerSchemaEvidence")
-        if catalog.schema_version is None:
-            raise CatalogValidationError("current client did not provide a schema_version")
-        if evidence.schema_version != catalog.schema_version:
-            raise CatalogValidationError("verifier schema_version does not match the catalog")
-        if evidence.client_version != catalog.client_version:
-            raise CatalogValidationError("verifier client_version does not match the catalog")
-        _validate_receipt_fields(
-            catalog.schema_version,
-            catalog.client_version,
-            catalog_fingerprint(catalog),
-        )
-        receipt = object.__new__(PickerVerificationReceipt)
-        object.__setattr__(receipt, "schema_version", catalog.schema_version)
-        object.__setattr__(receipt, "client_version", catalog.client_version)
-        object.__setattr__(receipt, "catalog_sha256", catalog_fingerprint(catalog))
-        object.__setattr__(receipt, "source", _RECEIPT_SOURCE)
-        object.__setattr__(receipt, "_writer_capability", _WRITER_CAPABILITY_TOKEN)
-        return receipt
+
+def _make_receipt_registry_checker():
+    """Keep the registration set private; this build has no issuing flow."""
+
+    registered: weakref.WeakSet[PickerVerificationReceipt] = weakref.WeakSet()
+
+    def is_registered(receipt: PickerVerificationReceipt) -> bool:
+        return receipt in registered
+
+    return is_registered
+
+
+_is_registered_receipt = _make_receipt_registry_checker()
 
 
 def _validate_receipt_fields(

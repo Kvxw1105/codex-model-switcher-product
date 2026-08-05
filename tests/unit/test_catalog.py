@@ -151,7 +151,7 @@ def test_picker_contract_result_cannot_be_constructed_as_native_pass() -> None:
         PickerContractResult(True, "fake", evidence, "example-provider", True)
 
 
-def test_only_verifier_issued_receipt_can_be_created_for_apply() -> None:
+def test_untrusted_verifier_subclass_cannot_issue_a_receipt() -> None:
     catalog = {
         "schema_version": "picker-v1",
         "client_version": "9.9.9",
@@ -159,27 +159,45 @@ def test_only_verifier_issued_receipt_can_be_created_for_apply() -> None:
         "models": [_route_to_record()],
     }
     document = catalog_from_mapping(catalog)
-    class FixtureTrustedVerifier(TrustedPickerVerifier):
+    class CallerVerifier(TrustedPickerVerifier):
         def _read_current_client_evidence(self, candidate):
             return PickerSchemaEvidence(
                 schema_version=candidate.schema_version,
                 client_version=candidate.client_version,
-                source="fixture-verifier",
+                source="caller-forged-runtime",
             )
 
-    verifier = FixtureTrustedVerifier()
+    verifier = CallerVerifier()
 
-    receipt = verifier.issue_receipt(document)
-
-    assert receipt.schema_version == "picker-v1"
-    assert receipt.client_version == "9.9.9"
-    assert not hasattr(PickerVerificationReceipt, "_from_verifier")
+    assert not hasattr(CallerVerifier, "issue_receipt")
+    with pytest.raises(AttributeError, match="issue_receipt"):
+        verifier.issue_receipt(document)
 
 
-def test_untrusted_injected_verifier_factory_is_not_exposed() -> None:
+def test_receipt_factories_are_not_exposed() -> None:
     import codex_model_switcher.catalog as catalog_module
 
     assert not hasattr(catalog_module, "PickerVerifier")
+    assert not hasattr(TrustedPickerVerifier, "issue_receipt")
+    assert not hasattr(PickerVerificationReceipt, "_from_verifier")
+
+
+def test_object_new_receipt_copy_is_rejected() -> None:
+    import codex_model_switcher.catalog as catalog_module
+
+    forged = object.__new__(PickerVerificationReceipt)
+    for field_name, value in {
+        "schema_version": "picker-v1",
+        "client_version": "9.9.9",
+        "catalog_sha256": "0" * 64,
+        "source": "current-client-artifact",
+        "_writer_capability": getattr(catalog_module, "_WRITER_CAPABILITY_TOKEN", object()),
+    }.items():
+        object.__setattr__(forged, field_name, value)
+
+    assert forged._is_authentic() is False
+
+
 def _route_to_record() -> dict[str, object]:
     return {
         "id": "cms-example-chat",
