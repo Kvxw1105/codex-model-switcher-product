@@ -48,7 +48,11 @@ class FirstThenWaitStream(httpx.AsyncByteStream):
 
     async def __aiter__(self):
         self.first_sent.set()
-        yield b"id: first\ndata: {\"delta\":1}\n\n"
+        yield (
+            b'id: first\ndata: {"id":"chat-cancel","created":1700000003,'
+            b'"model":"deepseek-v4-flash","choices":[{"index":0,'
+            b'"delta":{"content":"hi"},"finish_reason":null}]}\n\n'
+        )
         await self.release.wait()
 
     async def aclose(self) -> None:
@@ -151,17 +155,18 @@ def test_cancel_active_stream_closes_upstream_response_before_returning() -> Non
         response = await router.handle(
             RouterRequest(
                 "deepseek-model",
-                {"messages": [{"role": "user", "content": "hello"}]},
+                {"input": "hello"},
                 "task-fixture",
                 "turn-active-cancel",
-                api="chat",
+                api="responses",
                 stream=True,
             )
         )
         first_received = asyncio.Event()
 
         async def consume() -> None:
-            async for _event in response.aiter_events():
+            async for event in response.aiter_events():
+                assert event.event == "response.created"
                 first_received.set()
                 await asyncio.Event().wait()
 

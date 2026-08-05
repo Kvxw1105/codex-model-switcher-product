@@ -128,6 +128,8 @@ def test_third_party_request_never_forwards_inbound_chatgpt_identity() -> None:
                 or request.headers["authorization"] != "Bearer inbound-chatgpt"
             )
             assert "cookie" not in request.headers
+            body = json.loads((await request.aread()).decode("utf-8"))
+            assert body["thinking"] == {"type": "disabled"}
             return httpx.Response(
                 200,
                 json={"id": "third-party-r1", "choices": [{"message": {"content": "ok"}}]},
@@ -150,6 +152,34 @@ def test_third_party_request_never_forwards_inbound_chatgpt_identity() -> None:
         assert response.status_code == 200
         assert transport.requests[0].headers["authorization"] == "Bearer deepseek-fixture"
         assert "cookie" not in transport.requests[0].headers
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_deepseek_explicit_reasoning_or_tools_are_rejected_before_upstream() -> None:
+    async def run() -> None:
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            raise AssertionError("unsupported DeepSeek capability must not reach upstream")
+
+        router, transport, client = make_router(handler)
+        cases = (
+            ("reasoning", {"input": "hello", "reasoning": {"effort": "medium"}}),
+            ("thinking", {"input": "hello", "thinking": {"type": "enabled"}}),
+            ("tools", {"input": "hello", "tools": [{"type": "function"}]}),
+        )
+        for suffix, payload in cases:
+            response = await router.handle(
+                RouterRequest(
+                    "deepseek-model",
+                    payload,
+                    "task-fixture",
+                    f"turn-explicit-{suffix}",
+                )
+            )
+            assert response.status_code == 422
+            assert response.json()["error"]["unsupported_item_types"] == [suffix]
+        assert transport.requests == []
         await client.aclose()
 
     asyncio.run(run())

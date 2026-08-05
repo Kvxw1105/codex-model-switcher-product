@@ -92,7 +92,10 @@ async def iter_sse_events(chunks: AsyncIterator[bytes]) -> AsyncIterator[SSEEven
                 boundary = _find_event_boundary(buffer)
                 if boundary is None:
                     break
-                block, buffer = buffer[:boundary[0]], buffer[boundary[1] :]
+                block, buffer = (
+                    buffer[: boundary[0]],
+                    buffer[boundary[0] + boundary[1] :],
+                )
                 event = _parse_sse_block(block)
                 if event is not None:
                     yield event

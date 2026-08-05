@@ -14,7 +14,9 @@ import httpx
 from .adapters.chat import adapt_chat_to_responses
 from .adapters.responses import (
     AdapterError,
+    ChatToResponsesTextStream,
     UnsupportedItemError,
+    UnsupportedStreamChunkError,
     adapt_chat_response_to_responses,
     adapt_responses_to_chat,
     adapt_responses_to_responses,
@@ -268,16 +270,6 @@ class Router:
                 required_fields=["codex_task_id", "turn_id"],
             )
         target = self._table.resolve_target(request.model_id)
-        if request.stream and request.api != target.wire_api:
-            raise UnsupportedItemError(
-                [
-                    (
-                        "streaming_responses_to_chat"
-                        if request.api == "responses" and target.wire_api == "chat"
-                        else "streaming_chat_to_responses"
-                    )
-                ]
-            )
         turn_key = (request.codex_task_id, request.turn_id)
         active_model = self._active_turns.get(turn_key)
         if active_model is not None:
@@ -318,10 +310,36 @@ class Router:
         if target.wire_api == request.api == "chat":
             body = dict(request.payload)
             body["model"] = target.route.upstream_model
-            return body
+            return self._prepare_deepseek_chat_body(request.payload, target, body)
         if target.wire_api == "chat":
-            return adapt_responses_to_chat(request.payload, model=target.route.upstream_model)
+            body = adapt_responses_to_chat(request.payload, model=target.route.upstream_model)
+            return self._prepare_deepseek_chat_body(request.payload, target, body)
         return adapt_chat_to_responses(request.payload, model=target.route.upstream_model)
+
+    def _prepare_deepseek_chat_body(
+        self,
+        source: Mapping[str, Any],
+        target: RouteTarget,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        if target.route.provider_id != "deepseek":
+            return body
+        unsupported: list[str] = []
+        if "reasoning" in source:
+            unsupported.append("reasoning")
+        if any(key in source for key in ("tools", "tool_choice", "parallel_tool_calls")):
+            unsupported.append("tools")
+        if "thinking" not in source:
+            body["thinking"] = {"type": "disabled"}
+        else:
+            thinking = source["thinking"]
+            if not isinstance(thinking, Mapping) or thinking.get("type") != "disabled":
+                unsupported.append("thinking")
+            else:
+                body["thinking"] = dict(thinking)
+        if unsupported:
+            raise UnsupportedItemError(unsupported)
+        return body
 
     def _drop_cross_route_response_id(
         self,
@@ -410,6 +428,11 @@ class Router:
         headers: dict[str, str],
     ) -> AsyncIterator[SSEEvent]:
         active.task = asyncio.current_task()
+        translator = (
+            ChatToResponsesTextStream()
+            if active.request.api == "responses" and active.target.wire_api == "chat"
+            else None
+        )
         try:
             if active.cancelled.is_set():
                 raise asyncio.CancelledError
@@ -432,7 +455,16 @@ class Router:
                 async for event in iter_sse_events(response.aiter_bytes()):
                     if active.cancelled.is_set():
                         raise asyncio.CancelledError
-                    yield event
+                    if translator is None:
+                        yield event
+                        continue
+                    try:
+                        translated = translator.translate(event)
+                    except UnsupportedStreamChunkError as error:
+                        yield translator.error_event(event, error)
+                        return
+                    for translated_event in translated:
+                        yield translated_event
         finally:
             active.close_upstream = None
             self._finish(active)

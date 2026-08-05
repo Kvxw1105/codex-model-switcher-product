@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from ..upstream import SSEEvent
+
 
 class AdapterError(ValueError):
     """Base error for protocol conversion failures."""
@@ -44,6 +46,245 @@ class UnsupportedItemError(AdapterError):
 class AdapterResult:
     payload: dict[str, Any]
     compatibility_warnings: tuple[str, ...] = ()
+
+
+class UnsupportedStreamChunkError(AdapterError):
+    """A Chat stream chunk has no safe text-only Responses equivalent."""
+
+    def __init__(self, unsupported_type: str) -> None:
+        self.unsupported_type = unsupported_type
+        super().__init__(f"unsupported upstream streaming chunk: {unsupported_type}")
+
+
+class ChatToResponsesTextStream:
+    """Translate one single-choice Chat text stream into Responses events.
+
+    The translator deliberately has no tool/reasoning fallback.  It reuses
+    upstream response metadata and only emits usage when Chat supplied it.
+    """
+
+    def __init__(self) -> None:
+        self._response_id: str | None = None
+        self._model: str | None = None
+        self._created_at: int | None = None
+        self._text = ""
+        self._usage: Any = None
+        self._started = False
+        self._finished = False
+        self._saw_finish_reason = False
+        self._sequence_number = 0
+
+    def translate(self, event: SSEEvent) -> tuple[SSEEvent, ...]:
+        if self._finished:
+            if event.data.strip() == "[DONE]":
+                return ()
+            raise UnsupportedStreamChunkError("post_completion_chunk")
+        if event.event not in (None, "message"):
+            raise UnsupportedStreamChunkError("unknown_chunk")
+        if event.data.strip() == "[DONE]":
+            return self._finish(event.id)
+        try:
+            payload = json.loads(event.data)
+        except json.JSONDecodeError as error:
+            raise UnsupportedStreamChunkError("unknown_chunk") from error
+        if not isinstance(payload, Mapping):
+            raise UnsupportedStreamChunkError("unknown_chunk")
+
+        self._read_metadata(payload)
+        output: list[SSEEvent] = []
+
+        usage = payload.get("usage")
+        if usage is not None:
+            if not isinstance(usage, Mapping):
+                raise UnsupportedStreamChunkError("usage")
+            self._usage = copy.deepcopy(dict(usage))
+
+        choices = payload.get("choices")
+        if choices == [] and usage is not None:
+            if not self._started:
+                output.append(self._created(event.id))
+                self._started = True
+            return tuple(output)
+        if not isinstance(choices, list) or len(choices) != 1:
+            raise UnsupportedStreamChunkError("unknown_chunk")
+        choice = choices[0]
+        if not isinstance(choice, Mapping) or choice.get("index", 0) != 0:
+            raise UnsupportedStreamChunkError("unknown_chunk")
+        delta = choice.get("delta")
+        if not isinstance(delta, Mapping):
+            raise UnsupportedStreamChunkError("unknown_chunk")
+        self._reject_unsupported_delta(delta)
+        content = delta.get("content")
+        if content is not None and not isinstance(content, str):
+            raise UnsupportedStreamChunkError("non_text_content")
+        if not self._started:
+            output.append(self._created(event.id))
+            self._started = True
+        if isinstance(content, str):
+            self._text += content
+            output.append(
+                self._event(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": self._response_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": content,
+                    },
+                    event.id,
+                )
+            )
+        if choice.get("finish_reason") is not None:
+            self._saw_finish_reason = True
+            output.extend(self._finish(event.id))
+        return tuple(output)
+
+    def error_event(self, event: SSEEvent, error: UnsupportedStreamChunkError) -> SSEEvent:
+        return self._event(
+            "error",
+            {
+                "type": "error",
+                "code": "unsupported_upstream_chunk",
+                "message": str(error),
+                "param": error.unsupported_type,
+            },
+            event.id,
+        )
+
+    def _read_metadata(self, payload: Mapping[str, Any]) -> None:
+        response_id = payload.get("id")
+        model = payload.get("model")
+        created = payload.get("created")
+        if not self._started:
+            if not isinstance(response_id, str) or not response_id:
+                raise UnsupportedStreamChunkError("missing_response_id")
+            if not isinstance(model, str) or not model:
+                raise UnsupportedStreamChunkError("missing_model")
+            if not isinstance(created, int) or isinstance(created, bool):
+                raise UnsupportedStreamChunkError("missing_created")
+            self._response_id = response_id
+            self._model = model
+            self._created_at = created
+            return
+        if response_id is not None and response_id != self._response_id:
+            raise UnsupportedStreamChunkError("response_id_changed")
+        if model is not None and model != self._model:
+            raise UnsupportedStreamChunkError("model_changed")
+        if created is not None and created != self._created_at:
+            raise UnsupportedStreamChunkError("created_changed")
+
+    @staticmethod
+    def _reject_unsupported_delta(delta: Mapping[str, Any]) -> None:
+        if "reasoning_content" in delta:
+            raise UnsupportedStreamChunkError("reasoning_content")
+        if "tool_calls" in delta:
+            raise UnsupportedStreamChunkError("tool_calls")
+        allowed = {"role", "content"}
+        if any(key not in allowed for key in delta):
+            raise UnsupportedStreamChunkError("unknown_chunk")
+
+    def _created(self, event_id: str | None) -> SSEEvent:
+        return self._event(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": self._response_id,
+                    "object": "response",
+                    "created_at": self._created_at,
+                    "status": "in_progress",
+                    "model": self._model,
+                    "output": [],
+                },
+            },
+            event_id,
+        )
+
+    def _finish(self, event_id: str | None) -> tuple[SSEEvent, ...]:
+        if self._finished:
+            return ()
+        self._finished = True
+        output_text = {
+            "type": "output_text",
+            "text": self._text,
+            "annotations": [],
+        }
+        output_item = {
+            "id": self._response_id,
+            "status": "completed",
+            "type": "message",
+            "role": "assistant",
+            "content": [output_text],
+        }
+        completed_response: dict[str, Any] = {
+            "id": self._response_id,
+            "object": "response",
+            "created_at": self._created_at,
+            "status": "completed",
+            "model": self._model,
+            "output": [output_item],
+        }
+        if self._usage is not None:
+            completed_response["usage"] = self._usage
+        warnings: list[str] = []
+        if not self._saw_finish_reason:
+            warnings.append("missing_finish_reason")
+        if self._usage is None:
+            warnings.append("missing_usage")
+        if warnings:
+            completed_response["compatibility_warnings"] = warnings
+        return (
+            self._event(
+                "response.output_text.done",
+                {
+                    "type": "response.output_text.done",
+                    "item_id": self._response_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": self._text,
+                },
+                event_id,
+            ),
+            self._event(
+                "response.content_part.done",
+                {
+                    "type": "response.content_part.done",
+                    "item_id": self._response_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": output_text,
+                },
+                event_id,
+            ),
+            self._event(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": output_item,
+                },
+                event_id,
+            ),
+            self._event(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": completed_response,
+                },
+                event_id,
+            ),
+        )
+
+    def _event(self, event_name: str, payload: Mapping[str, Any], event_id: str | None) -> SSEEvent:
+        event_payload = dict(payload)
+        event_payload["sequence_number"] = self._sequence_number
+        self._sequence_number += 1
+        return SSEEvent(
+            event_name,
+            json.dumps(event_payload, ensure_ascii=False, separators=(",", ":")),
+            event_id,
+        )
 
 
 def adapt_responses_to_responses(
