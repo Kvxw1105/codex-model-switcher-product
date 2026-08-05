@@ -1,0 +1,41 @@
+# 桌面契约与 Gate 1 证据
+
+本文件只记录本 worktree 能安全复现的契约和验证边界。fixture 使用 `example.invalid` 语义的假值；没有复制真实 catalog、认证头、token、cookie 或用户路径。
+
+## 已实现的可证实契约
+
+- `ModelCapability` 与 `ModelRoute` 是 frozen dataclass。
+- 每个 route 必须显式提供全部能力字段；缺失能力会拒绝加载，因此不会为未知模型填充统一 context window。
+- route 的 `model_id`、`provider_id` 和 `upstream_model` 必须是稳定、非空且无空白的标识；display name 必须包含 `Official` 或 `API` lane 标记。
+- 目录生成从调用方提供的模型缓存读取 `client_version`，不会硬编码客户端版本。没有 schema 证据时，候选明确带有 `schema_version: null` 和 `verification_status: UNVERIFIED`；`picker-v1` 不再是默认或通过信号。
+- 配置只写入受管区块中的 `model_provider` 与 `model_catalog_json`。没有写入 upstream URL、Authorization、cookie 或凭据字段。
+- `render_managed_config` 与 `apply_managed_config` 只接受由模块内部可信流程登记的 opaque writer capability；验证同时要求 receipt 对象本身的 `id` 命中私有 identity registry、registry 的 `weakref.ref(receipt) is receipt`，并校验 registry 封存字段与候选 catalog SHA-256。`PickerVerificationReceipt` 没有 public/protected 构造器、`_from_verifier` 或 `issue_receipt` 路径；当前没有真实 receipt 时 render/apply 必须拒绝。
+- `TrustedPickerVerifier` 只是未来真实外部 verifier 的证据读取抽象，本项目没有 concrete implementation，也不接受调用方注入 `evidence_provider`，更不会从 untrusted subclass/provider 生成 receipt。私有 registry 不是当前客户端证据，且不向 caller 暴露 registry/seal。
+- 受管区块 start/end marker 必须各自独占完整行且恰好一对；marker 出现在用户注释、TOML 字符串、嵌入文本或重复区块时直接拒绝替换。
+- apply 会在首次读取、当前 hash 检查、备份、临时文件写入和最终替换期间同时持有同路径临界区。Windows 用 `CreateFileW(FILE_FLAG_OPEN_REQUIRING_OPLOCK)` 在打开目标时取得 OS 级 namespace 保护，并用 `LockFileEx` 做协作进程内的全文件锁；单独的 `LockFileEx` 不被当作跨进程 rename 防线。替换使用 TxF：在同一 `CreateTransaction` 中把旧目标移到临时 shadow、建立新临时文件到目标的硬链接、删除两个临时名字，并用 `CreateFileTransactedW` 预先打开带 `share read/write`（拒绝 `DELETE/RENAME`）的新目标句柄，随后才 `CommitTransaction`。提交返回时新句柄已经存在，因此没有 `ReplaceFileW` 返回到 relock 的路径窗口；TxF/相关 API 不可用时 fail-closed，不回退到普通 `os.replace`。成功 apply 才创建包含写前字节和时间戳的原子备份，receipt 保存写前/写后 SHA-256。
+- 上述 Windows 强保证限定在支持这些 API 语义的本地文件系统；网络盘或特殊文件系统若不能取得 oplock/事务能力会拒绝操作，不把降级路径宣称为全局保护。
+- 非 Windows 使用进程锁和同目录 sidecar `flock`，只保证遵守该协作锁的进程；不参与锁的外部编辑仍可能造成 TOCTOU，代码不会把该 fallback 宣称为全局防护。若平台没有 `fcntl`，获取协作锁会 fail-closed，拒绝无锁写入。Windows 锁获取失败、锁定冲突或最终原子替换失败会拒绝操作。
+- restore 也在同一目标文件临界区内读取当前 hash、校验备份、写临时文件并替换；当前文件不是本项目最后一次写入的 hash 时拒绝，备份 hash 也必须匹配，恢复结果按字节保留原文件。
+
+## Gate 1：当前客户端原生 picker
+
+状态：`FAIL / UNVERIFIED`。
+
+本 worktree 没有安全可用的当前 Codex 客户端 schema 或 app-server 证据，且本任务禁止读取或输出真实 `catalog.json`、`auth.json`、token、cookie、Authorization 值。因此无法证明候选 `model_provider + model_catalog_json` 会被当前客户端接受，也不能把候选字段称为官方 picker schema。
+
+代码中的 `verify_isolated_picker_contract` 只在隔离 `CODEX_HOME` 中做候选一致性检查，结果永远是 `passed: false`，即使 fixture 的 schema/version 与配置完全一致也不会宣称 native picker 通过。它检查：
+
+1. `config.toml` 能被 TOML 解析；
+2. provider 与候选目录匹配；
+3. `model_catalog_json` 是与候选目录相同的 JSON；
+4. 记录调用方提供的不含隐私的候选 schema/version 来源，但不把该字段当作当前客户端通过信号。
+
+缺少真实外部 receipt 时结果明确为 `FAIL / UNVERIFIED`，即使本地配置语法正确也不能宣称 Gate 1 通过。`_register_receipt_for_registry_test` 只登记一个供 clone/identity contract 使用的内部测试对象，不进入 render/apply，也不代表 picker 证据；没有真实客户端启动、付费模型请求或 endpoint 猜测。进程内 capability/测试 seam 永远不等于 Gate 1 证据。
+
+## app-server、turn 边界与 compact
+
+当前安装客户端的 app-server 契约未在本轮获得可安全审查的证据，故以下结论保持未证实：同一 thread 的下一 turn 是否可指定另一个 model ID、完成/取消后的切换边界，以及是否存在稳定且不含隐私的 thread/turn correlation 字段。本项目不虚构 thread/turn ID，也不猜测请求 endpoint、请求头或认证行为。
+
+compact 归 app-server/thread 权威。本项目的目录和配置模块不保存聊天历史、不生成第二份摘要，也不实现第二套 compact 状态。
+
+在获得当前客户端或官方文档的非敏感证据前，不能报告官方上游 URL、请求头、认证行为、per-turn model 切换或跨通道 token 行为已验证；相关 Gate 继续保持失败/未验证。

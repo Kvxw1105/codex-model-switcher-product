@@ -1,0 +1,23 @@
+{
+  "schema_version": "picker-v1",
+  "client_version": "9.9.9",
+  "provider_id": "example-provider",
+  "models": [
+    {
+      "id": "cms-example-chat",
+      "display_name": "Example API",
+      "lane": "third_party",
+      "provider_id": "example-provider",
+      "upstream_model": "example-chat",
+      "capability": {
+        "context_window": 32000,
+        "supports_responses": true,
+        "supports_streaming": true,
+        "supports_tools": true,
+        "supports_images": false,
+        "supports_files": true,
+        "supports_compaction_context": false
+      }
+    }
+  ]
+}
