@@ -10,6 +10,7 @@ from codex_model_switcher.credentials import (
     CredentialStore,
     CredentialStoreError,
     KeyringCredentialStore,
+    ProviderIdAllowlist,
     ProviderIdError,
     configure_credential,
     migrate_legacy_catalog,
@@ -42,6 +43,11 @@ def assert_secret_absent(value: Any, secret: str) -> None:
         raise AssertionError("sensitive fixture leaked")
 
 
+def assert_secret_equal(actual: Any, expected: Any) -> None:
+    if actual != expected:
+        raise AssertionError("credential value mismatch")
+
+
 def test_provider_record_persists_credential_ref_instead_of_bearer_value() -> None:
     secret = "fixture-provider-secret-value"
     record = serialize_provider_record(
@@ -57,6 +63,30 @@ def test_provider_record_persists_credential_ref_instead_of_bearer_value() -> No
     assert "token" not in record
     assert "headers" not in record
     assert_secret_absent(record, secret)
+
+
+def test_camel_case_sensitive_fields_are_removed_but_safe_labels_remain() -> None:
+    secret = "fixture-camel-case-secret-value"
+    record = serialize_provider_record(
+        {
+            "provider_id": "deepseek",
+            "tokenValue": secret,
+            "accessToken": secret,
+            "apiKey": secret,
+            "tokenLabel": "display-only",
+        }
+    )
+
+    assert "tokenValue" not in record
+    assert "accessToken" not in record
+    assert "apiKey" not in record
+    assert record["tokenLabel"] == "display-only"
+    assert_secret_absent(record, secret)
+
+
+def test_unregistered_credential_ref_cannot_become_username() -> None:
+    with pytest.raises(ProviderIdError):
+        serialize_provider_record({"credential_ref": "unregistered-provider"})
 
 
 def test_memory_fake_satisfies_credential_store_protocol() -> None:
@@ -88,7 +118,7 @@ def test_keyring_store_uses_fixed_service_and_validated_provider_username() -> N
     store.set("deepseek", secret)
 
     assert store.exists("deepseek") is True
-    assert store.get("deepseek") == secret
+    assert_secret_equal(store.get("deepseek"), secret)
     assert all(service == "CodexModelSwitcher" for service, _ in keyring.calls)
     assert all(username == "deepseek" for _, username in keyring.calls)
     store.delete("deepseek")
@@ -105,6 +135,22 @@ def test_keyring_store_rejects_unvalidated_provider_username() -> None:
 
     with pytest.raises(ProviderIdError):
         store.set("user@example.com", "fixture-secret")
+
+
+def test_keyring_store_requires_registered_provider_id_and_rejects_secret_like_id() -> None:
+    class FakeKeyring:
+        def set_password(self, *_args: object) -> None:
+            raise AssertionError("backend must not be called")
+
+    store = KeyringCredentialStore(
+        keyring_module=FakeKeyring(),
+        provider_id_verifier=ProviderIdAllowlist({"deepseek"}),
+    )
+
+    with pytest.raises(ProviderIdError):
+        store.set("unregistered-provider", "fixture-secret")
+    with pytest.raises(ProviderIdError):
+        store.set("token-value-secret", "fixture-secret")
 
 
 def test_keyring_backend_failure_does_not_chain_secret() -> None:
@@ -155,7 +201,7 @@ def test_third_party_credential_ignores_inbound_authorization() -> None:
         credential_store=store,
     )
 
-    assert resolved == f"Bearer {secret}"
+    assert_secret_equal(resolved, f"Bearer {secret}")
     assert "test-auth" not in resolved
     assert store.get_calls == ["deepseek"]
 
@@ -199,7 +245,57 @@ def test_migrate_legacy_catalog_writes_and_verifies_secret_without_deleting_sour
     assert migrated["providers"][0]["credential_ref"] == "deepseek"
     assert_secret_absent(migrated, secret)
     assert_secret_absent(json.loads(destination.read_text(encoding="utf-8")), secret)
-    assert store.get("deepseek") == secret
+    assert_secret_equal(store.get("deepseek"), secret)
+
+
+def test_migrate_nested_credentials_api_key_writes_and_verifies_secret(tmp_path: Path) -> None:
+    secret = "fixture-nested-catalog-secret-value"
+    source = tmp_path / "legacy-catalog.json"
+    source.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "provider_id": "deepseek",
+                        "credentials": {"api_key": secret},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = MemoryCredentialStore()
+
+    migrated = migrate_legacy_catalog(source, store)
+
+    assert migrated["providers"][0]["credential_ref"] == "deepseek"
+    assert_secret_equal(store.get("deepseek"), secret)
+    assert_secret_absent(migrated, secret)
+
+
+def test_migrate_rejects_multiple_nested_credentials_without_output(tmp_path: Path) -> None:
+    source = tmp_path / "legacy-catalog.json"
+    source.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {
+                        "provider_id": "deepseek",
+                        "credentials": {
+                            "api_key": "fixture-first-secret-value",
+                            "access_token": "fixture-second-secret-value",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CredentialMigrationError) as error:
+        migrate_legacy_catalog(source, MemoryCredentialStore())
+
+    assert str(error.value) == "legacy provider contains multiple credentials"
 
 
 def test_migrate_legacy_catalog_stops_before_output_when_readback_differs(tmp_path: Path) -> None:
@@ -220,4 +316,4 @@ def test_migrate_legacy_catalog_stops_before_output_when_readback_differs(tmp_pa
         migrate_legacy_catalog(source, CorruptingStore(), destination=destination)
 
     assert not destination.exists()
-    assert "fixture-readback-secret-value" not in str(error.value)
+    assert_secret_absent(str(error.value), secret)

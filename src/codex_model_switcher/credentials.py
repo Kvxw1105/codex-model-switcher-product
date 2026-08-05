@@ -8,7 +8,9 @@ until those layers are integrated.
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections.abc import Callable, Collection, Iterable
 from pathlib import Path
 from typing import Any, Mapping, Protocol, runtime_checkable
 
@@ -17,6 +19,7 @@ REDACTED = "[REDACTED]"
 REDACTED_URL = "[REDACTED_URL]"
 
 _PROVIDER_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,63})$")
+_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[^\s,;]+")
 _LABELED_SECRET_RE = re.compile(
     r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|"
@@ -27,22 +30,31 @@ _KEY_SECRET_RE = re.compile(r"(?i)^sk-[a-z0-9_-]{8,}$")
 
 _SENSITIVE_KEYS = {
     "access_token",
+    "auth_header",
     "account_email",
     "api_key",
     "apikey",
     "api_token",
     "authorization",
+    "bearer",
+    "bearer_token",
+    "client_secret",
     "cookie",
     "credential",
     "credentials",
+    "credential_value",
     "email",
     "id_token",
+    "key",
     "password",
     "proxy_authorization",
     "refresh_token",
     "secret",
+    "secret_key",
+    "secret_value",
     "set_cookie",
     "token",
+    "token_value",
 }
 _SENSITIVE_KEY_SUFFIXES = (
     "_api_key",
@@ -71,6 +83,26 @@ _PRIVATE_CONTENT_KEYS = {
     "files",
     "prompt",
 }
+
+DEFAULT_REGISTERED_PROVIDER_IDS = frozenset(
+    {
+        "anthropic",
+        "cohere",
+        "deepseek",
+        "gemini",
+        "google",
+        "groq",
+        "mistral",
+        "moonshot",
+        "openai",
+        "openrouter",
+        "qwen",
+        "siliconflow",
+        "volcengine",
+        "xai",
+        "zhipu",
+    }
+)
 
 
 class CredentialError(Exception):
@@ -117,18 +149,76 @@ class CredentialStore(Protocol):
 CredentialStoreProtocol = CredentialStore
 
 
-def validate_provider_id(provider_id: str) -> str:
-    """Validate the safe identifier used as a Credential Manager username."""
+ProviderIdVerifier = Callable[[str], bool]
+ProviderIdVerifierSpec = ProviderIdVerifier | Collection[str] | None
+_SECRET_LIKE_PROVIDER_ID_RE = re.compile(
+    r"(?i)(?:^|[-_])(bearer|token|secret|credential|api[_-]?key)(?:$|[-_])|^sk-[a-z0-9_-]{8,}$"
+)
 
+
+def _validate_provider_id_syntax(provider_id: str) -> str:
     if not isinstance(provider_id, str) or _PROVIDER_ID_RE.fullmatch(provider_id) is None:
+        raise ProviderIdError("provider ID is not valid")
+    if _SECRET_LIKE_PROVIDER_ID_RE.search(provider_id):
         raise ProviderIdError("provider ID is not valid")
     return provider_id
 
 
-def credential_ref(provider_id: str) -> str:
+class ProviderIdAllowlist:
+    """Explicit registry of provider IDs permitted for credential usernames."""
+
+    def __init__(self, provider_ids: Iterable[str]) -> None:
+        ids = frozenset(_validate_provider_id_syntax(provider_id) for provider_id in provider_ids)
+        self._provider_ids = ids
+
+    def __call__(self, provider_id: str) -> bool:
+        return provider_id in self._provider_ids
+
+    def __contains__(self, provider_id: object) -> bool:
+        return provider_id in self._provider_ids
+
+
+def _is_registered_provider(provider_id: str, verifier: ProviderIdVerifierSpec) -> bool:
+    if verifier is None:
+        return provider_id in DEFAULT_REGISTERED_PROVIDER_IDS
+    if isinstance(verifier, Collection) and not isinstance(verifier, (str, bytes)):
+        return provider_id in verifier
+    if callable(verifier):
+        try:
+            return bool(verifier(provider_id))
+        except Exception:
+            return False
+    return False
+
+
+def verify_provider_id(
+    provider_id: str,
+    provider_id_verifier: ProviderIdVerifierSpec = None,
+) -> str:
+    """Validate syntax, reject secret-like IDs, and require registered membership."""
+
+    provider_id = _validate_provider_id_syntax(provider_id)
+    if not _is_registered_provider(provider_id, provider_id_verifier):
+        raise ProviderIdError("provider ID is not registered")
+    return provider_id
+
+
+def validate_provider_id(
+    provider_id: str,
+    provider_id_verifier: ProviderIdVerifierSpec = None,
+) -> str:
+    """Validate the registered ID used as a Credential Manager username."""
+
+    return verify_provider_id(provider_id, provider_id_verifier)
+
+
+def credential_ref(
+    provider_id: str,
+    provider_id_verifier: ProviderIdVerifierSpec = None,
+) -> str:
     """Return the non-secret catalog reference for a provider credential."""
 
-    return validate_provider_id(provider_id)
+    return verify_provider_id(provider_id, provider_id_verifier)
 
 
 class KeyringCredentialStore:
@@ -136,16 +226,22 @@ class KeyringCredentialStore:
 
     SERVICE_NAME = SERVICE_NAME
 
-    def __init__(self, keyring_module: Any | None = None) -> None:
+    def __init__(
+        self,
+        keyring_module: Any | None = None,
+        *,
+        provider_id_verifier: ProviderIdVerifierSpec = None,
+    ) -> None:
         if keyring_module is None:
             try:
                 import keyring as keyring_module
             except ImportError:
                 raise CredentialStoreError("keyring package is required") from None
         self._keyring = keyring_module
+        self._provider_id_verifier = provider_id_verifier
 
     def set(self, provider_id: str, secret: str) -> None:
-        username = validate_provider_id(provider_id)
+        username = validate_provider_id(provider_id, self._provider_id_verifier)
         _validate_secret(secret)
         try:
             self._keyring.set_password(self.SERVICE_NAME, username, secret)
@@ -153,7 +249,7 @@ class KeyringCredentialStore:
             raise CredentialStoreError("credential backend write failed") from None
 
     def get(self, provider_id: str) -> str:
-        username = validate_provider_id(provider_id)
+        username = validate_provider_id(provider_id, self._provider_id_verifier)
         try:
             value = self._keyring.get_password(self.SERVICE_NAME, username)
         except Exception:
@@ -165,7 +261,7 @@ class KeyringCredentialStore:
         return value
 
     def delete(self, provider_id: str) -> None:
-        username = validate_provider_id(provider_id)
+        username = validate_provider_id(provider_id, self._provider_id_verifier)
         try:
             self._keyring.delete_password(self.SERVICE_NAME, username)
         except Exception as error:
@@ -174,7 +270,7 @@ class KeyringCredentialStore:
             raise CredentialStoreError("credential backend delete failed") from None
 
     def exists(self, provider_id: str) -> bool:
-        username = validate_provider_id(provider_id)
+        username = validate_provider_id(provider_id, self._provider_id_verifier)
         try:
             return self._keyring.get_password(self.SERVICE_NAME, username) is not None
         except Exception:
@@ -188,11 +284,13 @@ def configure_credential(
     credential_store: CredentialStore,
     provider_id: str,
     secret: str,
+    *,
+    provider_id_verifier: ProviderIdVerifierSpec = None,
 ) -> dict[str, bool]:
     """Write a credential and expose only a boolean GUI/call-layer result."""
 
     try:
-        validate_provider_id(provider_id)
+        validate_provider_id(provider_id, provider_id_verifier)
         _validate_secret(secret)
         credential_store.set(provider_id, secret)
         configured = bool(credential_store.exists(provider_id))
@@ -211,11 +309,12 @@ def resolve_upstream_auth(
     provider_id: str,
     inbound_authorization: str | None,
     credential_store: CredentialStore,
+    provider_id_verifier: ProviderIdVerifierSpec = None,
 ) -> str | None:
     """Resolve an upstream auth header while keeping official and third-party lanes separate."""
 
     if lane == "third_party":
-        validate_provider_id(provider_id)
+        validate_provider_id(provider_id, provider_id_verifier)
         try:
             secret = credential_store.get(provider_id)
         except KeyError:
@@ -233,8 +332,15 @@ def _validate_secret(secret: str) -> None:
         raise CredentialValueError("credential must be non-empty text")
 
 
+def _canonical_key(key: object) -> str:
+    text = str(key).strip()
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
+    text = re.sub(r"[^A-Za-z0-9]+", "_", text)
+    return re.sub(r"_+", "_", text).strip("_").lower()
+
+
 def _normal_key(key: object) -> str:
-    return str(key).strip().lower().replace("-", "_")
+    return _canonical_key(key)
 
 
 def _is_sensitive_key(key: object) -> bool:
@@ -337,6 +443,38 @@ def summarize_subprocess_env(environment: Mapping[str, Any]) -> dict[str, list[s
 _SAFE_LOG_FIELDS = ("route_id", "status_code", "elapsed_ms", "byte_count", "trace_id")
 
 
+def _is_secret_like_text(value: str) -> bool:
+    lowered = value.lower()
+    return (
+        "@" in value
+        or "://" in value
+        or any(
+            marker in lowered
+            for marker in (
+                "api_key",
+                "apikey",
+                "authorization",
+                "bearer",
+                "credential",
+                "password",
+                "secret",
+                "token",
+            )
+        )
+        or _KEY_SECRET_RE.fullmatch(value) is not None
+    )
+
+
+def _safe_log_identifier(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if _SAFE_IDENTIFIER_RE.fullmatch(value) is None:
+        return None
+    if _is_secret_like_text(value) or _redact_text(value) != value:
+        return None
+    return value
+
+
 def build_safe_log_record(
     fields: Mapping[str, Any] | None = None,
     **extra_fields: Any,
@@ -347,7 +485,23 @@ def build_safe_log_record(
     if fields is not None:
         combined.update(fields)
     combined.update(extra_fields)
-    return {field: combined[field] for field in _SAFE_LOG_FIELDS if field in combined}
+    record: dict[str, Any] = {}
+    for field in _SAFE_LOG_FIELDS:
+        if field not in combined:
+            continue
+        value = combined[field]
+        if field in {"route_id", "trace_id"}:
+            safe_value = _safe_log_identifier(value)
+            if safe_value is not None:
+                record[field] = safe_value
+        elif field == "status_code":
+            if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+                record[field] = value
+        elif field in {"elapsed_ms", "byte_count"}:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if math.isfinite(value) and value >= 0:
+                    record[field] = value
+    return record
 
 
 safe_log_fields = build_safe_log_record
@@ -376,6 +530,7 @@ def serialize_provider_record(
     provider: Mapping[str, Any],
     *,
     provider_id: str | None = None,
+    provider_id_verifier: ProviderIdVerifierSpec = None,
 ) -> dict[str, Any]:
     """Serialize provider metadata with a credential reference, never a secret."""
 
@@ -384,7 +539,7 @@ def serialize_provider_record(
     candidate = provider_id or provider.get("provider_id") or provider.get("id")
     if candidate is None:
         candidate = provider.get("credential_ref")
-    reference = credential_ref(candidate)  # type: ignore[arg-type]
+    reference = credential_ref(candidate, provider_id_verifier)  # type: ignore[arg-type]
     result = _sanitize_catalog_value(provider)
     if not isinstance(result, dict):
         raise TypeError("provider must serialize to an object")
@@ -399,7 +554,11 @@ sanitize_provider_record = serialize_provider_record
 serialize_provider = serialize_provider_record
 
 
-def serialize_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
+def serialize_catalog(
+    catalog: Mapping[str, Any],
+    *,
+    provider_id_verifier: ProviderIdVerifierSpec = None,
+) -> dict[str, Any]:
     """Serialize a catalog while replacing provider secrets with credential refs."""
 
     if not isinstance(catalog, Mapping):
@@ -409,7 +568,10 @@ def serialize_catalog(catalog: Mapping[str, Any]) -> dict[str, Any]:
         raise TypeError("catalog must serialize to an object")
     providers = catalog.get("providers")
     if isinstance(providers, list):
-        result["providers"] = [serialize_provider_record(provider) for provider in providers]
+        result["providers"] = [
+            serialize_provider_record(provider, provider_id_verifier=provider_id_verifier)
+            for provider in providers
+        ]
     return result
 
 
@@ -429,10 +591,13 @@ def _load_catalog(source: Mapping[str, Any] | str | Path) -> tuple[dict[str, Any
     return payload, source_path
 
 
-def _provider_id_from_record(provider: Mapping[str, Any]) -> str:
+def _provider_id_from_record(
+    provider: Mapping[str, Any],
+    provider_id_verifier: ProviderIdVerifierSpec = None,
+) -> str:
     candidate = provider.get("provider_id") or provider.get("id") or provider.get("credential_ref")
     try:
-        return validate_provider_id(candidate)
+        return validate_provider_id(candidate, provider_id_verifier)
     except ProviderIdError:
         raise CredentialMigrationError("legacy provider has no valid provider ID") from None
 
@@ -444,20 +609,26 @@ def _secret_from_legacy_value(value: Any) -> str | None:
     return bearer.group(1) if bearer else value
 
 
-def _find_legacy_secret(value: Any, *, key: object | None = None) -> str | None:
-    if _is_sensitive_key(key):
-        return _secret_from_legacy_value(value)
+def _collect_legacy_secrets(value: Any, *, key: object | None = None) -> list[str]:
+    secrets: list[str] = []
+    if _is_sensitive_key(key) and isinstance(value, str):
+        secret = _secret_from_legacy_value(value)
+        if secret is not None:
+            secrets.append(secret)
     if isinstance(value, Mapping):
         for item_key, item_value in value.items():
-            secret = _find_legacy_secret(item_value, key=item_key)
-            if secret is not None:
-                return secret
+            secrets.extend(_collect_legacy_secrets(item_value, key=item_key))
     if isinstance(value, list):
         for item in value:
-            secret = _find_legacy_secret(item)
-            if secret is not None:
-                return secret
-    return None
+            secrets.extend(_collect_legacy_secrets(item, key=key))
+    return secrets
+
+
+def _find_legacy_secret(value: Any, *, key: object | None = None) -> str | None:
+    secrets = _collect_legacy_secrets(value, key=key)
+    if len(secrets) > 1:
+        raise CredentialMigrationError("legacy provider contains multiple credentials")
+    return secrets[0] if secrets else None
 
 
 def _verify_written_credential(
@@ -479,6 +650,7 @@ def migrate_legacy_catalog(
     credential_store: CredentialStore,
     *,
     destination: str | Path | None = None,
+    provider_id_verifier: ProviderIdVerifierSpec = None,
 ) -> dict[str, Any]:
     """Explicitly migrate legacy inline credentials and preserve the source file."""
 
@@ -498,14 +670,14 @@ def migrate_legacy_catalog(
     for provider in providers:
         if not isinstance(provider, Mapping):
             raise CredentialMigrationError("legacy provider must be an object")
-        provider_id = _provider_id_from_record(provider)
+        provider_id = _provider_id_from_record(provider, provider_id_verifier)
         secret = _find_legacy_secret(provider)
         if secret is not None:
             _verify_written_credential(credential_store, provider_id, secret)
         elif not provider.get("credential_ref"):
             raise CredentialMigrationError("legacy provider has no credential")
 
-    migrated = serialize_catalog(catalog)
+    migrated = serialize_catalog(catalog, provider_id_verifier=provider_id_verifier)
     if destination is not None:
         destination_path = Path(destination)
         try:

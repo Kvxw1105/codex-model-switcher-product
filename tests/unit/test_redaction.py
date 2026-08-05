@@ -15,6 +15,11 @@ def assert_secret_absent(value: Any, secret: str) -> None:
         raise AssertionError("sensitive fixture leaked")
 
 
+def assert_secret_equal(actual: Any, expected: Any) -> None:
+    if actual != expected:
+        raise AssertionError("redaction value mismatch")
+
+
 def test_recursive_redactor_covers_headers_query_and_nested_json() -> None:
     secret = "fixture-redaction-secret-value"
     payload = {
@@ -37,6 +42,24 @@ def test_recursive_redactor_covers_headers_query_and_nested_json() -> None:
     assert_secret_absent(redacted, secret)
     assert "account@example.invalid" not in repr(redacted)
     assert "api.example.invalid" not in repr(redacted)
+
+
+def test_recursive_redactor_covers_camel_case_sensitive_fields_with_safe_counterexample() -> None:
+    secret = "fixture-camel-redaction-secret-value"
+    payload = {
+        "accessToken": secret,
+        "tokenValue": secret,
+        "apiKey": secret,
+        "tokenLabel": "display-only",
+    }
+
+    redacted = redact_sensitive(payload)
+
+    assert "accessToken" not in redacted
+    assert "tokenValue" not in redacted
+    assert "apiKey" not in redacted
+    assert_secret_equal(redacted["tokenLabel"], "display-only")
+    assert_secret_absent(redacted, secret)
 
 
 def test_exception_redaction_hides_secret_url_email_and_nested_attributes() -> None:
@@ -116,4 +139,19 @@ def test_safe_log_record_allows_only_route_telemetry() -> None:
         "byte_count": 128,
         "trace_id": "trace-123",
     }
+    assert_secret_absent(record, secret)
+
+
+def test_safe_log_record_drops_unsafe_route_and_trace_identifiers() -> None:
+    secret = "fixture-log-identifier-secret-value"
+    record = build_safe_log_record(
+        route_id=f"Bearer {secret}",
+        trace_id="account@example.invalid",
+        status_code=200,
+        elapsed_ms=42,
+        byte_count=128,
+    )
+
+    assert "route_id" not in record
+    assert "trace_id" not in record
     assert_secret_absent(record, secret)
