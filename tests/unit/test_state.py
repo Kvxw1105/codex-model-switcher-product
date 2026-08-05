@@ -11,6 +11,7 @@ from codex_model_switcher import state as state_module
 from codex_model_switcher.state import (
     DatabaseCorruptionError,
     DatabaseQuarantineError,
+    StateError,
     StateStore,
 )
 
@@ -1470,6 +1471,61 @@ def test_compact_prune_uses_event_order_when_timestamps_are_equal(
     store.close()
 
 
+def test_compact_boundary_rejects_response_mutation_and_expiry_purge(
+    tmp_path, secret_key_provider
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, secret_key_provider)
+    store.link_response(
+        "local-boundary",
+        "upstream-boundary",
+        route_id="chat",
+        codex_task_id="task-1",
+        created_at=100,
+        expires_at=20,
+    )
+    store.prune_after_compact("task-1", "local-boundary")
+    store.link_response(
+        "local-other",
+        "upstream-other",
+        route_id="chat",
+        codex_task_id="task-1",
+        expires_at=20,
+    )
+    boundary_before = store.get_response_link("local-boundary")
+    counter_before = store._require_connection().execute(
+        "SELECT value FROM event_counters WHERE counter_name = 'state'"
+    ).fetchone()[0]
+
+    with pytest.raises(StateError, match="compact boundary"):
+        store.link_response(
+            "local-boundary",
+            "upstream-mutated",
+            route_id="other-route",
+            codex_task_id="task-2",
+            created_at=101,
+        )
+
+    assert store.get_response_link("local-boundary") == boundary_before
+    assert store._require_connection().execute(
+        "SELECT value FROM event_counters WHERE counter_name = 'state'"
+    ).fetchone()[0] == counter_before
+
+    with pytest.raises(StateError, match="compact boundary"):
+        store.purge_expired(now=20)
+
+    assert store.get_response_link("local-boundary") == boundary_before
+    assert store.get_response_link("local-other") is not None
+    assert store._require_connection().execute(
+        "SELECT value FROM event_counters WHERE counter_name = 'state'"
+    ).fetchone()[0] == counter_before
+    store.close()
+
+    reopened = StateStore(path, secret_key_provider)
+    assert reopened.get_response_link("local-boundary") == boundary_before
+    reopened.close()
+
+
 def test_expired_mapping_cleanup_is_transactional_and_scoped(tmp_path, secret_key_provider) -> None:
     path = tmp_path / "state.sqlite3"
     store = StateStore(path, secret_key_provider)
@@ -1744,6 +1800,64 @@ def test_persistent_wal_snapshot_permission_error_is_explicit_and_quarantined(
     assert any(not item.name.endswith(("-wal", "-shm")) for item in quarantine_files)
     assert path.read_bytes() == b"not a sqlite database"
     assert wal_path.read_bytes() == b"wal evidence"
+
+
+def test_open_failure_closes_connection_before_quarantine(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    initial = StateStore(path, secret_key_provider)
+    initial.link_response("local-1", "upstream-1", route_id="chat")
+    initial.close()
+
+    seed = sqlite3.connect(path)
+    try:
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("PRAGMA wal_autocheckpoint=0")
+        seed.execute("CREATE TABLE open_failure_marker (value BLOB NOT NULL)")
+        seed.execute("INSERT INTO open_failure_marker VALUES (?)", (b"fixture",))
+        seed.commit()
+        sidecars = {
+            "-wal": path.with_name(f"{path.name}-wal"),
+            "-shm": path.with_name(f"{path.name}-shm"),
+        }
+        assert all(sidecar.exists() for sidecar in sidecars.values())
+        quarantine_evidence: dict[str, bytes] = {}
+        original_quarantine = StateStore._quarantine_existing
+
+        def fail_configuration(_store: StateStore) -> None:
+            raise sqlite3.DatabaseError("injected open failure")
+
+        def quarantine_after_close(store: StateStore, *args, **kwargs):
+            assert store._connection is None
+            evidence = {"": path.read_bytes()}
+            evidence.update(
+                {suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()}
+            )
+            quarantine_evidence.update(evidence)
+            return original_quarantine(store, *args, **kwargs)
+
+        monkeypatch.setattr(StateStore, "_configure_connection", fail_configuration)
+        monkeypatch.setattr(StateStore, "_quarantine_existing", quarantine_after_close)
+
+        with pytest.raises(DatabaseCorruptionError, match="failed integrity"):
+            StateStore(path, secret_key_provider)
+
+        quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+        quarantine_main = next(
+            item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+        )
+        assert quarantine_main.read_bytes() == quarantine_evidence[""]
+        assert (
+            (tmp_path / f"{quarantine_main.name}-wal").read_bytes()
+            == quarantine_evidence["-wal"]
+        )
+        assert (
+            (tmp_path / f"{quarantine_main.name}-shm").read_bytes()
+            == quarantine_evidence["-shm"]
+        )
+    finally:
+        seed.close()
 
 
 def test_concurrent_stores_can_commit_without_losing_links(tmp_path, secret_key_provider) -> None:

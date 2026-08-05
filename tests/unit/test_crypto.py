@@ -1,7 +1,7 @@
 import pytest
 from cryptography.fernet import Fernet
 
-from codex_model_switcher.crypto import FernetCipher, InvalidSecretKeyError
+from codex_model_switcher.crypto import CryptoError, FernetCipher, InvalidSecretKeyError
 
 
 class FakeSecretKeyProvider:
@@ -33,3 +33,27 @@ def test_fernet_cipher_rejects_invalid_injected_key() -> None:
 
     with pytest.raises(InvalidSecretKeyError):
         FernetCipher(InvalidProvider())
+
+
+def test_fernet_cipher_wraps_invalid_token_without_exposing_token() -> None:
+    cipher = FernetCipher(FakeSecretKeyProvider())
+    invalid_token = b"not-a-valid-token"
+
+    with pytest.raises(CryptoError, match="could not be decrypted") as error:
+        cipher.decrypt_text(invalid_token)
+
+    assert invalid_token.decode() not in str(error.value)
+    assert error.value.__cause__ is None
+
+
+def test_fernet_cipher_wraps_invalid_utf8_without_exposing_plaintext() -> None:
+    provider = FakeSecretKeyProvider()
+    cipher = FernetCipher(provider)
+    invalid_utf8 = b"\xff\xfe"
+    token = Fernet(provider.key).encrypt(invalid_utf8)
+
+    with pytest.raises(CryptoError, match="could not be decrypted") as error:
+        cipher.decrypt_text(token)
+
+    assert "invalid" not in str(error.value)
+    assert error.value.__cause__ is None

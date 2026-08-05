@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 
 class CryptoError(Exception):
@@ -55,4 +55,9 @@ class FernetCipher:
     def decrypt_text(self, token: bytes) -> str:
         if not isinstance(token, bytes):
             raise TypeError("encrypted protocol fragments must be bytes")
-        return self._fernet.decrypt(token).decode("utf-8")
+        try:
+            return self._fernet.decrypt(token).decode("utf-8")
+        except (InvalidToken, UnicodeDecodeError):
+            raise CryptoError(
+                "encrypted protocol fragment could not be decrypted"
+            ) from None

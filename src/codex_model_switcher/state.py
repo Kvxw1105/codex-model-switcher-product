@@ -300,14 +300,13 @@ class StateStore:
                 self.close()
                 raise
             except (OSError, sqlite3.DatabaseError) as exc:
+                self.close()
                 if existed:
                     quarantine = self._quarantine_existing()
-                    self.close()
                     raise DatabaseCorruptionError(
                         "existing state database failed integrity checks; "
                         f"quarantined as {quarantine.name}"
                     ) from exc
-                self.close()
                 raise DatabaseCorruptionError(
                     "new state database could not be initialized"
                 ) from exc
@@ -382,12 +381,14 @@ class StateStore:
             except (OSError, sqlite3.Error, DatabaseCorruptionError) as original_error:
                 failure = original_error
                 if snapshot is not None:
-                    snapshot.close()
+                    with suppress(sqlite3.Error):
+                        snapshot.close()
                     snapshot = None
                 if source is not None:
                     with suppress(sqlite3.Error):
                         source.rollback()
-                    source.close()
+                    with suppress(sqlite3.Error):
+                        source.close()
                     source = None
                 try:
                     self._restore_read_only_shm(original_shm_present, original_shm)
@@ -405,9 +406,11 @@ class StateStore:
                 ) from failure
             finally:
                 if snapshot is not None:
-                    snapshot.close()
+                    with suppress(sqlite3.Error):
+                        snapshot.close()
                 if source is not None:
-                    source.close()
+                    with suppress(sqlite3.Error):
+                        source.close()
 
     def _restore_read_only_shm(
         self, originally_present: bool, original_shm: bytes | None
@@ -1060,6 +1063,15 @@ class StateStore:
         created_at = _timestamp_value(created_at, "created_at")
 
         def insert(connection: sqlite3.Connection) -> ResponseLink:
+            boundary_reference = connection.execute(
+                "SELECT 1 FROM compact_boundaries "
+                "WHERE boundary_response_id = ? LIMIT 1",
+                (local_response_id,),
+            ).fetchone()
+            if boundary_reference is not None:
+                raise StateError(
+                    "cannot update a response link referenced by a compact boundary"
+                )
             event_sequence = self._next_event_sequence(connection)
             connection.execute(
                 """
@@ -1299,6 +1311,21 @@ class StateStore:
         now = _timestamp_value(now, "now")
 
         def delete(connection: sqlite3.Connection) -> int:
+            boundary_reference = connection.execute(
+                """
+                SELECT 1
+                FROM compact_boundaries AS boundaries
+                JOIN response_links AS links
+                  ON links.local_response_id = boundaries.boundary_response_id
+                WHERE links.expires_at IS NOT NULL AND links.expires_at <= ?
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+            if boundary_reference is not None:
+                raise StateError(
+                    "cannot purge a response link referenced by a compact boundary"
+                )
             removed = 0
             for table in ("response_links", "context_fragments", "cancel_handles"):
                 cursor = connection.execute(
