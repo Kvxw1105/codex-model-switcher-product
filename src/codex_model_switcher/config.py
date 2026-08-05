@@ -119,13 +119,17 @@ def _replace_or_append_managed_block(original: str, block: str) -> str:
     lines = original.splitlines(keepends=True)
     start_lines: list[int] = []
     end_lines: list[int] = []
+    multiline_quote: str | None = None
     for index, line in enumerate(lines):
         content = line.rstrip("\r\n")
         for marker, matches in ((MANAGED_START, start_lines), (MANAGED_END, end_lines)):
             if marker in content:
+                if multiline_quote is not None:
+                    raise ConfigError("managed config marker is inside a TOML multiline string")
                 if content != marker:
                     raise ConfigError("managed config marker must occupy a complete line")
                 matches.append(index)
+        multiline_quote = _advance_toml_multiline_state(line, multiline_quote)
     if len(start_lines) > 1 or len(end_lines) > 1:
         raise ConfigError("managed config must contain exactly one marker pair")
     if len(start_lines) != len(end_lines):
@@ -146,6 +150,64 @@ def _replace_or_append_managed_block(original: str, block: str) -> str:
 
     separator = "" if not original or original.endswith(("\n", "\r")) else "\n"
     return original + separator + block + "\n"
+
+
+def _advance_toml_multiline_state(line: str, quote: str | None) -> str | None:
+    index = 0
+    while index < len(line):
+        if quote is not None:
+            closing = _find_toml_triple_quote(line, quote, index)
+            if closing == -1:
+                return quote
+            index = closing + 3
+            quote = None
+            continue
+        if line[index] == "#":
+            return None
+        if line.startswith('"""', index):
+            quote = '"""'
+            index += 3
+            continue
+        if line.startswith("'''", index):
+            quote = "'''"
+            index += 3
+            continue
+        if line[index] in ('"', "'"):
+            index = _skip_toml_single_line_string(line, index)
+            continue
+        index += 1
+    return quote
+
+
+def _find_toml_triple_quote(line: str, quote: str, start: int) -> int:
+    index = start
+    while True:
+        index = line.find(quote, index)
+        if index == -1:
+            return -1
+        if quote == '"""':
+            backslashes = 0
+            previous = index - 1
+            while previous >= 0 and line[previous] == "\\":
+                backslashes += 1
+                previous -= 1
+            if backslashes % 2:
+                index += 1
+                continue
+        return index
+
+
+def _skip_toml_single_line_string(line: str, start: int) -> int:
+    quote = line[start]
+    index = start + 1
+    while index < len(line):
+        if quote == '"' and line[index] == "\\":
+            index += 2
+            continue
+        if line[index] == quote:
+            return index + 1
+        index += 1
+    return len(line)
 
 
 def _atomic_write(path: Path, data: bytes) -> None:

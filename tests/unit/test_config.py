@@ -4,7 +4,9 @@ import json
 import pytest
 
 from codex_model_switcher.catalog import (
+    PickerSchemaEvidence,
     PickerVerificationReceipt,
+    PickerVerifier,
     catalog_fingerprint,
     load_catalog,
 )
@@ -18,12 +20,14 @@ from codex_model_switcher.config import (
 
 def _verification(catalog_path):
     catalog = load_catalog(catalog_path)
-    return PickerVerificationReceipt(
-        schema_version=catalog.schema_version,
-        client_version=catalog.client_version,
-        catalog_sha256=catalog_fingerprint(catalog),
-        source="current-client-artifact",
+    verifier = PickerVerifier(
+        lambda candidate: PickerSchemaEvidence(
+            schema_version=candidate.schema_version,
+            client_version=candidate.client_version,
+            source="current-client-runtime",
+        )
     )
+    return verifier.issue_receipt(catalog)
 
 
 def _safe_catalog() -> dict[str, object]:
@@ -145,6 +149,20 @@ def test_apply_rejects_unverified_candidate_without_external_attestation(
         apply_managed_config(config_path, catalog_path)
 
 
+def test_public_receipt_construction_cannot_authorize_apply(tmp_path) -> None:
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+    catalog = load_catalog(catalog_path)
+
+    with pytest.raises(TypeError, match="verifier-issued"):
+        PickerVerificationReceipt(
+            schema_version=catalog.schema_version,
+            client_version=catalog.client_version,
+            catalog_sha256=catalog_fingerprint(catalog),
+            source="current-client-artifact",
+        )
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -181,3 +199,22 @@ def test_duplicate_managed_blocks_are_rejected(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(ConfigError, match="exactly one|duplicate|marker"):
         apply_managed_config(config_path, catalog_path, verification=verification)
+
+
+def test_marker_lines_inside_toml_multiline_string_are_rejected(tmp_path, monkeypatch) -> None:
+    isolated_home = tmp_path / "isolated-codex-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
+    config_path = isolated_home / "config.toml"
+    config_path.write_text(
+        'notes = """\n'
+        "# >>> codex-model-switcher managed start\n"
+        "# <<< codex-model-switcher managed end\n"
+        '"""\n',
+        encoding="utf-8",
+    )
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="multiline"):
+        apply_managed_config(config_path, catalog_path, verification=_verification(catalog_path))

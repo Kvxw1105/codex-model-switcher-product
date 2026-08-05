@@ -6,7 +6,9 @@ from codex_model_switcher.catalog import (
     CatalogValidationError,
     PickerContractResult,
     PickerSchemaEvidence,
+    PickerVerifier,
     build_catalog_from_model_cache,
+    catalog_from_mapping,
     load_catalog,
     verify_isolated_picker_contract,
 )
@@ -148,6 +150,26 @@ def test_picker_contract_result_cannot_be_constructed_as_native_pass() -> None:
         PickerContractResult(True, "fake", evidence, "example-provider", True)
 
 
+def test_only_verifier_issued_receipt_can_be_created_for_apply() -> None:
+    catalog = {
+        "schema_version": "picker-v1",
+        "client_version": "9.9.9",
+        "provider_id": "example-provider",
+        "models": [_route_to_record()],
+    }
+    document = catalog_from_mapping(catalog)
+    verifier = PickerVerifier(
+        lambda candidate: PickerSchemaEvidence(
+            schema_version=candidate.schema_version,
+            client_version=candidate.client_version,
+            source="current-client-runtime",
+        )
+    )
+
+    receipt = verifier.issue_receipt(document)
+
+    assert receipt.schema_version == "picker-v1"
+    assert receipt.client_version == "9.9.9"
 def _route_to_record() -> dict[str, object]:
     return {
         "id": "cms-example-chat",

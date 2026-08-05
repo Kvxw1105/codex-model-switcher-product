@@ -8,10 +8,12 @@ claim that an unverified candidate is accepted by a particular Codex build.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
+import secrets
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -21,6 +23,10 @@ from .models import ModelRoute
 
 class CatalogValidationError(ValueError):
     """Raised when a catalog does not contain a complete route contract."""
+
+
+_RECEIPT_SOURCE = "current-client-artifact"
+_RECEIPT_SIGNING_KEY = secrets.token_bytes(32)
 
 
 @dataclass(frozen=True)
@@ -64,26 +70,90 @@ class PickerSchemaEvidence:
             raise ValueError("source must be a non-empty string")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class PickerVerificationReceipt:
-    """An externally-produced, auditable artifact required before apply."""
+    """A verifier-issued capability; direct public construction is disabled."""
 
     schema_version: str
     client_version: str
     catalog_sha256: str
     source: str
+    _signature: str
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.schema_version, str) or not self.schema_version.strip():
-            raise ValueError("schema_version must be a non-empty string")
-        if not isinstance(self.client_version, str) or not self.client_version.strip():
-            raise ValueError("client_version must be a non-empty string")
-        if not isinstance(self.catalog_sha256, str) or not re.fullmatch(
-            r"[0-9a-f]{64}", self.catalog_sha256
-        ):
-            raise ValueError("catalog_sha256 must be a lowercase SHA-256 hex digest")
-        if self.source != "current-client-artifact":
-            raise ValueError("source must identify a current-client-artifact")
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("PickerVerificationReceipt is verifier-issued")
+
+    @classmethod
+    def _from_verifier(
+        cls,
+        *,
+        schema_version: str,
+        client_version: str,
+        catalog_sha256: str,
+    ) -> "PickerVerificationReceipt":
+        _validate_receipt_fields(schema_version, client_version, catalog_sha256)
+        signature = _sign_receipt(schema_version, client_version, catalog_sha256)
+        receipt = object.__new__(cls)
+        object.__setattr__(receipt, "schema_version", schema_version)
+        object.__setattr__(receipt, "client_version", client_version)
+        object.__setattr__(receipt, "catalog_sha256", catalog_sha256)
+        object.__setattr__(receipt, "source", _RECEIPT_SOURCE)
+        object.__setattr__(receipt, "_signature", signature)
+        return receipt
+
+    def _is_authentic(self) -> bool:
+        expected = _sign_receipt(self.schema_version, self.client_version, self.catalog_sha256)
+        return self.source == _RECEIPT_SOURCE and hmac.compare_digest(self._signature, expected)
+
+
+class PickerVerifier:
+    """Boundary for a real client adapter that issues apply capabilities."""
+
+    def __init__(
+        self,
+        evidence_provider: Callable[[CatalogDocument], PickerSchemaEvidence],
+    ) -> None:
+        self._evidence_provider = evidence_provider
+
+    def issue_receipt(self, catalog: CatalogDocument) -> PickerVerificationReceipt:
+        if not isinstance(catalog, CatalogDocument):
+            raise TypeError("catalog must be a CatalogDocument")
+        evidence = self._evidence_provider(catalog)
+        if not isinstance(evidence, PickerSchemaEvidence):
+            raise CatalogValidationError("verifier must return PickerSchemaEvidence")
+        if evidence.source != "current-client-runtime":
+            raise CatalogValidationError("verifier evidence must come from current-client-runtime")
+        if catalog.schema_version is None:
+            raise CatalogValidationError("current client did not provide a schema_version")
+        if evidence.schema_version != catalog.schema_version:
+            raise CatalogValidationError("verifier schema_version does not match the catalog")
+        if evidence.client_version != catalog.client_version:
+            raise CatalogValidationError("verifier client_version does not match the catalog")
+        return PickerVerificationReceipt._from_verifier(
+            schema_version=catalog.schema_version,
+            client_version=catalog.client_version,
+            catalog_sha256=catalog_fingerprint(catalog),
+        )
+
+
+def _validate_receipt_fields(
+    schema_version: str,
+    client_version: str,
+    catalog_sha256: str,
+) -> None:
+    if not isinstance(schema_version, str) or not schema_version.strip():
+        raise ValueError("schema_version must be a non-empty string")
+    if not isinstance(client_version, str) or not client_version.strip():
+        raise ValueError("client_version must be a non-empty string")
+    if not isinstance(catalog_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", catalog_sha256
+    ):
+        raise ValueError("catalog_sha256 must be a lowercase SHA-256 hex digest")
+
+
+def _sign_receipt(schema_version: str, client_version: str, catalog_sha256: str) -> str:
+    payload = "\0".join((schema_version, client_version, catalog_sha256, _RECEIPT_SOURCE))
+    return hmac.new(_RECEIPT_SIGNING_KEY, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -327,6 +397,8 @@ def validate_picker_verification(
         raise CatalogValidationError(
             "cannot apply an UNVERIFIED catalog without current-client-artifact evidence"
         )
+    if not isinstance(verification, PickerVerificationReceipt) or not verification._is_authentic():
+        raise CatalogValidationError("verification must be an authentic verifier-issued receipt")
     if catalog.schema_version is None:
         raise CatalogValidationError(
             "cannot apply an UNVERIFIED catalog without an evidenced schema_version"
