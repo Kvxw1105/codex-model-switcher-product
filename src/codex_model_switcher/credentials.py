@@ -19,7 +19,6 @@ REDACTED = "[REDACTED]"
 REDACTED_URL = "[REDACTED_URL]"
 
 _PROVIDER_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,63})$")
-_SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[^\s,;]+")
 _LABELED_SECRET_RE = re.compile(
     r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|"
@@ -30,30 +29,41 @@ _KEY_SECRET_RE = re.compile(r"(?i)^sk-[a-z0-9_-]{8,}$")
 
 _SENSITIVE_KEYS = {
     "access_token",
+    "access_token_string",
+    "access_token_value",
     "auth_header",
     "account_email",
     "api_key",
+    "api_key_string",
+    "api_key_value",
     "apikey",
     "api_token",
+    "api_token_value",
     "authorization",
+    "authorization_value",
     "bearer",
     "bearer_token",
+    "bearer_token_value",
     "client_secret",
+    "client_secret_value",
     "cookie",
     "credential",
     "credentials",
     "credential_value",
     "email",
     "id_token",
+    "id_token_value",
     "key",
     "password",
     "proxy_authorization",
     "refresh_token",
+    "refresh_token_value",
     "secret",
     "secret_key",
     "secret_value",
     "set_cookie",
     "token",
+    "token_string",
     "token_value",
 }
 _SENSITIVE_KEY_SUFFIXES = (
@@ -317,14 +327,75 @@ def resolve_upstream_auth(
         validate_provider_id(provider_id, provider_id_verifier)
         try:
             secret = credential_store.get(provider_id)
+        except CredentialNotConfiguredError:
+            raise CredentialNotConfiguredError("provider credential is not configured") from None
         except KeyError:
             raise CredentialNotConfiguredError("provider credential is not configured") from None
+        except Exception:
+            raise CredentialStoreError("credential backend read failed") from None
         if not isinstance(secret, str) or not secret:
             raise CredentialNotConfiguredError("provider credential is not configured")
         return f"Bearer {secret}"
     if lane == "official":
         return inbound_authorization
     raise ValueError("lane must be official or third_party")
+
+
+def _is_third_party_forbidden_header(name: str) -> bool:
+    normalized = name.strip().lower().replace("_", "-")
+    if normalized in {
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "set-cookie",
+    }:
+        return True
+    if any(marker in normalized for marker in ("openai", "chatgpt")):
+        return True
+    if normalized.endswith(("-authorization", "-api-key", "-access-token", "-refresh-token")):
+        return True
+    if normalized in {
+        "x-account-id",
+        "x-account-email",
+        "x-user-id",
+        "x-user-email",
+        "x-organization",
+        "x-organization-id",
+    }:
+        return True
+    return False
+
+
+def build_third_party_headers(
+    inbound_headers: Mapping[str, Any],
+    *,
+    provider_id: str,
+    credential_store: CredentialStore,
+    provider_id_verifier: ProviderIdVerifierSpec = None,
+) -> dict[str, str]:
+    """Strip official identity headers before injecting the selected provider key."""
+
+    headers: dict[str, str] = {}
+    for raw_name, raw_value in inbound_headers.items():
+        if not isinstance(raw_name, str) or _is_third_party_forbidden_header(raw_name):
+            continue
+        if isinstance(raw_value, str):
+            headers[raw_name] = raw_value
+    resolved = resolve_upstream_auth(
+        lane="third_party",
+        provider_id=provider_id,
+        inbound_authorization=None,
+        credential_store=credential_store,
+        provider_id_verifier=provider_id_verifier,
+    )
+    if resolved is None:
+        raise CredentialNotConfiguredError("provider credential is not configured")
+    headers["Authorization"] = resolved
+    return headers
+
+
+prepare_third_party_headers = build_third_party_headers
+sanitize_third_party_headers = build_third_party_headers
 
 
 def _validate_secret(secret: str) -> None:
@@ -341,6 +412,14 @@ def _canonical_key(key: object) -> str:
 
 def _normal_key(key: object) -> str:
     return _canonical_key(key)
+
+
+def _is_credential_ref_key(key: object) -> bool:
+    return _canonical_key(key) == "credential_ref"
+
+
+def _is_noncanonical_credential_ref_key(key: object) -> bool:
+    return _is_credential_ref_key(key) and str(key).strip() != "credential_ref"
 
 
 def _is_sensitive_key(key: object) -> bool:
@@ -371,6 +450,12 @@ def _redact_text(value: str) -> str:
 def redact_sensitive(value: Any, *, key: object | None = None) -> Any:
     """Recursively redact credentials, URLs, and private content from data."""
 
+    if _is_noncanonical_credential_ref_key(key):
+        return REDACTED
+    if _is_credential_ref_key(key):
+        if not isinstance(value, str) or not _is_registered_provider(value, None):
+            return REDACTED
+        return value
     if _is_sensitive_key(key) or _is_private_content_key(key):
         return REDACTED
     if _is_url_key(key):
@@ -380,6 +465,7 @@ def redact_sensitive(value: Any, *, key: object | None = None) -> Any:
             item_key: redact_sensitive(item_value, key=item_key)
             for item_key, item_value in value.items()
             if not _is_sensitive_key(item_key)
+            and not _is_noncanonical_credential_ref_key(item_key)
         }
     if isinstance(value, list):
         return [redact_sensitive(item) for item in value]
@@ -432,47 +518,41 @@ def redact_sse_fragment(fragment: str) -> str:
     return "".join(output)
 
 
-def summarize_subprocess_env(environment: Mapping[str, Any]) -> dict[str, list[str]]:
-    """Return environment names only; never expose child-process values."""
+_SAFE_ENV_NAMES = frozenset(
+    {"LANG", "LC_ALL", "PATH", "PATHEXT", "PYTHONPATH", "SYSTEMROOT", "TEMP", "TMP", "WINDIR"}
+)
 
-    keys = sorted(str(key) for key in environment)
-    sensitive_keys = sorted(key for key in keys if _is_sensitive_key(key))
-    return {"keys": keys, "sensitive_keys": sensitive_keys}
+
+def summarize_subprocess_env(environment: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Return only strict allowlisted environment names, never their values."""
+
+    keys = sorted(
+        {
+            str(key).upper()
+            for key in environment
+            if str(key).upper() in _SAFE_ENV_NAMES
+        }
+    )
+    return {"keys": keys}
 
 
 _SAFE_LOG_FIELDS = ("route_id", "status_code", "elapsed_ms", "byte_count", "trace_id")
+_TRUSTED_ROUTE_IDS = frozenset(
+    f"cms-{provider_id}" for provider_id in DEFAULT_REGISTERED_PROVIDER_IDS
+)
+_TRUSTED_TRACE_ID_RE = re.compile(
+    r"^trace-(?:[0-9a-f]{1,64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
+)
 
 
-def _is_secret_like_text(value: str) -> bool:
-    lowered = value.lower()
-    return (
-        "@" in value
-        or "://" in value
-        or any(
-            marker in lowered
-            for marker in (
-                "api_key",
-                "apikey",
-                "authorization",
-                "bearer",
-                "credential",
-                "password",
-                "secret",
-                "token",
-            )
-        )
-        or _KEY_SECRET_RE.fullmatch(value) is not None
-    )
-
-
-def _safe_log_identifier(value: Any) -> str | None:
+def _safe_log_identifier(field: str, value: Any) -> str | None:
     if not isinstance(value, str):
         return None
-    if _SAFE_IDENTIFIER_RE.fullmatch(value) is None:
-        return None
-    if _is_secret_like_text(value) or _redact_text(value) != value:
-        return None
-    return value
+    if field == "route_id":
+        return value if value in _TRUSTED_ROUTE_IDS else None
+    if field == "trace_id":
+        return value if _TRUSTED_TRACE_ID_RE.fullmatch(value) else None
+    return None
 
 
 def build_safe_log_record(
@@ -491,7 +571,7 @@ def build_safe_log_record(
             continue
         value = combined[field]
         if field in {"route_id", "trace_id"}:
-            safe_value = _safe_log_identifier(value)
+            safe_value = _safe_log_identifier(field, value)
             if safe_value is not None:
                 record[field] = safe_value
         elif field == "status_code":
@@ -508,13 +588,14 @@ safe_log_fields = build_safe_log_record
 
 
 def _sanitize_catalog_value(value: Any, *, key: object | None = None) -> Any:
-    if _is_sensitive_key(key):
+    if _is_sensitive_key(key) or _is_credential_ref_key(key):
         return None
     if isinstance(value, Mapping):
         return {
             item_key: sanitized
             for item_key, item_value in value.items()
             if not _is_sensitive_key(item_key)
+            and not _is_credential_ref_key(item_key)
             for sanitized in [_sanitize_catalog_value(item_value, key=item_key)]
         }
     if isinstance(value, list):

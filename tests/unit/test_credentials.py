@@ -12,6 +12,7 @@ from codex_model_switcher.credentials import (
     KeyringCredentialStore,
     ProviderIdAllowlist,
     ProviderIdError,
+    build_third_party_headers,
     configure_credential,
     migrate_legacy_catalog,
     resolve_upstream_auth,
@@ -71,15 +72,22 @@ def test_camel_case_sensitive_fields_are_removed_but_safe_labels_remain() -> Non
         {
             "provider_id": "deepseek",
             "tokenValue": secret,
+            "accessTokenValue": secret,
+            "apiKeyValue": secret,
             "accessToken": secret,
             "apiKey": secret,
             "tokenLabel": "display-only",
+            "credentialRef": secret,
         }
     )
 
     assert "tokenValue" not in record
+    assert "accessTokenValue" not in record
+    assert "apiKeyValue" not in record
     assert "accessToken" not in record
     assert "apiKey" not in record
+    assert "credentialRef" not in record
+    assert_secret_equal(record["credential_ref"], "deepseek")
     assert record["tokenLabel"] == "display-only"
     assert_secret_absent(record, secret)
 
@@ -204,6 +212,53 @@ def test_third_party_credential_ignores_inbound_authorization() -> None:
     assert_secret_equal(resolved, f"Bearer {secret}")
     assert "test-auth" not in resolved
     assert store.get_calls == ["deepseek"]
+
+
+def test_third_party_backend_failure_is_fixed_and_cause_free() -> None:
+    secret = "fixture-backend-read-secret-value"
+
+    class FailingStore(MemoryCredentialStore):
+        def get(self, provider_id: str) -> str:
+            raise RuntimeError(f"backend leaked {secret}")
+
+    with pytest.raises(CredentialStoreError) as error:
+        resolve_upstream_auth(
+            lane="third_party",
+            provider_id="deepseek",
+            inbound_authorization="Bearer inbound",
+            credential_store=FailingStore(),
+        )
+
+    assert_secret_equal(str(error.value), "credential backend read failed")
+    assert error.value.__cause__ is None
+    assert_secret_absent(error.value, secret)
+
+
+def test_third_party_headers_strip_inbound_auth_and_inject_only_provider_credential() -> None:
+    inbound_secret = "fixture-inbound-header-secret-value"
+    provider_secret = "fixture-provider-header-secret-value"
+    store = MemoryCredentialStore()
+    store.set("deepseek", provider_secret)
+    inbound = {
+        "Authorization": f"Bearer {inbound_secret}",
+        "cookie": "session=fixture-cookie",
+        "OpenAI-Organization": "org-fixture",
+        "X-ChatGPT-Account-Id": "account-fixture",
+        "X-Client-Version": "client-1",
+    }
+
+    headers = build_third_party_headers(
+        inbound,
+        provider_id="deepseek",
+        credential_store=store,
+    )
+
+    assert_secret_equal(headers["Authorization"], f"Bearer {provider_secret}")
+    assert_secret_equal(headers["X-Client-Version"], "client-1")
+    assert "cookie" not in {name.lower() for name in headers}
+    assert "openai-organization" not in {name.lower() for name in headers}
+    assert "x-chatgpt-account-id" not in {name.lower() for name in headers}
+    assert_secret_absent(headers, inbound_secret)
 
 
 def test_third_party_missing_credential_does_not_return_inbound_authorization() -> None:

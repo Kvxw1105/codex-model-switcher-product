@@ -49,15 +49,21 @@ def test_recursive_redactor_covers_camel_case_sensitive_fields_with_safe_counter
     payload = {
         "accessToken": secret,
         "tokenValue": secret,
+        "accessTokenValue": secret,
+        "apiKeyValue": secret,
         "apiKey": secret,
         "tokenLabel": "display-only",
+        "credentialRef": secret,
     }
 
     redacted = redact_sensitive(payload)
 
     assert "accessToken" not in redacted
     assert "tokenValue" not in redacted
+    assert "accessTokenValue" not in redacted
+    assert "apiKeyValue" not in redacted
     assert "apiKey" not in redacted
+    assert "credentialRef" not in redacted
     assert_secret_equal(redacted["tokenLabel"], "display-only")
     assert_secret_absent(redacted, secret)
 
@@ -112,8 +118,7 @@ def test_subprocess_environment_summary_does_not_include_environment_values() ->
 
     summary = summarize_subprocess_env(environment)
 
-    assert "PATH" in summary["keys"]
-    assert "CMS_PROVIDER_TOKEN" in summary["sensitive_keys"]
+    assert summary == {"keys": ["PATH"]}
     assert_secret_absent(summary, secret)
 
 
@@ -155,3 +160,14 @@ def test_safe_log_record_drops_unsafe_route_and_trace_identifiers() -> None:
     assert "route_id" not in record
     assert "trace_id" not in record
     assert_secret_absent(record, secret)
+
+
+def test_safe_log_record_accepts_only_trusted_route_and_trace_formats() -> None:
+    record = build_safe_log_record(
+        route_id="cms-opaque1234567890",
+        trace_id="trace-not-hex",
+        status_code=200,
+    )
+
+    assert "route_id" not in record
+    assert "trace_id" not in record
