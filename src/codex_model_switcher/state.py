@@ -326,23 +326,18 @@ class StateStore:
                 read_only_uri = f"{source_path.as_uri()}?mode=ro"
                 source = sqlite3.connect(read_only_uri, uri=True, timeout=30.0)
                 source.execute("BEGIN")
-                snapshot_path = snapshot_dir / self.path.name
-                snapshot = sqlite3.connect(snapshot_path)
-                source.backup(snapshot, pages=0, sleep=SNAPSHOT_COPY_DELAY_SECONDS)
-                result = snapshot.execute("PRAGMA integrity_check").fetchone()
+                result = source.execute("PRAGMA integrity_check").fetchone()
                 if not result or str(result[0]).lower() != "ok":
                     raise sqlite3.DatabaseError("state database integrity check failed")
-                snapshot_version = int(
-                    snapshot.execute("PRAGMA user_version").fetchone()[0]
-                )
+                snapshot_version = int(source.execute("PRAGMA user_version").fetchone()[0])
                 if snapshot_version == 2:
-                    self._validate_v2_schema(snapshot)
+                    self._validate_v2_schema(source)
                 elif snapshot_version == SCHEMA_VERSION:
-                    self._validate_schema(snapshot)
+                    self._validate_schema(source)
                 else:
                     config_columns = {
                         row[1]
-                        for row in snapshot.execute("PRAGMA table_info(config_receipts)")
+                        for row in source.execute("PRAGMA table_info(config_receipts)")
                     }
                     if config_columns and "config_sha256" not in config_columns:
                         raise DatabaseSchemaError(
@@ -350,7 +345,10 @@ class StateStore:
                             "config_receipts.config_sha256"
                         )
                     if "config_sha256" in config_columns:
-                        self._validate_config_hashes(snapshot)
+                        self._validate_config_hashes(source)
+                snapshot_path = snapshot_dir / self.path.name
+                snapshot = sqlite3.connect(snapshot_path)
+                source.backup(snapshot, pages=0, sleep=SNAPSHOT_COPY_DELAY_SECONDS)
                 snapshot.close()
                 snapshot = None
                 source.close()

@@ -128,7 +128,7 @@ def test_migration_preserves_v1_response_link(tmp_path, secret_key_provider) -> 
 
 
 def test_v1_invalid_config_sha256_is_quarantined_before_migration_writes(
-    tmp_path, secret_key_provider
+    tmp_path, secret_key_provider, monkeypatch
 ) -> None:
     path = tmp_path / "state.sqlite3"
     seed = sqlite3.connect(path)
@@ -166,10 +166,23 @@ def test_v1_invalid_config_sha256_is_quarantined_before_migration_writes(
         assert all(sidecar.exists() for sidecar in sidecars.values())
         evidence = {"": path.read_bytes()}
         evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
+        connection_modes: list[str] = []
+        original_connect = state_module.sqlite3.connect
+
+        def record_connect(database, *args, **kwargs):
+            connection_modes.append(
+                "ro"
+                if kwargs.get("uri") and "?mode=ro" in str(database)
+                else "writable"
+            )
+            return original_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(state_module.sqlite3, "connect", record_connect)
 
         with pytest.raises(DatabaseCorruptionError, match="config_sha256"):
             StateStore(path, secret_key_provider)
 
+        assert connection_modes == ["ro"]
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
         assert sidecars["-shm"].read_bytes() == evidence["-shm"]
