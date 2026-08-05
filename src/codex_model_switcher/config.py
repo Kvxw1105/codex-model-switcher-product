@@ -60,12 +60,20 @@ class ConfigTransactionStateError(ConfigError):
         detail: str,
         *,
         backup_path: Path | None = None,
+        temporary_path: Path | None = None,
+        original_error: BaseException | None = None,
+        cleanup_error: BaseException | None = None,
         state_uncertain: bool = True,
     ) -> None:
         self.path = Path(path)
         self.committed = False
         self.state_uncertain = state_uncertain
         self.backup_path = Path(backup_path) if backup_path is not None else None
+        self.temporary_path = (
+            Path(temporary_path) if temporary_path is not None else None
+        )
+        self.original_error = original_error
+        self.cleanup_error = cleanup_error
         state = "uncertain" if state_uncertain else "not committed"
         super().__init__(
             f"Windows transaction is {state}; cleanup failed and backup is retained: {detail}"
@@ -1122,7 +1130,7 @@ def _atomic_write(
     finally:
         try:
             temporary_path.unlink(missing_ok=True)
-        except OSError as cleanup_error:
+        except Exception as cleanup_error:
             if replacement_committed or (
                 lease is not None and getattr(lease, "_replacement_committed", False)
             ):
@@ -1130,10 +1138,21 @@ def _atomic_write(
                     path,
                     "unable to remove the temporary replacement file",
                 ) from cleanup_error
-            if body_error is None:
-                raise ConfigError(
-                    "unable to remove the temporary replacement file"
-                ) from cleanup_error
+            backup_path = None
+            if lease is not None:
+                backup_path = lease._backup_path or lease._pending_backup_cleanup
+            state_error = ConfigTransactionStateError(
+                path,
+                "temporary replacement cleanup failed before commit; "
+                "temporary evidence is retained",
+                backup_path=backup_path,
+                temporary_path=temporary_path,
+                original_error=body_error,
+                cleanup_error=cleanup_error,
+            )
+            if body_error is not None:
+                raise state_error from body_error
+            raise state_error from cleanup_error
 
 
 def _commit_windows_transaction(commit_transaction, transaction_handle) -> bool:

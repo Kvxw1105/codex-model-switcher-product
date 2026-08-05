@@ -233,6 +233,70 @@ def test_apply_restore_preserves_original_bytes_with_low_level_render_seam(
     assert config_path.read_bytes() == original
 
 
+def test_precommit_temp_cleanup_failure_retains_state_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b'# keep bytes\r\nmodel = "original"\r\n'
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    real_replace_temp_file = config_module._replace_temp_file
+    real_unlink = config_module.Path.unlink
+    temporary_paths: list[Path] = []
+
+    def fail_config_replacement(temporary_path, target_path, *, lease=None, expected=None):
+        if target_path.resolve() == config_path.resolve():
+            temporary_paths.append(Path(temporary_path))
+            raise ConfigError("injected pre-commit replacement failure")
+        return real_replace_temp_file(
+            temporary_path,
+            target_path,
+            lease=lease,
+            expected=expected,
+        )
+
+    def fail_temporary_unlink(path, *args, **kwargs):
+        if temporary_paths and Path(path).resolve() == temporary_paths[0].resolve():
+            raise OSError("injected temporary cleanup failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(config_module, "_replace_temp_file", fail_config_replacement)
+    monkeypatch.setattr(config_module.Path, "unlink", fail_temporary_unlink)
+
+    with pytest.raises(
+        ConfigTransactionStateError, match="temporary replacement cleanup"
+    ) as caught:
+        apply_managed_config(config_path, catalog_path)
+
+    error = caught.value
+    assert len(temporary_paths) == 1
+    assert error.committed is False
+    assert error.state_uncertain is True
+    assert error.temporary_path == temporary_paths[0]
+    assert error.temporary_path.exists()
+    assert error.backup_path is not None
+    assert error.backup_path.read_bytes() == original
+    assert error.original_error is not None
+    assert isinstance(error.original_error, ConfigError)
+    assert isinstance(error.cleanup_error, OSError)
+    assert error.__cause__ is error.original_error
+
+
 def test_windows_new_config_is_removed_after_precommit_failure(tmp_path, monkeypatch) -> None:
     if os.name != "nt":
         pytest.skip("Windows OPEN_ALWAYS rollback is Windows-specific")
