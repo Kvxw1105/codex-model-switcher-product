@@ -77,7 +77,7 @@ def make_router(handler):
     router = Router(
         catalog,
         targets=targets,
-        credential_store=MemoryCredentials({"deepseek": "deepseek-fixture"}),
+        credential_store=MemoryCredentials({"deepseek": "deep"}),
         upstream_client=client,
     )
     return router, transport, client
@@ -143,14 +143,14 @@ def test_third_party_request_never_forwards_inbound_chatgpt_identity() -> None:
                 "task-fixture",
                 "turn-1",
                 headers={
-                    "Authorization": "Bearer inbound-chatgpt",
+                    "Authorization": "Bearer in",
                     "Cookie": "session=chatgpt",
                     "Content-Type": "application/json",
                 },
             )
         )
         assert response.status_code == 200
-        assert transport.requests[0].headers["authorization"] == "Bearer deepseek-fixture"
+        assert transport.requests[0].headers["authorization"] == "Bearer deep"
         assert "cookie" not in transport.requests[0].headers
         await client.aclose()
 

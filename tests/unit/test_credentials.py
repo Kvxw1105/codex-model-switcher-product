@@ -562,22 +562,22 @@ def test_official_resolve_preserves_legal_bearer_without_reading_store() -> None
     resolved = resolve_upstream_auth(
         lane="official",
         provider_id="deepseek",
-        inbound_authorization="Bearer legal-official-auth",
+        inbound_authorization="Bearer legal",
         credential_store=store,
     )
 
-    assert_secret_equal(resolved, "Bearer legal-official-auth")
+    assert_secret_equal(resolved, "Bearer legal")
     assert store.get_calls == []
 
 
 @pytest.mark.parametrize(
     "invalid_authorization",
     [
-        pytest.param("Bearer fixture-official-crlf\r\nInjected", id="crlf"),
-        pytest.param("Bearer fixture-official-nul\x00value", id="nul"),
-        pytest.param("Bearer fixture-official-del\x7fvalue", id="del"),
-        pytest.param("Bearer fixture-official-c1-low\x80value", id="c1-low"),
-        pytest.param("Bearer fixture-official-c1-high\x9fvalue", id="c1-high"),
+        pytest.param("Bearer f\r\nInjected", id="crlf"),
+        pytest.param("Bearer f\x00value", id="nul"),
+        pytest.param("Bearer f\x7fvalue", id="del"),
+        pytest.param("Bearer f\x80value", id="c1-low"),
+        pytest.param("Bearer f\x9fvalue", id="c1-high"),
     ],
 )
 def test_official_resolve_rejects_control_characters(

@@ -60,18 +60,18 @@ class MemoryTransport(httpx.AsyncBaseTransport):
 def test_third_party_headers_remove_chatgpt_identity_and_inject_selected_credential() -> None:
     headers = prepare_third_party_headers(
         {
-            "Authorization": "Bearer inbound-chatgpt-fixture",
+            "Authorization": "Bearer in",
             "Cookie": "session=chatgpt-fixture",
             "X-OpenAI-Account-Id": "account-fixture",
             "Content-Type": "application/json",
         },
         provider_id="deepseek",
-        credential_store=MemoryCredentials({"deepseek": "deepseek-fixture"}),
+        credential_store=MemoryCredentials({"deepseek": "deep"}),
     )
 
     assert headers == {
         "Content-Type": "application/json",
-        "Authorization": "Bearer deepseek-fixture",
+        "Authorization": "Bearer deep",
     }
 
 
