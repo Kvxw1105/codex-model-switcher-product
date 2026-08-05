@@ -141,6 +141,8 @@ _SENSITIVE_KEY_SEMANTICS = (
     "account",
     "organization",
     "credential",
+    "cookie",
+    "apikey",
     "token",
     "auth",
     "bearer",

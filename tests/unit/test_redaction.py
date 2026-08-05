@@ -119,6 +119,66 @@ def test_redact_headers_preserves_generic_protocol_headers(header_name: str) -> 
     assert_secret_equal(redacted[header_name], "safe-value")
 
 
+@pytest.mark.parametrize(
+    "sensitive_name",
+    [
+        "Authorization",
+        "authorization",
+        "Cookie",
+        "Cookies",
+        "CookieHeader",
+        "cookie-header",
+        "session_cookie",
+        "API-Key",
+        "APIKEY",
+        "X-APIKEY",
+        "X_API_KEY",
+        "xapikey",
+        "Access-Token",
+        "access_token",
+        "Refresh-Token",
+        "refresh_token",
+        "Session-Token",
+        "session_token",
+        "Account-Id",
+        "account_id",
+        "Auth-Header",
+        "auth_header",
+    ],
+)
+def test_redact_headers_drops_unified_sensitive_inbound_variants(
+    sensitive_name: str,
+) -> None:
+    secret = "fixture-unified-sensitive-header-secret"
+
+    redacted = redact_headers(
+        {
+            "Accept": "application/json",
+            sensitive_name: secret,
+        }
+    )
+
+    assert set(redacted) == {"Accept"}
+    assert_secret_equal(redacted["Accept"], "application/json")
+    assert_secret_absent(redacted, secret)
+
+
+def test_recursive_redactor_drops_sensitive_headers_and_preserves_content_type() -> None:
+    secret = "fixture-recursive-sensitive-header-secret"
+    redacted = redact_sensitive(
+        {
+            "X-APIKEY": secret,
+            "CookieHeader": secret,
+            "session_cookie": secret,
+            "Content-Type": "application/json",
+        }
+    )
+
+    assert set(redacted) == {"Content-Type"}
+    assert_secret_equal(redacted["Content-Type"], "application/json")
+    assert_secret_absent(redacted, secret)
+
+
 def test_exception_redaction_hides_secret_url_email_and_nested_attributes() -> None:
     secret = "fixture-exception-secret-value"
 

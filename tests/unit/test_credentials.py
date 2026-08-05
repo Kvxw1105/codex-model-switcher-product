@@ -225,6 +225,66 @@ def test_serializer_output_keeps_only_canonical_provider_identity_fields() -> No
 
 
 @pytest.mark.parametrize(
+    "header_name",
+    [
+        "Authorization",
+        "Cookie",
+        "Cookies",
+        "CookieHeader",
+        "session_cookie",
+        "API-Key",
+        "APIKEY",
+        "X-APIKEY",
+        "X_API_KEY",
+        "Access-Token",
+        "Refresh-Token",
+        "Session-Token",
+        "Account-Id",
+        "Auth-Header",
+    ],
+)
+def test_serializer_drops_unified_sensitive_headers(header_name: str) -> None:
+    secret = "fixture-serializer-sensitive-header-secret"
+
+    record = serialize_provider_record(
+        {
+            "provider_id": "deepseek",
+            "headers": {
+                header_name: secret,
+                "Content-Type": "application/json",
+            },
+        }
+    )
+
+    assert set(record["headers"]) == {"Content-Type"}
+    assert_secret_equal(record["headers"]["Content-Type"], "application/json")
+    assert_secret_absent(record, secret)
+
+
+def test_catalog_serializer_drops_x_apikey_and_preserves_content_type() -> None:
+    secret = "fixture-catalog-sensitive-header-secret"
+
+    catalog = serialize_catalog(
+        {
+            "providers": [
+                {
+                    "provider_id": "deepseek",
+                    "headers": {
+                        "X-APIKEY": secret,
+                        "Content-Type": "application/json",
+                    },
+                }
+            ]
+        }
+    )
+
+    headers = catalog["providers"][0]["headers"]
+    assert set(headers) == {"Content-Type"}
+    assert_secret_equal(headers["Content-Type"], "application/json")
+    assert_secret_absent(catalog, secret)
+
+
+@pytest.mark.parametrize(
     "provider",
     [
         pytest.param(
@@ -609,12 +669,20 @@ def test_third_party_headers_strip_inbound_auth_and_inject_only_provider_credent
         "authorization",
         "COOKIE",
         "Cookie",
+        "Cookies",
+        "CookieHeader",
+        "session_cookie",
         "Api-Key",
         "api_key",
+        "APIKEY",
+        "X-APIKEY",
+        "X_API_KEY",
         "Access-Token",
         "access_token",
         "Refresh-Token",
         "refresh_token",
+        "Session-Token",
+        "session_token",
         "Account-Id",
         "account_id",
         "Account-Email",
@@ -625,6 +693,8 @@ def test_third_party_headers_strip_inbound_auth_and_inject_only_provider_credent
         "openai_organization",
         "ChatGPT-Account-Id",
         "chatgpt_account_id",
+        "Auth-Header",
+        "auth_header",
     ],
 )
 def test_third_party_headers_allowlist_drops_identity_and_credential_variants(
