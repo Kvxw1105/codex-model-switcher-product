@@ -51,7 +51,91 @@ class _WindowsHandleReleaseResult:
     close_error: int | str | None = None
 
 
-class ConfigPostCommitError(ConfigError):
+class _WindowsHandleOwner:
+    """Private retry capability handed to a structured transaction error."""
+
+    def __init__(self, operation: str, path: Path, handle: int, close_callback) -> None:
+        self.operation = operation
+        self.path = Path(path)
+        self.handle = int(handle)
+        self._close_callback = close_callback
+        self._released = False
+        self._last_error_code: int | str | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def retry(self) -> bool:
+        with self._lock:
+            if self._released:
+                return True
+            try:
+                close_succeeded = bool(self._close_callback(self.handle))
+            except Exception as error:
+                self._last_error_code = _safe_error_code(error)
+                return False
+            self._last_error_code = (
+                None if close_succeeded else ctypes.get_last_error()
+            )
+            if close_succeeded:
+                self._released = True
+            return close_succeeded
+
+    def mark_released(self) -> None:
+        with self._lock:
+            self._released = True
+
+    def set_retry_callback(self, close_callback) -> None:
+        with self._lock:
+            self._close_callback = close_callback
+
+    def failure(self) -> ConfigOperationFailure:
+        return ConfigOperationFailure(
+            self.operation,
+            self.path,
+            self._last_error_code,
+        )
+
+
+class _HandleOwnershipErrorMixin:
+    def _set_unreleased_handle_owners(
+        self,
+        unreleased_handles: tuple[int, ...],
+        owners: tuple[_WindowsHandleOwner, ...],
+    ) -> None:
+        self._unreleased_handle_owners = tuple(
+            owner for owner in owners if not owner.released
+        )
+        self.unreleased_handles = tuple(
+            dict.fromkeys(
+                [
+                    *unreleased_handles,
+                    *(owner.handle for owner in self._unreleased_handle_owners),
+                ]
+            )
+        )
+
+    @property
+    def unreleased_handle_owners(self) -> tuple[_WindowsHandleOwner, ...]:
+        return self._unreleased_handle_owners
+
+    def retry_unreleased_handles(self) -> bool:
+        owners = self._unreleased_handle_owners
+        remaining = tuple(owner for owner in owners if not owner.retry())
+        self._unreleased_handle_owners = remaining
+        owner_handles = {owner.handle for owner in owners}
+        remaining_handles = {owner.handle for owner in remaining}
+        self.unreleased_handles = tuple(
+            handle
+            for handle in self.unreleased_handles
+            if handle not in owner_handles or handle in remaining_handles
+        )
+        return not self._unreleased_handle_owners and not self.unreleased_handles
+
+
+class ConfigPostCommitError(_HandleOwnershipErrorMixin, ConfigError):
     """Raised when replacement committed but cleanup made completion uncertain."""
 
     def __init__(
@@ -60,22 +144,32 @@ class ConfigPostCommitError(ConfigError):
         detail: str,
         *,
         backup_path: Path | None = None,
+        temporary_path: Path | None = None,
+        cleanup_error: BaseException | None = None,
         original_error: BaseException | None = None,
         failures: tuple[ConfigOperationFailure, ...] = (),
         unreleased_handles: tuple[int, ...] = (),
+        unreleased_handle_owners: tuple[_WindowsHandleOwner, ...] = (),
     ) -> None:
         self.path = Path(path)
         self.committed = True
         self.backup_path = Path(backup_path) if backup_path is not None else None
+        self.temporary_path = (
+            Path(temporary_path) if temporary_path is not None else None
+        )
+        self.cleanup_error = cleanup_error
         self.original_error = original_error
         self.failures = tuple(failures)
-        self.unreleased_handles = tuple(unreleased_handles)
+        self._set_unreleased_handle_owners(
+            unreleased_handles,
+            unreleased_handle_owners,
+        )
         super().__init__(
             f"atomic replacement for {self.path} committed, but cleanup failed: {detail}"
         )
 
 
-class ConfigTransactionStateError(ConfigError):
+class ConfigTransactionStateError(_HandleOwnershipErrorMixin, ConfigError):
     """Raised when pre-commit rollback or handle cleanup leaves state uncertain."""
 
     def __init__(
@@ -89,6 +183,7 @@ class ConfigTransactionStateError(ConfigError):
         cleanup_error: BaseException | None = None,
         failures: tuple[ConfigOperationFailure, ...] = (),
         unreleased_handles: tuple[int, ...] = (),
+        unreleased_handle_owners: tuple[_WindowsHandleOwner, ...] = (),
         state_uncertain: bool = True,
     ) -> None:
         self.path = Path(path)
@@ -101,7 +196,10 @@ class ConfigTransactionStateError(ConfigError):
         self.original_error = original_error
         self.cleanup_error = cleanup_error
         self.failures = tuple(failures)
-        self.unreleased_handles = tuple(unreleased_handles)
+        self._set_unreleased_handle_owners(
+            unreleased_handles,
+            unreleased_handle_owners,
+        )
         state = "uncertain" if state_uncertain else "not committed"
         super().__init__(
             f"Windows transaction is {state}; cleanup failed and backup is retained: {detail}"
@@ -176,15 +274,25 @@ def _aggregate_config_errors(
 ) -> ConfigError:
     failures: list[ConfigOperationFailure] = []
     unreleased_handles: list[int] = []
+    unreleased_handle_owners: list[_WindowsHandleOwner] = []
     original_errors: list[BaseException] = []
     retained_backup = backup_path
+    temporary_path: Path | None = None
+    cleanup_error: BaseException | None = None
     for error in errors:
         failures.extend(getattr(error, "failures", ()))
         for handle in getattr(error, "unreleased_handles", ()):
             if handle not in unreleased_handles:
                 unreleased_handles.append(handle)
+        for owner in getattr(error, "unreleased_handle_owners", ()):
+            if owner not in unreleased_handle_owners:
+                unreleased_handle_owners.append(owner)
         if retained_backup is None:
             retained_backup = getattr(error, "backup_path", None)
+        if temporary_path is None:
+            temporary_path = getattr(error, "temporary_path", None)
+        if cleanup_error is None:
+            cleanup_error = getattr(error, "cleanup_error", None)
         original_error = getattr(error, "original_error", None)
         if original_error is not None:
             original_errors.append(original_error)
@@ -204,17 +312,23 @@ def _aggregate_config_errors(
             path,
             "multiple post-commit failures",
             backup_path=retained_backup,
+            temporary_path=temporary_path,
+            cleanup_error=cleanup_error,
             original_error=original_error,
             failures=tuple(failures),
             unreleased_handles=tuple(unreleased_handles),
+            unreleased_handle_owners=tuple(unreleased_handle_owners),
         )
     return ConfigTransactionStateError(
         path,
         "multiple transaction cleanup failures",
         backup_path=retained_backup,
+        temporary_path=temporary_path,
+        cleanup_error=cleanup_error,
         original_error=original_error,
         failures=tuple(failures),
         unreleased_handles=tuple(unreleased_handles),
+        unreleased_handle_owners=tuple(unreleased_handle_owners),
     )
 
 
@@ -222,6 +336,14 @@ def _remove_unreleased_handle(error: BaseException, handle: int) -> None:
     handles = getattr(error, "unreleased_handles", None)
     if handles is not None:
         error.unreleased_handles = tuple(value for value in handles if value != handle)
+    owners = getattr(error, "_unreleased_handle_owners", None)
+    if owners is not None:
+        for owner in owners:
+            if owner.handle == handle:
+                owner.mark_released()
+        error._unreleased_handle_owners = tuple(
+            owner for owner in owners if owner.handle != handle
+        )
 
 
 class _WindowsOverlapped(ctypes.Structure):
@@ -502,23 +624,17 @@ class _PathLease:
                 )
             ]
             unreleased_handles: list[int] = []
-            try:
-                close_succeeded = _close_windows_handle(close_handle, handle)
-                close_error_code = (
-                    None if close_succeeded else ctypes.get_last_error()
-                )
-            except Exception as error:
-                close_succeeded = False
-                close_error_code = _safe_error_code(error)
-            if not close_succeeded:
-                failures.append(
-                    ConfigOperationFailure(
-                        "CloseHandle(lease)",
-                        self.path,
-                        close_error_code,
-                    )
-                )
-                unreleased_handles.append(int(handle))
+            unreleased_handle_owners: list[_WindowsHandleOwner] = []
+            handle_owner = _WindowsHandleOwner(
+                "CloseHandle(lease)",
+                self.path,
+                int(handle),
+                lambda value: _close_windows_handle(close_handle, value),
+            )
+            if not handle_owner.retry():
+                failures.append(handle_owner.failure())
+                unreleased_handles.append(handle_owner.handle)
+                unreleased_handle_owners.append(handle_owner)
             if created_new_path:
                 try:
                     self.path.unlink(missing_ok=True)
@@ -538,6 +654,7 @@ class _PathLease:
                     original_error=lock_failure,
                     failures=tuple(failures),
                     unreleased_handles=tuple(unreleased_handles),
+                    unreleased_handle_owners=tuple(unreleased_handle_owners),
                 )
                 if lock_failure_cause is not None:
                     raise state_error from lock_failure_cause
@@ -622,20 +739,14 @@ class _PathLease:
             body_error = error
             raise
         finally:
-            try:
-                close_succeeded = _close_windows_handle(close_handle, current_handle)
-                close_error_code = (
-                    None if close_succeeded else ctypes.get_last_error()
-                )
-            except Exception as error:
-                close_succeeded = False
-                close_error_code = _safe_error_code(error)
+            identity_owner = _WindowsHandleOwner(
+                "CloseHandle(identity)",
+                self.path,
+                int(current_handle),
+                lambda value: _close_windows_handle(close_handle, value),
+            )
+            close_succeeded = identity_owner.retry()
             if not close_succeeded:
-                failure = ConfigOperationFailure(
-                    "CloseHandle(identity)",
-                    self.path,
-                    close_error_code,
-                )
                 original_error = getattr(body_error, "original_error", None)
                 if original_error is None:
                     original_error = body_error
@@ -644,12 +755,18 @@ class _PathLease:
                     "unable to close the Windows identity handle",
                     original_error=original_error,
                     failures=tuple(
-                        [*getattr(body_error, "failures", ()), failure]
+                        [*getattr(body_error, "failures", ()), identity_owner.failure()]
                     ),
                     unreleased_handles=tuple(
                         [
                             *getattr(body_error, "unreleased_handles", ()),
-                            int(current_handle),
+                            identity_owner.handle,
+                        ]
+                    ),
+                    unreleased_handle_owners=tuple(
+                        [
+                            *getattr(body_error, "unreleased_handle_owners", ()),
+                            identity_owner,
                         ]
                     ),
                 )
@@ -725,6 +842,31 @@ class _PathLease:
         body_error: Exception | None = None
         body_failures: list[ConfigOperationFailure] = []
         unreleased_handles: list[int] = []
+        unreleased_handle_owners: list[_WindowsHandleOwner] = []
+        transaction_owner: _WindowsHandleOwner | None = None
+        replacement_owner: _WindowsHandleOwner | None = None
+        source_owner = _WindowsHandleOwner(
+            "CloseHandle(source)",
+            temporary_path,
+            source_handle_int,
+            lambda value: _close_source_handle(close_handle, value),
+        )
+
+        def remember_owner(owner: _WindowsHandleOwner) -> None:
+            if owner not in unreleased_handle_owners:
+                unreleased_handle_owners.append(owner)
+            if owner.handle not in unreleased_handles:
+                unreleased_handles.append(owner.handle)
+
+        def forget_owner(owner: _WindowsHandleOwner) -> None:
+            if owner in unreleased_handle_owners:
+                unreleased_handle_owners.remove(owner)
+            if not any(
+                remaining.handle == owner.handle
+                for remaining in unreleased_handle_owners
+            ):
+                while owner.handle in unreleased_handles:
+                    unreleased_handles.remove(owner.handle)
         try:
             if self._read_windows_handle(source_handle_int, kernel32) != expected:
                 raise ConfigChangedError(
@@ -785,6 +927,12 @@ class _PathLease:
                 raise ConfigError(f"unable to start Windows config transaction (error {error})")
 
             transaction_handle = int(transaction)
+            transaction_owner = _WindowsHandleOwner(
+                "CloseHandle(transaction)",
+                target_path,
+                transaction_handle,
+                lambda value: _close_windows_transaction(close_handle, value),
+            )
             if not move_file_transacted(
                 str(target_path),
                 str(shadow_path),
@@ -849,6 +997,12 @@ class _PathLease:
                     f"unable to pre-open new config handle in Windows transaction (error {error})"
                 )
             new_handle = int(new_handle_value)
+            replacement_owner = _WindowsHandleOwner(
+                "CloseHandle(replacement)",
+                target_path,
+                new_handle,
+                lambda value: _close_precommit_handle(close_handle, value),
+            )
 
             def commit_and_mark(handle: int) -> bool:
                 nonlocal committed
@@ -872,29 +1026,12 @@ class _PathLease:
             # The share-denying handle was opened before commit.  Release the
             # old lease while it is still owned by self, then install the new
             # handle only after CloseHandle has succeeded.
-            try:
-                source_close_ok = _close_source_handle(
-                    close_handle,
-                    source_handle_int,
-                )
-                source_close_code = (
-                    None if source_close_ok else ctypes.get_last_error()
-                )
-            except Exception as error:
-                source_close_ok = False
-                source_close_code = _safe_error_code(error)
+            source_close_ok = source_owner.retry()
             if source_close_ok:
                 source_handle = None
             else:
-                body_failures.append(
-                    ConfigOperationFailure(
-                        "CloseHandle(source)",
-                        temporary_path,
-                        source_close_code,
-                    )
-                )
-                if source_handle_int not in unreleased_handles:
-                    unreleased_handles.append(source_handle_int)
+                body_failures.append(source_owner.failure())
+                remember_owner(source_owner)
 
             try:
                 old_release = _normalize_windows_release(
@@ -926,7 +1063,7 @@ class _PathLease:
                     self._overlapped = None
                     self._locked = False
                     new_handle = None
-                    if old_handle in unreleased_handles:
+                    while old_handle in unreleased_handles:
                         unreleased_handles.remove(old_handle)
                 elif old_handle not in unreleased_handles:
                     unreleased_handles.append(old_handle)
@@ -963,24 +1100,32 @@ class _PathLease:
                             )
                         )
                 try:
-                    transaction_close_ok = _close_windows_transaction(
-                        close_handle,
-                        transaction_value,
+                    transaction_close_ok = (
+                        transaction_owner.retry()
+                        if transaction_owner is not None
+                        else _close_windows_transaction(close_handle, transaction_value)
                     )
                     if transaction_close_ok:
                         transaction = None
-                        if transaction_value in unreleased_handles:
-                            unreleased_handles.remove(transaction_value)
+                        if transaction_owner is not None:
+                            forget_owner(transaction_owner)
+                        else:
+                            while transaction_value in unreleased_handles:
+                                unreleased_handles.remove(transaction_value)
                     else:
-                        cleanup_failures.append(
-                            ConfigOperationFailure(
-                                "CloseHandle(transaction)",
-                                target_path,
-                                ctypes.get_last_error(),
+                        if transaction_owner is not None:
+                            cleanup_failures.append(transaction_owner.failure())
+                            remember_owner(transaction_owner)
+                        else:
+                            cleanup_failures.append(
+                                ConfigOperationFailure(
+                                    "CloseHandle(transaction)",
+                                    target_path,
+                                    ctypes.get_last_error(),
+                                )
                             )
-                        )
-                        if transaction_value not in unreleased_handles:
-                            unreleased_handles.append(transaction_value)
+                            if transaction_value not in unreleased_handles:
+                                unreleased_handles.append(transaction_value)
                 except Exception as error:
                     cleanup_failures.append(
                         ConfigOperationFailure(
@@ -994,24 +1139,32 @@ class _PathLease:
             if new_handle is not None:
                 replacement_handle = new_handle
                 try:
-                    replacement_close_ok = _close_precommit_handle(
-                        close_handle,
-                        replacement_handle,
+                    replacement_close_ok = (
+                        replacement_owner.retry()
+                        if replacement_owner is not None
+                        else _close_precommit_handle(close_handle, replacement_handle)
                     )
                     if replacement_close_ok:
                         new_handle = None
-                        if replacement_handle in unreleased_handles:
-                            unreleased_handles.remove(replacement_handle)
+                        if replacement_owner is not None:
+                            forget_owner(replacement_owner)
+                        else:
+                            while replacement_handle in unreleased_handles:
+                                unreleased_handles.remove(replacement_handle)
                     else:
-                        cleanup_failures.append(
-                            ConfigOperationFailure(
-                                "CloseHandle(replacement)",
-                                target_path,
-                                ctypes.get_last_error(),
+                        if replacement_owner is not None:
+                            cleanup_failures.append(replacement_owner.failure())
+                            remember_owner(replacement_owner)
+                        else:
+                            cleanup_failures.append(
+                                ConfigOperationFailure(
+                                    "CloseHandle(replacement)",
+                                    target_path,
+                                    ctypes.get_last_error(),
+                                )
                             )
-                        )
-                        if replacement_handle not in unreleased_handles:
-                            unreleased_handles.append(replacement_handle)
+                            if replacement_handle not in unreleased_handles:
+                                unreleased_handles.append(replacement_handle)
                 except Exception as error:
                     cleanup_failures.append(
                         ConfigOperationFailure(
@@ -1025,24 +1178,16 @@ class _PathLease:
             if source_handle is not None:
                 source_handle_value = int(source_handle)
                 try:
-                    source_cleanup_ok = _close_precommit_handle(
-                        close_handle,
-                        source_handle_value,
+                    source_owner.set_retry_callback(
+                        lambda value: _close_precommit_handle(close_handle, value)
                     )
+                    source_cleanup_ok = source_owner.retry()
                     if source_cleanup_ok:
                         source_handle = None
-                        if source_handle_value in unreleased_handles:
-                            unreleased_handles.remove(source_handle_value)
+                        forget_owner(source_owner)
                     else:
-                        cleanup_failures.append(
-                            ConfigOperationFailure(
-                                "CloseHandle(source)",
-                                temporary_path,
-                                ctypes.get_last_error(),
-                            )
-                        )
-                        if source_handle_value not in unreleased_handles:
-                            unreleased_handles.append(source_handle_value)
+                        cleanup_failures.append(source_owner.failure())
+                        remember_owner(source_owner)
                 except Exception as error:
                     cleanup_failures.append(
                         ConfigOperationFailure(
@@ -1081,6 +1226,12 @@ class _PathLease:
                 original_error = getattr(body_error, "original_error", None)
                 if original_error is None:
                     original_error = body_error
+                all_owners = list(
+                    getattr(body_error, "unreleased_handle_owners", ())
+                )
+                for owner in unreleased_handle_owners:
+                    if owner not in all_owners:
+                        all_owners.append(owner)
                 post_error = ConfigPostCommitError(
                     target_path,
                     "post-commit operation cleanup is uncertain",
@@ -1088,12 +1239,19 @@ class _PathLease:
                     original_error=original_error,
                     failures=tuple(all_failures),
                     unreleased_handles=tuple(dict.fromkeys(all_handles)),
+                    unreleased_handle_owners=tuple(all_owners),
                 )
                 if original_error is not None:
                     raise post_error from original_error
                 raise post_error
             if not committed and all_failures:
                 original_error = getattr(body_error, "original_error", None)
+                all_owners = list(
+                    getattr(body_error, "unreleased_handle_owners", ())
+                )
+                for owner in unreleased_handle_owners:
+                    if owner not in all_owners:
+                        all_owners.append(owner)
                 state_error = ConfigTransactionStateError(
                     target_path,
                     "pre-commit operation cleanup is uncertain",
@@ -1101,10 +1259,22 @@ class _PathLease:
                     original_error=original_error or body_error,
                     failures=tuple(all_failures),
                     unreleased_handles=tuple(dict.fromkeys(all_handles)),
+                    unreleased_handle_owners=tuple(all_owners),
                 )
                 if state_error.original_error is not None:
                     raise state_error from state_error.original_error
                 raise state_error
+
+    def _close_owned_lease_handle(self, kernel32: object, handle: int) -> bool:
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        close_succeeded = _close_windows_handle(close_handle, handle)
+        if close_succeeded and self._handle == handle:
+            self._handle = None
+            self._overlapped = None
+            self._locked = False
+        return close_succeeded
 
     def _release_windows(self) -> None:
         if self._handle is None or self._kernel32 is None:
@@ -1119,6 +1289,12 @@ class _PathLease:
                 overlapped,
             )
         except Exception as error:
+            handle_owner = _WindowsHandleOwner(
+                "lease:CloseHandle",
+                self.path,
+                handle,
+                lambda value: self._close_owned_lease_handle(kernel32, value),
+            )
             failures = (
                 ConfigOperationFailure(
                     "lease release",
@@ -1140,6 +1316,7 @@ class _PathLease:
                 original_error=error,
                 failures=failures,
                 unreleased_handles=(handle,),
+                unreleased_handle_owners=(handle_owner,),
             ) from error
         normalized = _normalize_windows_release(release_result)
         failures = _windows_release_failures(normalized, self.path, "lease")
@@ -1153,6 +1330,19 @@ class _PathLease:
                 if self._replacement_committed
                 else ConfigTransactionStateError
             )
+            handle_owners: tuple[_WindowsHandleOwner, ...] = ()
+            if not normalized.close_succeeded:
+                handle_owners = (
+                    _WindowsHandleOwner(
+                        "lease:CloseHandle",
+                        self.path,
+                        handle,
+                        lambda value: self._close_owned_lease_handle(
+                            kernel32,
+                            value,
+                        ),
+                    ),
+                )
             raise error_type(
                 self.path,
                 "unable to release Windows config lock",
@@ -1163,6 +1353,7 @@ class _PathLease:
                 unreleased_handles=()
                 if normalized.close_succeeded
                 else (handle,),
+                unreleased_handle_owners=handle_owners,
             )
 
     def _release_windows_handle(
@@ -1545,10 +1736,15 @@ def _atomic_write(
                     path,
                     "unable to remove the temporary replacement file",
                     backup_path=lease._backup_path if lease is not None else None,
+                    temporary_path=temporary_path,
+                    cleanup_error=cleanup_error,
                     original_error=original_error,
                     failures=tuple(body_failures),
                     unreleased_handles=tuple(
                         getattr(body_error, "unreleased_handles", ())
+                    ),
+                    unreleased_handle_owners=tuple(
+                        getattr(body_error, "unreleased_handle_owners", ())
                     ),
                 )
                 if original_error is not None:
@@ -1578,6 +1774,9 @@ def _atomic_write(
                 ),
                 unreleased_handles=tuple(
                     getattr(body_error, "unreleased_handles", ())
+                ),
+                unreleased_handle_owners=tuple(
+                    getattr(body_error, "unreleased_handle_owners", ())
                 ),
             )
             original_error = state_error.original_error

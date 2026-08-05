@@ -359,6 +359,7 @@ def test_precommit_temp_cleanup_failure_retains_state_evidence(
     )
     real_replace_temp_file = config_module._replace_temp_file
     real_unlink = config_module.Path.unlink
+    real_release = config_module._PathLease._release_windows_handle
     temporary_paths: list[Path] = []
 
     def fail_config_replacement(temporary_path, target_path, *, lease=None, expected=None):
@@ -377,11 +378,22 @@ def test_precommit_temp_cleanup_failure_retains_state_evidence(
             raise OSError("injected temporary cleanup failure")
         return real_unlink(path, *args, **kwargs)
 
+    def fail_lease_close(self, kernel32, handle, overlapped):
+        if self.path == config_path.resolve() and not self._replacement_committed:
+            real_release(self, kernel32, handle, overlapped)
+            return 123
+        return real_release(self, kernel32, handle, overlapped)
+
     monkeypatch.setattr(config_module, "_replace_temp_file", fail_config_replacement)
     monkeypatch.setattr(config_module.Path, "unlink", fail_temporary_unlink)
+    monkeypatch.setattr(
+        config_module._PathLease,
+        "_release_windows_handle",
+        fail_lease_close,
+    )
 
     with pytest.raises(
-        ConfigTransactionStateError, match="temporary replacement cleanup"
+        ConfigTransactionStateError, match="cleanup"
     ) as caught:
         apply_managed_config(config_path, catalog_path)
 
@@ -397,6 +409,48 @@ def test_precommit_temp_cleanup_failure_retains_state_evidence(
     assert isinstance(error.original_error, ConfigError)
     assert isinstance(error.cleanup_error, OSError)
     assert error.__cause__ is error.original_error
+    assert error.temporary_path == temporary_paths[0]
+    assert any("lease" in failure.operation for failure in error.failures)
+
+
+def test_windows_error_owns_failed_local_handle_for_retry(tmp_path) -> None:
+    import codex_model_switcher.config as config_module
+
+    class SequencedClose:
+        def __init__(self) -> None:
+            self.results = [False, True]
+            self.calls = 0
+
+        def __call__(self, handle: int) -> bool:
+            assert handle == 71
+            self.calls += 1
+            result = self.results.pop(0)
+            if not result:
+                ctypes.set_last_error(32)
+            return result
+
+    close_handle = SequencedClose()
+    owner = config_module._WindowsHandleOwner(
+        "CloseHandle(source)",
+        tmp_path / "candidate.tmp",
+        71,
+        close_handle,
+    )
+
+    assert owner.retry() is False
+    error = ConfigTransactionStateError(
+        tmp_path / "config.toml",
+        "local handle close is uncertain",
+        failures=(owner.failure(),),
+        unreleased_handles=(71,),
+        unreleased_handle_owners=(owner,),
+    )
+
+    assert error.unreleased_handle_owners == (owner,)
+    assert error.retry_unreleased_handles() is True
+    assert error.unreleased_handles == ()
+    assert error.unreleased_handle_owners == ()
+    assert close_handle.calls == 2
 
 
 def test_windows_release_close_failure_retains_handle_ownership(tmp_path) -> None:
@@ -775,6 +829,13 @@ def test_windows_postcommit_failures_are_structurally_aggregated(
     assert "CloseHandle(replacement)" in operations
     assert "CloseHandle(source)" in operations
     assert "lease:CloseHandle" in operations
+    owner_operations = {owner.operation for owner in error.unreleased_handle_owners}
+    assert {
+        "CloseHandle(transaction)",
+        "CloseHandle(replacement)",
+        "CloseHandle(source)",
+        "lease:CloseHandle",
+    } <= owner_operations
     assert error.unreleased_handles
     assert error.backup_path is not None
     assert error.backup_path.read_bytes() == original
