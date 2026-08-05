@@ -641,12 +641,18 @@ class StateStore:
             raise DatabaseSnapshotError("state database header is invalid")
         if header[18] != 2:
             raise DatabaseSnapshotError("state database has an invalid shm sidecar")
-        try:
-            shm_size = shm_path.stat().st_size
-            with shm_path.open("rb") as shm_file:
-                shm_header = shm_file.read(52)
-        except OSError as exc:
-            raise DatabaseSnapshotError("state database shm sidecar cannot be read") from exc
+        for attempt in range(SNAPSHOT_COPY_ATTEMPTS):
+            try:
+                shm_size = shm_path.stat().st_size
+                with shm_path.open("rb") as shm_file:
+                    shm_header = shm_file.read(52)
+                break
+            except OSError as exc:
+                if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
+                    raise DatabaseSnapshotError(
+                        "state database shm sidecar cannot be read"
+                    ) from exc
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
         database_page_size = int.from_bytes(header[16:18], "big")
         if database_page_size == 1:
             database_page_size = 65536
