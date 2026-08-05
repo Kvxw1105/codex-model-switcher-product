@@ -9,7 +9,7 @@ import pytest
 from codex_model_switcher.catalog import CatalogDocument
 from codex_model_switcher.models import ModelCapability, ModelRoute
 from codex_model_switcher.router import Router, RouterRequest
-from codex_model_switcher.routing import RouteTarget
+from codex_model_switcher.routing import RouteTarget, default_deepseek_target
 from codex_model_switcher.upstream import UpstreamClient
 
 
@@ -70,7 +70,11 @@ class Transport(httpx.AsyncBaseTransport):
         )
 
 
-def build_router(transport: Transport) -> tuple[Router, UpstreamClient]:
+def build_router(
+    transport: Transport,
+    *,
+    wire_api: str = "chat",
+) -> tuple[Router, UpstreamClient]:
     route = ModelRoute(
         "deepseek-model",
         "DeepSeek API",
@@ -79,12 +83,15 @@ def build_router(transport: Transport) -> tuple[Router, UpstreamClient]:
         "deepseek-v4-flash",
         ModelCapability(4096, True, True, True, False, False, False),
     )
-    target = RouteTarget(
-        route,
-        "https://deepseek.example.invalid/v1/chat/completions",
-        frozenset({"deepseek.example.invalid"}),
-        wire_api="chat",
-    )
+    if wire_api == "responses":
+        target = default_deepseek_target(route, allowed_hosts={"api.deepseek.com"})
+    else:
+        target = RouteTarget(
+            route,
+            "https://deepseek.example.invalid/v1/chat/completions",
+            frozenset({"deepseek.example.invalid"}),
+            wire_api="chat",
+        )
     client = UpstreamClient(transport=transport)
     return (
         Router(
@@ -196,6 +203,80 @@ def test_responses_facing_deepseek_text_stream_emits_real_responses_events() -> 
         assert json.loads(transport.requests[0].content.decode("utf-8"))["thinking"] == {
             "type": "disabled"
         }
+        assert stream.closed is True
+        await router.aclose()
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_default_deepseek_responses_sse_is_passed_through_without_translation() -> None:
+    async def run() -> None:
+        chunks = [
+            (
+                b'event: response.created\ndata: '
+                b'{"type":"response.created","response":{"id":"resp-1",'
+                b'"status":"in_progress","future_field":{"keep":true}}}\n\n'
+            ),
+            (
+                b'event: response.completed\ndata: '
+                b'{"type":"response.completed","response":{"id":"resp-1",'
+                b'"status":"completed","output":[]}}\n\n'
+            ),
+        ]
+        stream = ScriptedStream(chunks)
+        transport = Transport(stream)
+        router, client = build_router(transport, wire_api="responses")
+        response = await router.handle(
+            RouterRequest(
+                "deepseek-model",
+                {"input": [{"type": "future_item", "keep": True}]},
+                "task-fixture",
+                "turn-responses-pass-through",
+                stream=True,
+            )
+        )
+
+        events = [event async for event in response.aiter_events()]
+
+        assert [event.event for event in events] == [
+            "response.created",
+            "response.completed",
+        ]
+        assert [event.data for event in events] == [
+            '{"type":"response.created","response":{"id":"resp-1","status":"in_progress","future_field":{"keep":true}}}',
+            '{"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[]}}',
+        ]
+        assert events[0].raw == chunks[0].decode("utf-8")
+        assert transport.requests[0].url.path == "/responses"
+        assert stream.closed is True
+        await router.aclose()
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_default_deepseek_responses_sse_cancellation_closes_upstream() -> None:
+    async def run() -> None:
+        release = asyncio.Event()
+        stream = EventStream(release)
+        transport = Transport(stream)
+        router, client = build_router(transport, wire_api="responses")
+        response = await router.handle(
+            RouterRequest(
+                "deepseek-model",
+                {"input": "hello"},
+                "task-fixture",
+                "turn-responses-cancel",
+                stream=True,
+            )
+        )
+
+        event = await asyncio.wait_for(anext(response.aiter_events()), timeout=0.5)
+
+        assert event.event == "message"
+        assert transport.requests[0].url.path == "/responses"
+        await response.events.aclose()  # type: ignore[union-attr]
         assert stream.closed is True
         await router.aclose()
         await client.aclose()

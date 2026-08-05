@@ -73,7 +73,7 @@ def test_native_adapter_preserves_internal_route_and_provider_reference() -> Non
         {
             "provider_id": "deepseek",
             "model": "deepseek-v4-flash",
-            "wire_api": "chat_completions",
+            "wire_api": "responses",
             "credential_ref": "deepseek",
         }
     ]
@@ -86,7 +86,7 @@ def test_native_adapter_preserves_internal_route_and_provider_reference() -> Non
                 {
                     "provider_id": "deepseek",
                     "model": "deepseek-v4-flash",
-                    "wire_api": "chat_completions",
+                    "wire_api": "responses",
                     "credential_ref": "deepseek",
                 }
             ],
@@ -120,7 +120,7 @@ def test_native_adapter_preserves_internal_route_and_provider_reference() -> Non
         {
             "provider_id": "deepseek",
             "model": "deepseek-v4-flash",
-            "wire_api": "chat_completions",
+            "wire_api": "responses",
             "credential_ref": "deepseek",
         }
     ]

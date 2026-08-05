@@ -619,7 +619,7 @@ def _derive_provider_references(routes: Sequence[ModelRoute]) -> tuple[ProviderR
         ProviderReference(
             provider_id="deepseek",
             model=_DEFAULT_DEEPSEEK_MODEL,
-            wire_api="chat_completions",
+            wire_api="responses",
             credential_ref="deepseek",
         ),
     )
