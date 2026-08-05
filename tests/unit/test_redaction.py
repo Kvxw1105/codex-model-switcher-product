@@ -1,9 +1,12 @@
 import json
 from typing import Any
 
+import pytest
+
 from codex_model_switcher.credentials import (
     build_safe_log_record,
     redact_exception,
+    redact_headers,
     redact_sensitive,
     redact_sse_fragment,
     summarize_subprocess_env,
@@ -65,6 +68,35 @@ def test_recursive_redactor_covers_camel_case_sensitive_fields_with_safe_counter
     assert "apiKey" not in redacted
     assert "credentialRef" not in redacted
     assert_secret_equal(redacted["tokenLabel"], "display-only")
+    assert_secret_absent(redacted, secret)
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    [
+        "OpenAI-Organization",
+        "openai_organization",
+        "ChatGPT-Account-Id",
+        "chat_gpt_account_id",
+        "chatgpt_account_id",
+        "Account-Id",
+        "account_id",
+        "Account-Email",
+        "account_email",
+        "X-Account-Name",
+        "x_account_name",
+        "X-OpenAI-Organization",
+    ],
+)
+def test_redact_headers_drops_openai_chatgpt_and_account_identity_variants(
+    header_name: str,
+) -> None:
+    secret = "fixture-identity-header-secret-value"
+
+    redacted = redact_headers({"Accept": "application/json", header_name: secret})
+
+    assert set(redacted) == {"Accept"}
+    assert_secret_equal(redacted["Accept"], "application/json")
     assert_secret_absent(redacted, secret)
 
 

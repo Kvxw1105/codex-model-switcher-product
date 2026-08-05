@@ -33,6 +33,8 @@ _SENSITIVE_KEYS = {
     "access_token_value",
     "auth_header",
     "account_email",
+    "account_id",
+    "account_name",
     "api_key",
     "api_key_string",
     "api_key_value",
@@ -54,7 +56,18 @@ _SENSITIVE_KEYS = {
     "id_token",
     "id_token_value",
     "key",
+    "chat_gpt_account_id",
+    "chat_gpt_account_name",
+    "chatgpt_account_id",
+    "chatgpt_account_name",
     "password",
+    "openai_account_id",
+    "openai_organization",
+    "open_ai_account_id",
+    "open_ai_organization",
+    "organization",
+    "organization_id",
+    "organization_name",
     "proxy_authorization",
     "refresh_token",
     "refresh_token_value",
@@ -62,6 +75,44 @@ _SENSITIVE_KEYS = {
     "secret_key",
     "secret_value",
     "set_cookie",
+    "token",
+    "token_string",
+    "token_value",
+    "x_account_email",
+    "x_account_id",
+    "x_account_name",
+    "x_openai_organization",
+    "x_open_ai_organization",
+}
+
+_CREDENTIAL_KEYS = {
+    "access_token",
+    "access_token_string",
+    "access_token_value",
+    "api_key",
+    "api_key_string",
+    "api_key_value",
+    "api_token",
+    "api_token_value",
+    "auth_header",
+    "authorization",
+    "authorization_value",
+    "bearer",
+    "bearer_token",
+    "bearer_token_value",
+    "client_secret",
+    "client_secret_value",
+    "credential",
+    "credential_value",
+    "id_token",
+    "id_token_value",
+    "key",
+    "password",
+    "refresh_token",
+    "refresh_token_value",
+    "secret",
+    "secret_key",
+    "secret_value",
     "token",
     "token_string",
     "token_value",
@@ -421,6 +472,10 @@ def _is_sensitive_key(key: object) -> bool:
     )
 
 
+def _is_credential_key(key: object) -> bool:
+    return _canonical_key(key) in _CREDENTIAL_KEYS
+
+
 def _is_url_key(key: object) -> bool:
     return _normal_key(key) in _URL_KEYS
 
@@ -682,7 +737,7 @@ def _secret_from_legacy_value(value: Any) -> str | None:
 
 def _collect_legacy_secrets(value: Any, *, key: object | None = None) -> list[str]:
     secrets: list[str] = []
-    if _is_sensitive_key(key) and isinstance(value, str):
+    if _is_credential_key(key) and isinstance(value, str):
         secret = _secret_from_legacy_value(value)
         if secret is not None:
             secrets.append(secret)

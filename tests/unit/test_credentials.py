@@ -374,6 +374,44 @@ def test_migrate_nested_credentials_api_key_writes_and_verifies_secret(tmp_path:
     assert_secret_absent(migrated, secret)
 
 
+@pytest.mark.parametrize(
+    "identity_field,identity_value",
+    [
+        ("email", "account@example.invalid"),
+        ("account_email", "account@example.invalid"),
+        ("account_id", "account-123"),
+        ("organization", "organization-123"),
+        ("base_url", "https://api.example.invalid/v1"),
+    ],
+)
+def test_migrate_identity_only_provider_never_creates_credential(
+    tmp_path: Path,
+    identity_field: str,
+    identity_value: str,
+) -> None:
+    source = tmp_path / "legacy-catalog.json"
+    destination = tmp_path / "migrated-catalog.json"
+    source.write_text(
+        json.dumps(
+            {
+                "providers": [
+                    {"provider_id": "deepseek", identity_field: identity_value},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = MemoryCredentialStore()
+
+    with pytest.raises(CredentialMigrationError) as error:
+        migrate_legacy_catalog(source, store, destination=destination)
+
+    assert_secret_equal(str(error.value), "legacy provider has no credential")
+    assert store.values == {}
+    assert not destination.exists()
+    assert_secret_absent(error.value, identity_value)
+
+
 def test_migrate_rejects_multiple_nested_credentials_without_output(tmp_path: Path) -> None:
     source = tmp_path / "legacy-catalog.json"
     source.write_text(
