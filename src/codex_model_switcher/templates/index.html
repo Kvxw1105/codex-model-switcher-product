@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101315">
+    <title>Codex Model Switcher · Control Center</title>
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body>
+    <div class="ambient ambient-a" aria-hidden="true"></div>
+    <div class="ambient ambient-b" aria-hidden="true"></div>
+    <main class="shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">CONTROL PLANE / LOCAL ONLY</p>
+          <h1>Codex Model Switcher</h1>
+          <p class="lede">模型路由、凭据引用与 Codex 配置的本地控制中心。</p>
+        </div>
+        <div class="masthead-meta">
+          <span class="loopback-mark"><span class="pulse"></span>127.0.0.1</span>
+          <span class="version-mark">GUI / 0.1</span>
+        </div>
+      </header>
+
+      <section class="notice" aria-label="配置提醒">
+        <span class="notice-symbol">!</span>
+        <div>
+          <strong>尚未应用真实 Codex 配置</strong>
+          <span>当前页面只展示本地控制面状态；聊天记录仍由 Codex 官方界面管理。</span>
+        </div>
+      </section>
+
+      <section class="status-grid" aria-label="核心状态">
+        <article class="status-card" data-status="router">
+          <div class="card-kicker">ROUTER</div>
+          <div class="status-value" id="router-status">读取中</div>
+          <div class="status-detail" id="router-detail">等待本地服务状态</div>
+        </article>
+        <article class="status-card" data-status="config">
+          <div class="card-kicker">CODEX CONFIG</div>
+          <div class="status-value" id="config-status">未应用</div>
+          <div class="status-detail" id="config-detail">保留原配置，等待明确操作</div>
+        </article>
+        <article class="status-card" data-status="identity">
+          <div class="card-kicker">OFFICIAL IDENTITY</div>
+          <div class="status-value" id="identity-status">读取中</div>
+          <div class="status-detail" id="identity-detail">官方身份只读显示</div>
+        </article>
+        <article class="status-card status-card-accent" data-status="routes">
+          <div class="card-kicker">READY ROUTES</div>
+          <div class="status-value" id="routes-status">—</div>
+          <div class="status-detail" id="routes-detail">模型目录加载中</div>
+        </article>
+      </section>
+
+      <section class="section-block">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">ROUTE INVENTORY</p>
+            <h2>Providers &amp; Models</h2>
+          </div>
+          <button class="button button-quiet" id="refresh-button" type="button">刷新状态</button>
+        </div>
+        <div class="table-shell">
+          <table>
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>Protocol</th>
+                <th>Model / lane</th>
+                <th>Capability</th>
+                <th>Credential</th>
+                <th>Probe</th>
+              </tr>
+            </thead>
+            <tbody id="provider-rows">
+              <tr><td colspan="6" class="empty-cell">正在读取 provider 目录…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="workbench-grid">
+        <article class="panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">THIRD-PARTY ONLY</p><h3>保存凭据引用</h3></div>
+            <span class="panel-tag">WRITE-ONLY</span>
+          </div>
+          <p class="panel-copy">密钥只写入已注入的凭据后端，页面不回显已保存值。</p>
+          <form id="credential-form">
+            <label>Provider
+              <select id="credential-provider" required></select>
+            </label>
+            <label>API key
+              <input id="provider-key" type="password" autocomplete="off" spellcheck="false" required>
+            </label>
+            <button class="button button-primary" type="submit">保存并验证</button>
+          </form>
+          <div class="form-result" id="credential-result" role="status"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">OPERATIONS</p><h3>控制面动作</h3></div>
+            <span class="panel-tag">EXPLICIT</span>
+          </div>
+          <p class="panel-copy">配置和 Router 动作由协调者注入；未接入时会明确显示未配置。</p>
+          <div class="action-grid">
+            <button class="button button-primary" data-action="/api/config/apply" type="button">应用 Codex 配置</button>
+            <button class="button button-quiet" data-action="/api/config/restore" type="button">恢复原配置</button>
+            <button class="button button-quiet" data-action="/api/router/start" type="button">启动 Router</button>
+            <button class="button button-danger" data-action="/api/router/stop" type="button">停止 Router</button>
+          </div>
+          <div class="form-result" id="operation-result" role="status"></div>
+        </article>
+      </section>
+
+      <footer class="footer">
+        <span>Codex owns conversation history. This console owns the control plane.</span>
+        <span id="last-updated">—</span>
+      </footer>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
