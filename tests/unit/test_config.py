@@ -65,11 +65,28 @@ def _assert_child_replace_is_blocked(external_path, target_path) -> None:
         "    raise SystemExit(0)\n"
         "raise SystemExit(1)\n"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", probe, str(external_path), str(target_path)],
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(external_path), str(target_path)],
+            check=False,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError("child os.replace probe timed out; refusing success") from error
     assert result.returncode == 0, "child os.replace crossed the protected rename boundary"
+
+
+def test_child_replace_probe_timeout_fails_closed(tmp_path, monkeypatch) -> None:
+    def timeout_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], kwargs.get("timeout", 5))
+
+    monkeypatch.setattr(subprocess, "run", timeout_run)
+
+    with pytest.raises(AssertionError, match="timed out"):
+        _assert_child_replace_is_blocked(
+            tmp_path / "external.toml",
+            tmp_path / "config.toml",
+        )
 
 
 def test_managed_block_replacement_round_trips_user_bytes() -> None:
@@ -382,6 +399,42 @@ def test_precommit_temp_cleanup_failure_retains_state_evidence(
     assert error.__cause__ is error.original_error
 
 
+def test_windows_release_close_failure_retains_handle_ownership(tmp_path) -> None:
+    import codex_model_switcher.config as config_module
+
+    class FakeCall:
+        def __init__(self, result, error_code=None):
+            self.result = result
+            self.error_code = error_code
+
+        def __call__(self, *args):
+            if self.error_code is not None:
+                ctypes.set_last_error(self.error_code)
+            return self.result
+
+    class FakeKernel32:
+        UnlockFileEx = FakeCall(True)
+        CloseHandle = FakeCall(False, 32)
+
+    lease = config_module._PathLease(tmp_path / "config.toml", create=False)
+    overlapped = config_module._WindowsOverlapped()
+    lease._handle = 123
+    lease._overlapped = overlapped
+    lease._kernel32 = FakeKernel32()
+    lease._locked = True
+
+    with pytest.raises(ConfigTransactionStateError) as caught:
+        lease._release_windows()
+
+    error = caught.value
+    assert lease._handle == 123
+    assert lease._overlapped is overlapped
+    assert lease._locked is True
+    assert error.unreleased_handles == (123,)
+    assert any("CloseHandle" in failure.operation for failure in error.failures)
+    assert error.failures[0].path == lease.path
+
+
 def test_windows_new_config_is_removed_after_precommit_failure(tmp_path, monkeypatch) -> None:
     if os.name != "nt":
         pytest.skip("Windows OPEN_ALWAYS rollback is Windows-specific")
@@ -501,6 +554,9 @@ def test_windows_postcommit_cleanup_failure_keeps_backup_and_status(
 
     error = caught.value
     assert getattr(error, "committed", False) is True
+    assert isinstance(error, ConfigPostCommitError)
+    assert isinstance(error.original_error, OSError)
+    assert "replacement" in {failure.operation for failure in error.failures}
     backup_path = getattr(error, "backup_path", None)
     assert backup_path is not None
     assert backup_path.read_bytes() == original
@@ -616,6 +672,114 @@ def test_windows_commit_success_then_throw_keeps_backup_and_status(
     assert b'model_provider = "example-provider"' in config_path.read_bytes()
 
 
+def test_windows_postcommit_failures_are_structurally_aggregated(
+    tmp_path, monkeypatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows transaction cleanup is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b"# original bytes\r\n"
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    original_commit = config_module._commit_windows_transaction
+    commit_calls = [0]
+
+    def commit_then_throw(commit_transaction, transaction_handle):
+        result = original_commit(commit_transaction, transaction_handle)
+        if result:
+            commit_calls[0] += 1
+            if commit_calls[0] == 2:
+                raise RuntimeError("injected post-commit original error")
+        return result
+
+    monkeypatch.setattr(
+        config_module,
+        "_commit_windows_transaction",
+        commit_then_throw,
+    )
+    transaction_close_calls = [0]
+
+    def fail_main_transaction_close(close_handle, transaction):
+        transaction_close_calls[0] += 1
+        if transaction_close_calls[0] == 1:
+            return bool(close_handle(transaction))
+        return False
+
+    monkeypatch.setattr(
+        config_module,
+        "_close_windows_transaction",
+        fail_main_transaction_close,
+    )
+    precommit_close_calls = [0]
+
+    def fail_main_precommit_close(close_handle, handle):
+        precommit_close_calls[0] += 1
+        return False
+
+    monkeypatch.setattr(
+        config_module,
+        "_close_precommit_handle",
+        fail_main_precommit_close,
+    )
+    source_close_calls = [0]
+
+    def fail_main_source_close(close_handle, handle):
+        source_close_calls[0] += 1
+        if source_close_calls[0] == 1:
+            return bool(close_handle(handle))
+        return False
+
+    monkeypatch.setattr(
+        config_module,
+        "_close_source_handle",
+        fail_main_source_close,
+    )
+    real_release = config_module._PathLease._release_windows_handle
+
+    def fail_main_lease_release(self, kernel32, handle, overlapped):
+        if self.path == config_path.resolve() and self._replacement_committed:
+            return 77
+        return real_release(self, kernel32, handle, overlapped)
+
+    monkeypatch.setattr(
+        config_module._PathLease,
+        "_release_windows_handle",
+        fail_main_lease_release,
+    )
+
+    with pytest.raises(ConfigPostCommitError) as caught:
+        apply_managed_config(config_path, catalog_path)
+
+    error = caught.value
+    operations = {failure.operation for failure in error.failures}
+    assert commit_calls == [2]
+    assert error.original_error is not None
+    assert isinstance(error.original_error, RuntimeError)
+    assert "CloseHandle(transaction)" in operations
+    assert "CloseHandle(replacement)" in operations
+    assert "CloseHandle(source)" in operations
+    assert "lease:CloseHandle" in operations
+    assert error.unreleased_handles
+    assert error.backup_path is not None
+    assert error.backup_path.read_bytes() == original
+
+
 def test_windows_rollback_failure_retains_backup_and_status(tmp_path, monkeypatch) -> None:
     if os.name != "nt":
         pytest.skip("Windows transaction rollback is Windows-specific")
@@ -658,7 +822,44 @@ def test_windows_rollback_failure_retains_backup_and_status(tmp_path, monkeypatc
         "_rollback_windows_transaction",
         lambda _rollback_transaction, _transaction_handle: False,
     )
+    original_close_transaction = config_module._close_windows_transaction
+    transaction_close_calls = [0]
 
+    def fail_target_transaction_close(close_handle, transaction):
+        transaction_close_calls[0] += 1
+        if transaction_close_calls[0] == 1:
+            return original_close_transaction(close_handle, transaction)
+        return False
+
+    monkeypatch.setattr(
+        config_module,
+        "_close_windows_transaction",
+        fail_target_transaction_close,
+    )
+    shadow_unlink_enabled = [False]
+    original_unlink = config_module.Path.unlink
+
+    def fail_shadow_unlink(path, *args, **kwargs):
+        if shadow_unlink_enabled[0] and ".shadow." in Path(path).name:
+            raise OSError("injected shadow cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(config_module.Path, "unlink", fail_shadow_unlink)
+    original_commit_for_probe = config_module._commit_windows_transaction
+    commit_probe_calls = [0]
+
+    def mark_target_commit_probe(commit_transaction, transaction_handle):
+        result = original_commit_for_probe(commit_transaction, transaction_handle)
+        commit_probe_calls[0] += 1
+        if commit_probe_calls[0] == 2:
+            shadow_unlink_enabled[0] = True
+        return result
+
+    monkeypatch.setattr(
+        config_module,
+        "_commit_windows_transaction",
+        mark_target_commit_probe,
+    )
     with pytest.raises(ConfigTransactionStateError) as caught:
         apply_managed_config(config_path, catalog_path)
 
@@ -668,7 +869,11 @@ def test_windows_rollback_failure_retains_backup_and_status(tmp_path, monkeypatc
     assert error.state_uncertain is True
     assert error.backup_path is not None
     assert error.backup_path.read_bytes() == original
-    assert config_path.read_bytes() == original
+    operations = {failure.operation for failure in error.failures}
+    assert "RollbackTransaction" in operations
+    assert "CloseHandle(transaction)" in operations
+    assert "unlink(shadow)" in operations
+    assert error.unreleased_handles
 
 
 def test_windows_precommit_handle_close_failures_retain_backup_and_status(
@@ -841,14 +1046,18 @@ def test_windows_lock_acquisition_cleanup_uncertainty_is_state_error(
     monkeypatch.setattr(config_module.Path, "unlink", fail_rollback_unlink)
 
     lease = config_module._PathLease(config_path, create=True)
-    with pytest.raises(ConfigTransactionStateError, match="close|rollback") as caught:
+    with pytest.raises(ConfigTransactionStateError, match="cleanup") as caught:
         lease._acquire_windows()
 
     error = caught.value
     assert error.committed is False
     assert error.state_uncertain is True
     assert config_path.exists()
-    assert "LockFileEx" in str(error)
+    operations = {failure.operation for failure in error.failures}
+    assert "LockFileEx" in operations
+    assert "CloseHandle(lease)" in operations
+    assert "unlink(config)" in operations
+    assert error.unreleased_handles
 
 
 def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> None:

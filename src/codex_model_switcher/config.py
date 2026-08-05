@@ -33,6 +33,24 @@ class ConfigChangedError(ConfigError):
     """Raised when the target changed after this project wrote it."""
 
 
+@dataclass(frozen=True)
+class ConfigOperationFailure:
+    """Safe metadata for one failed transaction operation."""
+
+    operation: str
+    path: Path | None
+    error_code: int | str | None
+
+
+@dataclass(frozen=True)
+class _WindowsHandleReleaseResult:
+    """Result that distinguishes a closed handle from an uncertain close."""
+
+    close_succeeded: bool
+    unlock_error: int | str | None = None
+    close_error: int | str | None = None
+
+
 class ConfigPostCommitError(ConfigError):
     """Raised when replacement committed but cleanup made completion uncertain."""
 
@@ -42,10 +60,16 @@ class ConfigPostCommitError(ConfigError):
         detail: str,
         *,
         backup_path: Path | None = None,
+        original_error: BaseException | None = None,
+        failures: tuple[ConfigOperationFailure, ...] = (),
+        unreleased_handles: tuple[int, ...] = (),
     ) -> None:
         self.path = Path(path)
         self.committed = True
         self.backup_path = Path(backup_path) if backup_path is not None else None
+        self.original_error = original_error
+        self.failures = tuple(failures)
+        self.unreleased_handles = tuple(unreleased_handles)
         super().__init__(
             f"atomic replacement for {self.path} committed, but cleanup failed: {detail}"
         )
@@ -63,6 +87,8 @@ class ConfigTransactionStateError(ConfigError):
         temporary_path: Path | None = None,
         original_error: BaseException | None = None,
         cleanup_error: BaseException | None = None,
+        failures: tuple[ConfigOperationFailure, ...] = (),
+        unreleased_handles: tuple[int, ...] = (),
         state_uncertain: bool = True,
     ) -> None:
         self.path = Path(path)
@@ -74,6 +100,8 @@ class ConfigTransactionStateError(ConfigError):
         )
         self.original_error = original_error
         self.cleanup_error = cleanup_error
+        self.failures = tuple(failures)
+        self.unreleased_handles = tuple(unreleased_handles)
         state = "uncertain" if state_uncertain else "not committed"
         super().__init__(
             f"Windows transaction is {state}; cleanup failed and backup is retained: {detail}"
@@ -87,6 +115,113 @@ class ConfigReceipt:
     original_hash: str
     written_hash: str
     timestamp: str
+
+
+def _safe_error_code(error: BaseException | int | str | None) -> int | str | None:
+    if error is None:
+        return None
+    if isinstance(error, (int, str)):
+        return error
+    for attribute in ("winerror", "errno"):
+        value = getattr(error, attribute, None)
+        if isinstance(value, (int, str)):
+            return value
+    return type(error).__name__
+
+
+def _normalize_windows_release(
+    result: _WindowsHandleReleaseResult | int | str | None,
+) -> _WindowsHandleReleaseResult:
+    if isinstance(result, _WindowsHandleReleaseResult):
+        return result
+    if result is None:
+        return _WindowsHandleReleaseResult(close_succeeded=True)
+    return _WindowsHandleReleaseResult(
+        close_succeeded=False,
+        close_error=_safe_error_code(result),
+    )
+
+
+def _windows_release_failures(
+    result: _WindowsHandleReleaseResult,
+    path: Path,
+    scope: str,
+) -> list[ConfigOperationFailure]:
+    failures: list[ConfigOperationFailure] = []
+    if result.unlock_error is not None:
+        failures.append(
+            ConfigOperationFailure(
+                f"{scope}:UnlockFileEx",
+                Path(path),
+                result.unlock_error,
+            )
+        )
+    if not result.close_succeeded:
+        failures.append(
+            ConfigOperationFailure(
+                f"{scope}:CloseHandle",
+                Path(path),
+                result.close_error,
+            )
+        )
+    return failures
+
+
+def _aggregate_config_errors(
+    errors: list[BaseException],
+    path: Path,
+    *,
+    committed: bool,
+    backup_path: Path | None,
+) -> ConfigError:
+    failures: list[ConfigOperationFailure] = []
+    unreleased_handles: list[int] = []
+    original_errors: list[BaseException] = []
+    retained_backup = backup_path
+    for error in errors:
+        failures.extend(getattr(error, "failures", ()))
+        for handle in getattr(error, "unreleased_handles", ()):
+            if handle not in unreleased_handles:
+                unreleased_handles.append(handle)
+        if retained_backup is None:
+            retained_backup = getattr(error, "backup_path", None)
+        original_error = getattr(error, "original_error", None)
+        if original_error is not None:
+            original_errors.append(original_error)
+        elif not getattr(error, "failures", ()):
+            original_errors.append(error)
+    if not failures:
+        failures.append(
+            ConfigOperationFailure(
+                "transaction cleanup",
+                Path(path),
+                _safe_error_code(errors[-1] if errors else None),
+            )
+        )
+    original_error = original_errors[0] if original_errors else None
+    if committed:
+        return ConfigPostCommitError(
+            path,
+            "multiple post-commit failures",
+            backup_path=retained_backup,
+            original_error=original_error,
+            failures=tuple(failures),
+            unreleased_handles=tuple(unreleased_handles),
+        )
+    return ConfigTransactionStateError(
+        path,
+        "multiple transaction cleanup failures",
+        backup_path=retained_backup,
+        original_error=original_error,
+        failures=tuple(failures),
+        unreleased_handles=tuple(unreleased_handles),
+    )
+
+
+def _remove_unreleased_handle(error: BaseException, handle: int) -> None:
+    handles = getattr(error, "unreleased_handles", None)
+    if handles is not None:
+        error.unreleased_handles = tuple(value for value in handles if value != handle)
 
 
 class _WindowsOverlapped(ctypes.Structure):
@@ -152,24 +287,47 @@ class _PathLease:
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
         if os.name == "nt":
-            cleanup_error: ConfigError | None = None
+            cleanup_errors: list[BaseException] = []
             if self._created_new_path and not self._replacement_committed:
                 try:
                     self._rollback_new_path()
                 except ConfigError as error:
-                    cleanup_error = error
+                    cleanup_errors.append(error)
+            release_handle = self._handle
             try:
                 self._release_windows()
             except Exception as release_error:
-                if cleanup_error is not None:
-                    if isinstance(release_error, ConfigTransactionStateError):
-                        raise release_error
-                    raise cleanup_error
-                raise
-            if cleanup_error is not None:
-                if exc_value is not None:
-                    raise cleanup_error from exc_value
-                raise cleanup_error
+                if (
+                    release_handle is not None
+                    and self._handle is None
+                    and isinstance(exc_value, BaseException)
+                ):
+                    _remove_unreleased_handle(exc_value, release_handle)
+                cleanup_errors.append(release_error)
+            else:
+                if (
+                    release_handle is not None
+                    and self._handle is None
+                    and isinstance(exc_value, BaseException)
+                ):
+                    _remove_unreleased_handle(exc_value, release_handle)
+            if cleanup_errors:
+                errors = list(cleanup_errors)
+                if isinstance(exc_value, BaseException):
+                    errors.insert(0, exc_value)
+                committed = self._replacement_committed or any(
+                    isinstance(error, ConfigPostCommitError) for error in errors
+                )
+                aggregate = _aggregate_config_errors(
+                    errors,
+                    self.path,
+                    committed=committed,
+                    backup_path=self._backup_path or self._pending_backup_cleanup,
+                )
+                original_error = getattr(aggregate, "original_error", None)
+                if original_error is not None:
+                    raise aggregate from original_error
+                raise aggregate
         else:
             self._release_cooperative()
         if (
@@ -183,12 +341,24 @@ class _PathLease:
                 pending_backup.unlink(missing_ok=True)
                 self._pending_backup_cleanup = None
             except OSError as error:
-                raise ConfigTransactionStateError(
+                state_error = ConfigTransactionStateError(
                     self.path,
                     "unable to remove the pre-commit backup after a safe rollback",
                     backup_path=pending_backup,
                     state_uncertain=False,
-                ) from error
+                    original_error=exc_value,
+                    cleanup_error=error,
+                    failures=(
+                        ConfigOperationFailure(
+                            "unlink(backup)",
+                            pending_backup,
+                            _safe_error_code(error),
+                        ),
+                    ),
+                )
+                if exc_value is not None:
+                    raise state_error from exc_value
+                raise state_error from error
         return False
 
     def _rollback_new_path(self) -> None:
@@ -201,6 +371,14 @@ class _PathLease:
                 self.path,
                 "unable to roll back the newly created config file",
                 backup_path=self._backup_path or self._pending_backup_cleanup,
+                cleanup_error=error,
+                failures=(
+                    ConfigOperationFailure(
+                        "unlink(config)",
+                        self.path,
+                        _safe_error_code(error),
+                    ),
+                ),
             ) from error
         self._created_new_path = False
 
@@ -306,38 +484,66 @@ class _PathLease:
         ]
         lock_file.restype = ctypes.c_int
         overlapped = _WindowsOverlapped()
-        if not _lock_windows_file(lock_file, handle, overlapped):
-            error = ctypes.get_last_error()
-            lock_failure = ConfigError(
-                f"unable to lock config on Windows (LockFileEx error {error})"
-            )
-            close_error: Exception | None = None
+        lock_failure_cause: BaseException | None = None
+        try:
+            lock_succeeded = _lock_windows_file(lock_file, handle, overlapped)
+            lock_error_code = None if lock_succeeded else ctypes.get_last_error()
+        except Exception as error:
+            lock_succeeded = False
+            lock_error_code = _safe_error_code(error)
+            lock_failure_cause = error
+        if not lock_succeeded:
+            lock_failure = ConfigError("unable to lock config on Windows")
+            failures = [
+                ConfigOperationFailure(
+                    "LockFileEx",
+                    self.path,
+                    lock_error_code,
+                )
+            ]
+            unreleased_handles: list[int] = []
             try:
-                if not _close_windows_handle(close_handle, handle):
-                    close_error = RuntimeError(
-                        "CloseHandle returned failure "
-                        f"(error {ctypes.get_last_error()})"
+                close_succeeded = _close_windows_handle(close_handle, handle)
+                close_error_code = (
+                    None if close_succeeded else ctypes.get_last_error()
+                )
+            except Exception as error:
+                close_succeeded = False
+                close_error_code = _safe_error_code(error)
+            if not close_succeeded:
+                failures.append(
+                    ConfigOperationFailure(
+                        "CloseHandle(lease)",
+                        self.path,
+                        close_error_code,
                     )
-            except Exception as cleanup_error:
-                close_error = cleanup_error
-            rollback_error: OSError | None = None
+                )
+                unreleased_handles.append(int(handle))
             if created_new_path:
                 try:
                     self.path.unlink(missing_ok=True)
-                except OSError as cleanup_error:
-                    rollback_error = cleanup_error
-            if close_error is not None or rollback_error is not None:
-                details = [str(lock_failure)]
-                if close_error is not None:
-                    details.append(f"handle cleanup: {close_error}")
-                if rollback_error is not None:
-                    details.append(f"rollback unlink: {rollback_error}")
+                except OSError as error:
+                    failures.append(
+                        ConfigOperationFailure(
+                            "unlink(config)",
+                            self.path,
+                            _safe_error_code(error),
+                        )
+                    )
+            if len(failures) > 1:
                 state_error = ConfigTransactionStateError(
                     self.path,
-                    "; ".join(details),
+                    "Windows lock acquisition cleanup is uncertain",
                     backup_path=self._backup_path or self._pending_backup_cleanup,
+                    original_error=lock_failure,
+                    failures=tuple(failures),
+                    unreleased_handles=tuple(unreleased_handles),
                 )
+                if lock_failure_cause is not None:
+                    raise state_error from lock_failure_cause
                 raise state_error from lock_failure
+            if lock_failure_cause is not None:
+                raise lock_failure from lock_failure_cause
             raise lock_failure
 
         self._kernel32 = kernel32
@@ -348,15 +554,27 @@ class _PathLease:
         try:
             self._verify_windows_handle_path_identity(self._handle, create_file, close_handle)
         except Exception as error:
-            cleanup_error: ConfigError | None = None
+            cleanup_errors: list[BaseException] = []
             if self._created_new_path:
                 try:
                     self._rollback_new_path()
                 except ConfigError as cleanup_exception:
-                    cleanup_error = cleanup_exception
-            self._release_windows()
-            if cleanup_error is not None:
-                raise cleanup_error from error
+                    cleanup_errors.append(cleanup_exception)
+            try:
+                self._release_windows()
+            except Exception as cleanup_exception:
+                cleanup_errors.append(cleanup_exception)
+            if cleanup_errors:
+                aggregate = _aggregate_config_errors(
+                    [error, *cleanup_errors],
+                    self.path,
+                    committed=self._replacement_committed,
+                    backup_path=self._backup_path or self._pending_backup_cleanup,
+                )
+                original_error = getattr(aggregate, "original_error", None)
+                if original_error is not None:
+                    raise aggregate from original_error
+                raise aggregate from error
             raise
 
     def _verify_windows_handle_path_identity(
@@ -377,6 +595,7 @@ class _PathLease:
         invalid_handle = ctypes.c_void_p(-1).value
         if current_handle in (None, invalid_handle):
             raise ConfigChangedError("config path changed while acquiring its Windows lock")
+        body_error: BaseException | None = None
         try:
             get_info = self._kernel32.GetFileInformationByHandle
             get_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WindowsFileInfo)]
@@ -399,13 +618,44 @@ class _PathLease:
             )
             if locked_identity != current_identity:
                 raise ConfigChangedError("config path changed while acquiring its Windows lock")
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
-            if not _close_windows_handle(close_handle, current_handle):
-                raise ConfigTransactionStateError(
-                    self.path,
-                    "unable to close the Windows identity handle "
-                    f"(error {ctypes.get_last_error()})",
+            try:
+                close_succeeded = _close_windows_handle(close_handle, current_handle)
+                close_error_code = (
+                    None if close_succeeded else ctypes.get_last_error()
                 )
+            except Exception as error:
+                close_succeeded = False
+                close_error_code = _safe_error_code(error)
+            if not close_succeeded:
+                failure = ConfigOperationFailure(
+                    "CloseHandle(identity)",
+                    self.path,
+                    close_error_code,
+                )
+                original_error = getattr(body_error, "original_error", None)
+                if original_error is None:
+                    original_error = body_error
+                state_error = ConfigTransactionStateError(
+                    self.path,
+                    "unable to close the Windows identity handle",
+                    original_error=original_error,
+                    failures=tuple(
+                        [*getattr(body_error, "failures", ()), failure]
+                    ),
+                    unreleased_handles=tuple(
+                        [
+                            *getattr(body_error, "unreleased_handles", ()),
+                            int(current_handle),
+                        ]
+                    ),
+                )
+                if original_error is not None:
+                    raise state_error from original_error
+                raise state_error
 
     def replace_with_windows_transaction(
         self,
@@ -468,9 +718,13 @@ class _PathLease:
             raise ConfigError(f"unable to open temporary config for locking (error {error})")
 
         source_handle_int = int(source_handle)
+        source_handle = source_handle_int
         transaction = None
         new_handle: int | None = None
         committed = False
+        body_error: Exception | None = None
+        body_failures: list[ConfigOperationFailure] = []
+        unreleased_handles: list[int] = []
         try:
             if self._read_windows_handle(source_handle_int, kernel32) != expected:
                 raise ConfigChangedError(
@@ -604,19 +858,10 @@ class _PathLease:
                     self._replacement_committed = True
                 return succeeded
 
-            try:
-                commit_succeeded = _commit_windows_transaction(
-                    commit_and_mark,
-                    transaction_handle,
-                )
-            except Exception as error:
-                if committed:
-                    raise ConfigPostCommitError(
-                        target_path,
-                        "CommitTransaction succeeded before post-commit handling failed",
-                        backup_path=self._backup_path,
-                    ) from error
-                raise
+            commit_succeeded = _commit_windows_transaction(
+                commit_and_mark,
+                transaction_handle,
+            )
 
             if not commit_succeeded:
                 error = ctypes.get_last_error()
@@ -624,150 +869,300 @@ class _PathLease:
             if not committed:
                 raise ConfigError("Windows transaction commit was not recorded")
 
-            # The share-denying handle was opened before commit.  Install it
-            # on the lease before releasing any pre-commit handles so every
-            # post-commit failure still leaves the target namespace guarded.
-            self._handle = new_handle
-            self._overlapped = None
-            self._locked = False
-            new_handle = None
+            # The share-denying handle was opened before commit.  Release the
+            # old lease while it is still owned by self, then install the new
+            # handle only after CloseHandle has succeeded.
+            try:
+                source_close_ok = _close_source_handle(
+                    close_handle,
+                    source_handle_int,
+                )
+                source_close_code = (
+                    None if source_close_ok else ctypes.get_last_error()
+                )
+            except Exception as error:
+                source_close_ok = False
+                source_close_code = _safe_error_code(error)
+            if source_close_ok:
+                source_handle = None
+            else:
+                body_failures.append(
+                    ConfigOperationFailure(
+                        "CloseHandle(source)",
+                        temporary_path,
+                        source_close_code,
+                    )
+                )
+                if source_handle_int not in unreleased_handles:
+                    unreleased_handles.append(source_handle_int)
 
-            source_close_ok = _close_windows_handle(close_handle, source_handle_int)
-            source_close_code = ctypes.get_last_error() if not source_close_ok else None
-            source_handle = None
-            old_error = self._release_windows_handle(kernel32, old_handle, old_overlapped)
-            if source_close_code is not None:
-                raise ConfigPostCommitError(
-                    target_path,
-                    f"unable to release temporary Windows config handle (error {source_close_code})"
+            try:
+                old_release = _normalize_windows_release(
+                    self._release_windows_handle(
+                        kernel32,
+                        old_handle,
+                        old_overlapped,
+                    )
                 )
-            if old_error is not None:
-                raise ConfigPostCommitError(
-                    target_path,
-                    f"unable to release previous Windows config lock (error {old_error})"
+            except Exception as error:
+                body_failures.append(
+                    ConfigOperationFailure(
+                        "lease release",
+                        target_path,
+                        _safe_error_code(error),
+                    )
                 )
+                if old_handle not in unreleased_handles:
+                    unreleased_handles.append(old_handle)
+            else:
+                old_failures = _windows_release_failures(
+                    old_release,
+                    target_path,
+                    "lease",
+                )
+                body_failures.extend(old_failures)
+                if old_release.close_succeeded:
+                    self._handle = new_handle
+                    self._overlapped = None
+                    self._locked = False
+                    new_handle = None
+                    if old_handle in unreleased_handles:
+                        unreleased_handles.remove(old_handle)
+                elif old_handle not in unreleased_handles:
+                    unreleased_handles.append(old_handle)
+
+            if body_failures:
+                raise ConfigError("post-commit handle cleanup failed")
+        except Exception as error:
+            body_error = error
+            raise
         finally:
-            transaction_cleanup_error: ConfigError | None = None
-            rollback_error: Exception | None = None
-            transaction_close_error: Exception | None = None
+            cleanup_failures: list[ConfigOperationFailure] = []
             if transaction is not None:
+                transaction_value = int(transaction)
                 if not committed:
                     try:
-                        if not _rollback_windows_transaction(
+                        rollback_ok = _rollback_windows_transaction(
                             rollback_transaction,
-                            int(transaction),
-                        ):
-                            rollback_error = RuntimeError(
-                                "RollbackTransaction returned failure"
+                            transaction_value,
+                        )
+                        if not rollback_ok:
+                            cleanup_failures.append(
+                                ConfigOperationFailure(
+                                    "RollbackTransaction",
+                                    target_path,
+                                    ctypes.get_last_error(),
+                                )
                             )
                     except Exception as error:
-                        rollback_error = error
-                try:
-                    if not _close_windows_transaction(close_handle, transaction):
-                        transaction_close_error = RuntimeError(
-                            f"CloseHandle failed (error {ctypes.get_last_error()})"
+                        cleanup_failures.append(
+                            ConfigOperationFailure(
+                                "RollbackTransaction",
+                                target_path,
+                                _safe_error_code(error),
+                            )
                         )
+                try:
+                    transaction_close_ok = _close_windows_transaction(
+                        close_handle,
+                        transaction_value,
+                    )
+                    if transaction_close_ok:
+                        transaction = None
+                        if transaction_value in unreleased_handles:
+                            unreleased_handles.remove(transaction_value)
+                    else:
+                        cleanup_failures.append(
+                            ConfigOperationFailure(
+                                "CloseHandle(transaction)",
+                                target_path,
+                                ctypes.get_last_error(),
+                            )
+                        )
+                        if transaction_value not in unreleased_handles:
+                            unreleased_handles.append(transaction_value)
                 except Exception as error:
-                    transaction_close_error = error
-                if committed and transaction_close_error is not None:
-                    transaction_cleanup_error = ConfigPostCommitError(
-                        target_path,
-                        "unable to close the Windows transaction handle",
-                        backup_path=self._backup_path,
+                    cleanup_failures.append(
+                        ConfigOperationFailure(
+                            "CloseHandle(transaction)",
+                            target_path,
+                            _safe_error_code(error),
+                        )
                     )
-                    transaction_cleanup_error.__cause__ = transaction_close_error
-                elif not committed and (
-                    rollback_error is not None or transaction_close_error is not None
-                ):
-                    details = []
-                    if rollback_error is not None:
-                        details.append(f"rollback: {rollback_error}")
-                    if transaction_close_error is not None:
-                        details.append(f"close: {transaction_close_error}")
-                    transaction_cleanup_error = ConfigTransactionStateError(
-                        target_path,
-                        "; ".join(details),
-                        backup_path=self._backup_path,
-                    )
+                    if transaction_value not in unreleased_handles:
+                        unreleased_handles.append(transaction_value)
             if new_handle is not None:
+                replacement_handle = new_handle
                 try:
-                    if not _close_precommit_handle(close_handle, new_handle):
-                        raise RuntimeError(
-                            f"CloseHandle failed (error {ctypes.get_last_error()})"
+                    replacement_close_ok = _close_precommit_handle(
+                        close_handle,
+                        replacement_handle,
+                    )
+                    if replacement_close_ok:
+                        new_handle = None
+                        if replacement_handle in unreleased_handles:
+                            unreleased_handles.remove(replacement_handle)
+                    else:
+                        cleanup_failures.append(
+                            ConfigOperationFailure(
+                                "CloseHandle(replacement)",
+                                target_path,
+                                ctypes.get_last_error(),
+                            )
                         )
+                        if replacement_handle not in unreleased_handles:
+                            unreleased_handles.append(replacement_handle)
                 except Exception as error:
-                    if transaction_cleanup_error is None:
-                        transaction_cleanup_error = ConfigTransactionStateError(
+                    cleanup_failures.append(
+                        ConfigOperationFailure(
+                            "CloseHandle(replacement)",
                             target_path,
-                            "unable to close the pre-commit replacement handle",
-                            backup_path=self._backup_path,
+                            _safe_error_code(error),
                         )
-                        transaction_cleanup_error.__cause__ = error
+                    )
+                    if replacement_handle not in unreleased_handles:
+                        unreleased_handles.append(replacement_handle)
             if source_handle is not None:
+                source_handle_value = int(source_handle)
                 try:
-                    if not _close_precommit_handle(close_handle, source_handle):
-                        raise RuntimeError(
-                            f"CloseHandle failed (error {ctypes.get_last_error()})"
+                    source_cleanup_ok = _close_precommit_handle(
+                        close_handle,
+                        source_handle_value,
+                    )
+                    if source_cleanup_ok:
+                        source_handle = None
+                        if source_handle_value in unreleased_handles:
+                            unreleased_handles.remove(source_handle_value)
+                    else:
+                        cleanup_failures.append(
+                            ConfigOperationFailure(
+                                "CloseHandle(source)",
+                                temporary_path,
+                                ctypes.get_last_error(),
+                            )
                         )
+                        if source_handle_value not in unreleased_handles:
+                            unreleased_handles.append(source_handle_value)
                 except Exception as error:
-                    if transaction_cleanup_error is None:
-                        transaction_cleanup_error = ConfigTransactionStateError(
-                            target_path,
-                            "unable to close the pre-commit source handle",
-                            backup_path=self._backup_path,
+                    cleanup_failures.append(
+                        ConfigOperationFailure(
+                            "CloseHandle(source)",
+                            temporary_path,
+                            _safe_error_code(error),
                         )
-                        transaction_cleanup_error.__cause__ = error
+                    )
+                    if source_handle_value not in unreleased_handles:
+                        unreleased_handles.append(source_handle_value)
             if not committed:
                 try:
                     shadow_path.unlink(missing_ok=True)
-                except OSError as error:
-                    if transaction_cleanup_error is None:
-                        transaction_cleanup_error = ConfigTransactionStateError(
-                            target_path,
-                            "unable to remove the pre-commit shadow path",
-                            backup_path=self._backup_path,
+                except Exception as error:
+                    cleanup_failures.append(
+                        ConfigOperationFailure(
+                            "unlink(shadow)",
+                            shadow_path,
+                            _safe_error_code(error),
                         )
-                        transaction_cleanup_error.__cause__ = error
-            if transaction_cleanup_error is not None:
-                raise transaction_cleanup_error
+                    )
+
+            body_metadata_failures = list(getattr(body_error, "failures", ()))
+            all_failures = body_metadata_failures + body_failures + cleanup_failures
+            body_handles = list(getattr(body_error, "unreleased_handles", ()))
+            all_handles = body_handles + unreleased_handles
+            if committed and (body_error is not None or all_failures):
+                if body_error is not None and not all_failures:
+                    all_failures.append(
+                        ConfigOperationFailure(
+                            "post-commit",
+                            target_path,
+                            _safe_error_code(body_error),
+                        )
+                    )
+                original_error = getattr(body_error, "original_error", None)
+                if original_error is None:
+                    original_error = body_error
+                post_error = ConfigPostCommitError(
+                    target_path,
+                    "post-commit operation cleanup is uncertain",
+                    backup_path=self._backup_path,
+                    original_error=original_error,
+                    failures=tuple(all_failures),
+                    unreleased_handles=tuple(dict.fromkeys(all_handles)),
+                )
+                if original_error is not None:
+                    raise post_error from original_error
+                raise post_error
+            if not committed and all_failures:
+                original_error = getattr(body_error, "original_error", None)
+                state_error = ConfigTransactionStateError(
+                    target_path,
+                    "pre-commit operation cleanup is uncertain",
+                    backup_path=self._backup_path,
+                    original_error=original_error or body_error,
+                    failures=tuple(all_failures),
+                    unreleased_handles=tuple(dict.fromkeys(all_handles)),
+                )
+                if state_error.original_error is not None:
+                    raise state_error from state_error.original_error
+                raise state_error
 
     def _release_windows(self) -> None:
         if self._handle is None or self._kernel32 is None:
             return
+        handle = self._handle
+        overlapped = self._overlapped
         kernel32 = self._kernel32
         try:
-            unlock_error = self._release_windows_handle(
+            release_result = self._release_windows_handle(
                 kernel32,
-                self._handle,
-                self._overlapped,
+                handle,
+                overlapped,
             )
         except Exception as error:
-            self._handle = None
-            self._locked = False
-            if self._replacement_committed:
-                raise ConfigPostCommitError(
+            failures = (
+                ConfigOperationFailure(
+                    "lease release",
                     self.path,
-                    "unable to release Windows config lock",
-                    backup_path=self._backup_path,
-                ) from error
-            raise ConfigTransactionStateError(
+                    _safe_error_code(error),
+                ),
+            )
+            error_type = (
+                ConfigPostCommitError
+                if self._replacement_committed
+                else ConfigTransactionStateError
+            )
+            raise error_type(
                 self.path,
                 "unable to release Windows config lock",
-                backup_path=self._backup_path or self._pending_backup_cleanup,
+                backup_path=self._backup_path
+                if self._replacement_committed
+                else self._backup_path or self._pending_backup_cleanup,
+                original_error=error,
+                failures=failures,
+                unreleased_handles=(handle,),
             ) from error
-        self._handle = None
-        self._locked = False
-        if unlock_error is not None:
-            if self._replacement_committed:
-                raise ConfigPostCommitError(
-                    self.path,
-                    f"unable to release Windows config lock (error {unlock_error})",
-                    backup_path=self._backup_path,
-                )
-            raise ConfigTransactionStateError(
+        normalized = _normalize_windows_release(release_result)
+        failures = _windows_release_failures(normalized, self.path, "lease")
+        if normalized.close_succeeded:
+            self._handle = None
+            self._overlapped = None
+            self._locked = False
+        if failures:
+            error_type = (
+                ConfigPostCommitError
+                if self._replacement_committed
+                else ConfigTransactionStateError
+            )
+            raise error_type(
                 self.path,
-                f"unable to release Windows config lock (error {unlock_error})",
-                backup_path=self._backup_path or self._pending_backup_cleanup,
+                "unable to release Windows config lock",
+                backup_path=self._backup_path
+                if self._replacement_committed
+                else self._backup_path or self._pending_backup_cleanup,
+                failures=tuple(failures),
+                unreleased_handles=()
+                if normalized.close_succeeded
+                else (handle,),
             )
 
     def _release_windows_handle(
@@ -775,36 +1170,45 @@ class _PathLease:
         kernel32: object,
         handle: int,
         overlapped: _WindowsOverlapped | None,
-    ) -> int | str | None:
+    ) -> _WindowsHandleReleaseResult:
         unlock_error: int | str | None = None
         if overlapped is not None:
-            unlock_file = kernel32.UnlockFileEx
-            unlock_file.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint32,
-                ctypes.c_uint32,
-                ctypes.c_uint32,
-                ctypes.POINTER(_WindowsOverlapped),
-            ]
-            unlock_file.restype = ctypes.c_int
-            if not unlock_file(
-                handle,
-                0,
-                0xFFFFFFFF,
-                0xFFFFFFFF,
-                ctypes.byref(overlapped),
-            ):
-                unlock_error = ctypes.get_last_error()
-        close_handle = kernel32.CloseHandle
-        close_handle.argtypes = [ctypes.c_void_p]
-        close_handle.restype = ctypes.c_int
-        if not _close_windows_handle(close_handle, handle):
-            close_error = ctypes.get_last_error()
-            if unlock_error is None:
-                unlock_error = close_error
-            else:
-                unlock_error = f"unlock={unlock_error}, close={close_error}"
-        return unlock_error
+            try:
+                unlock_file = kernel32.UnlockFileEx
+                unlock_file.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.POINTER(_WindowsOverlapped),
+                ]
+                unlock_file.restype = ctypes.c_int
+                if not unlock_file(
+                    handle,
+                    0,
+                    0xFFFFFFFF,
+                    0xFFFFFFFF,
+                    ctypes.byref(overlapped),
+                ):
+                    unlock_error = ctypes.get_last_error()
+            except Exception as error:
+                unlock_error = _safe_error_code(error)
+        close_succeeded = False
+        close_error: int | str | None = None
+        try:
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [ctypes.c_void_p]
+            close_handle.restype = ctypes.c_int
+            close_succeeded = _close_windows_handle(close_handle, handle)
+            if not close_succeeded:
+                close_error = ctypes.get_last_error()
+        except Exception as error:
+            close_error = _safe_error_code(error)
+        return _WindowsHandleReleaseResult(
+            close_succeeded=close_succeeded,
+            unlock_error=unlock_error,
+            close_error=close_error,
+        )
 
     def _acquire_cooperative(self) -> None:
         try:
@@ -1101,7 +1505,19 @@ def _atomic_write(
             raise
         except Exception as error:
             if lease is not None and getattr(lease, "_replacement_committed", False):
-                raise ConfigPostCommitError(path, str(error)) from error
+                raise ConfigPostCommitError(
+                    path,
+                    "replacement raised after the transaction committed",
+                    backup_path=lease._backup_path,
+                    original_error=error,
+                    failures=(
+                        ConfigOperationFailure(
+                            "replacement",
+                            path,
+                            _safe_error_code(error),
+                        ),
+                    ),
+                ) from error
             raise
         replacement_committed = True
     except Exception as error:
@@ -1114,10 +1530,30 @@ def _atomic_write(
             if replacement_committed or (
                 lease is not None and getattr(lease, "_replacement_committed", False)
             ):
-                raise ConfigPostCommitError(
+                body_failures = list(getattr(body_error, "failures", ()))
+                body_failures.append(
+                    ConfigOperationFailure(
+                        "unlink(temporary)",
+                        temporary_path,
+                        _safe_error_code(cleanup_error),
+                    )
+                )
+                original_error = getattr(body_error, "original_error", None)
+                if original_error is None:
+                    original_error = body_error
+                post_error = ConfigPostCommitError(
                     path,
                     "unable to remove the temporary replacement file",
-                ) from cleanup_error
+                    backup_path=lease._backup_path if lease is not None else None,
+                    original_error=original_error,
+                    failures=tuple(body_failures),
+                    unreleased_handles=tuple(
+                        getattr(body_error, "unreleased_handles", ())
+                    ),
+                )
+                if original_error is not None:
+                    raise post_error from original_error
+                raise post_error from cleanup_error
             backup_path = None
             if lease is not None:
                 backup_path = lease._backup_path or lease._pending_backup_cleanup
@@ -1127,11 +1563,26 @@ def _atomic_write(
                 "temporary evidence is retained",
                 backup_path=backup_path,
                 temporary_path=temporary_path,
-                original_error=body_error,
+                original_error=getattr(body_error, "original_error", None)
+                or body_error,
                 cleanup_error=cleanup_error,
+                failures=tuple(
+                    [
+                        *getattr(body_error, "failures", ()),
+                        ConfigOperationFailure(
+                            "unlink(temporary)",
+                            temporary_path,
+                            _safe_error_code(cleanup_error),
+                        ),
+                    ]
+                ),
+                unreleased_handles=tuple(
+                    getattr(body_error, "unreleased_handles", ())
+                ),
             )
-            if body_error is not None:
-                raise state_error from body_error
+            original_error = state_error.original_error
+            if original_error is not None:
+                raise state_error from original_error
             raise state_error from cleanup_error
 
 
@@ -1201,6 +1652,10 @@ def _lock_windows_file(lock_file, handle, overlapped: _WindowsOverlapped) -> boo
 
 
 def _close_precommit_handle(close_handle, handle) -> bool:
+    return _close_windows_handle(close_handle, handle)
+
+
+def _close_source_handle(close_handle, handle) -> bool:
     return _close_windows_handle(close_handle, handle)
 
 
