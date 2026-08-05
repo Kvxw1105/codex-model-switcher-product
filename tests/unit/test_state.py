@@ -134,6 +134,18 @@ def test_new_database_uses_wal_and_current_schema(tmp_path, secret_key_provider)
 
     assert store.schema_version == 3
     assert store.journal_mode == "wal"
+    connection = store._require_connection()
+    for table, column in (
+        ("response_links", "event_sequence"),
+        ("context_fragments", "event_sequence"),
+        ("compact_boundaries", "boundary_event_sequence"),
+    ):
+        not_null = next(
+            row[3]
+            for row in connection.execute(f"PRAGMA table_info({table})")
+            if row[1] == column
+        )
+        assert not_null == 1
     store.close()
 
 
@@ -198,7 +210,9 @@ def test_legacy_and_v2_semantic_values_are_quarantined_before_writes(
         evidence = {"": path.read_bytes()}
         evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
         connection_modes: list[str] = []
+        operation_order: list[str] = []
         original_connect = state_module.sqlite3.connect
+        original_copy_file = StateStore._copy_file_with_retry
 
         def record_connect(database, *args, **kwargs):
             connection_modes.append(
@@ -208,12 +222,26 @@ def test_legacy_and_v2_semantic_values_are_quarantined_before_writes(
             )
             return original_connect(database, *args, **kwargs)
 
+        def record_copy_file(source, destination):
+            operation_order.append(
+                "quarantine_file_copy"
+                if ".quarantine-" in Path(destination).name
+                else "file_snapshot"
+            )
+            return original_copy_file(source, destination)
+
         monkeypatch.setattr(state_module.sqlite3, "connect", record_connect)
+        monkeypatch.setattr(
+            StateStore, "_copy_file_with_retry", staticmethod(record_copy_file)
+        )
 
         with pytest.raises(DatabaseCorruptionError, match=error_pattern):
             StateStore(path, secret_key_provider)
 
         assert connection_modes == ["ro"]
+        assert operation_order
+        assert operation_order[0] == "quarantine_file_copy"
+        assert "file_snapshot" not in operation_order
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
         assert sidecars["-shm"].read_bytes() == evidence["-shm"]
@@ -228,6 +256,58 @@ def test_legacy_and_v2_semantic_values_are_quarantined_before_writes(
         seed.close()
 
 
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "link-created-at",
+        "link-expires-at",
+        "route-selected-at",
+        "fragment-created-at",
+        "fragment-expires-at",
+        "receipt-created-at",
+        "cancel-created-at",
+        "cancel-expires-at",
+        "purge-now",
+    ],
+)
+def test_public_write_apis_reject_negative_timestamps(
+    tmp_path, secret_key_provider, operation
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3", secret_key_provider)
+    operations = {
+        "link-created-at": lambda: store.link_response(
+            "local", "upstream", route_id="chat", created_at=-1
+        ),
+        "link-expires-at": lambda: store.link_response(
+            "local", "upstream", route_id="chat", expires_at=-1
+        ),
+        "route-selected-at": lambda: store.save_route_selection(
+            "task", "turn", "chat", selected_at=-1
+        ),
+        "fragment-created-at": lambda: store.save_chat_fragment(
+            "task", "fragment", "fixture", created_at=-1
+        ),
+        "fragment-expires-at": lambda: store.save_chat_fragment(
+            "task", "fragment", "fixture", expires_at=-1
+        ),
+        "receipt-created-at": lambda: store.save_config_receipt(
+            "receipt", "a" * 64, created_at=-1
+        ),
+        "cancel-created-at": lambda: store.save_cancel_handle(
+            "handle", codex_task_id="task", route_id="chat", created_at=-1
+        ),
+        "cancel-expires-at": lambda: store.save_cancel_handle(
+            "handle", codex_task_id="task", route_id="chat", expires_at=-1
+        ),
+        "purge-now": lambda: store.purge_expired(now=-1),
+    }
+    try:
+        with pytest.raises(ValueError, match="non-negative"):
+            operations[operation]()
+    finally:
+        store.close()
+
+
 def test_response_link_survives_process_reopen(tmp_path, secret_key_provider) -> None:
     path = tmp_path / "state.sqlite3"
     first = StateStore(path, secret_key_provider)
@@ -238,6 +318,43 @@ def test_response_link_survives_process_reopen(tmp_path, secret_key_provider) ->
     assert second.get_response_link("local-1").upstream_id == "upstream-7"
     assert second.get_response_link("local-1").route_id == "deepseek"
     second.close()
+
+
+def test_read_only_source_preflight_precedes_file_snapshot(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = StateStore(path, secret_key_provider)
+    first.link_response("local-1", "upstream-1", route_id="chat")
+    first.close()
+
+    events: list[str] = []
+    read_only_sources: list[str] = []
+    original_connect = state_module.sqlite3.connect
+    original_copy_database_set = StateStore._copy_database_set
+
+    def record_connect(database, *args, **kwargs):
+        if kwargs.get("uri") and "?mode=ro" in str(database):
+            events.append("read_only_source_preflight")
+            read_only_sources.append(str(database))
+        else:
+            events.append("writable_sqlite_connection")
+        return original_connect(database, *args, **kwargs)
+
+    def record_file_snapshot(store, destination):
+        events.append("writable_file_snapshot")
+        return original_copy_database_set(store, destination)
+
+    monkeypatch.setattr(state_module.sqlite3, "connect", record_connect)
+    monkeypatch.setattr(StateStore, "_copy_database_set", record_file_snapshot)
+
+    reopened = StateStore(path, secret_key_provider)
+    reopened.close()
+
+    assert read_only_sources == [f"{path.as_uri()}?mode=ro"]
+    assert events.index("read_only_source_preflight") < events.index(
+        "writable_file_snapshot"
+    )
 
 
 def test_event_sequence_survives_process_reopen(tmp_path, secret_key_provider) -> None:
@@ -618,6 +735,10 @@ def test_v2_migration_interleaves_history_before_compact_prune(
             ("r-boundary", "u-boundary", "chat", 300, "task-1", None),
         ],
     )
+    connection.execute(
+        "INSERT INTO compact_boundaries VALUES (?, ?, ?)",
+        ("task-1", "r-boundary", 300),
+    )
     cipher = Fernet(secret_key_provider.get_key())
     connection.executemany(
         "INSERT INTO context_fragments VALUES (?, ?, ?, ?, ?)",
@@ -650,6 +771,10 @@ def test_v2_migration_interleaves_history_before_compact_prune(
         ("f-new", "fragment"),
     ]
     assert [row[1] for row in rows] == list(range(1, 7))
+    assert store._require_connection().execute(
+        "SELECT boundary_response_id, boundary_created_at, boundary_event_sequence "
+        "FROM compact_boundaries WHERE codex_task_id = 'task-1'"
+    ).fetchone() == ("r-boundary", 300, 5)
 
     assert store.prune_after_compact("task-1", "r-boundary") == 4
     assert store.get_response_link("r-old") is None
@@ -709,6 +834,129 @@ def test_incomplete_v3_schema_is_quarantined_before_first_write(
         assert path.read_bytes() == evidence[""]
         assert sidecars["-wal"].read_bytes() == evidence["-wal"]
         assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+    finally:
+        seed.close()
+
+
+@pytest.mark.parametrize(
+    ("boundary_definition", "boundary_value", "error_pattern"),
+    [
+        pytest.param("INTEGER", None, "schema", id="boundary-sequence-null"),
+        pytest.param(
+            "INTEGER NOT NULL", -1, "boundary event sequence", id="boundary-sequence-negative"
+        ),
+    ],
+)
+def test_v3_compact_boundary_sequence_is_required_and_validated(
+    tmp_path, secret_key_provider, monkeypatch, boundary_definition, boundary_value, error_pattern
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    seed = sqlite3.connect(path)
+    try:
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("PRAGMA wal_autocheckpoint=0")
+        seed.executescript(
+            """
+            CREATE TABLE route_selections (
+                selection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                codex_task_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                selected_at INTEGER NOT NULL
+            );
+            CREATE TABLE response_links (
+                local_response_id TEXT PRIMARY KEY,
+                upstream_response_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                codex_task_id TEXT,
+                expires_at INTEGER,
+                event_sequence INTEGER NOT NULL
+            );
+            CREATE TABLE context_fragments (
+                fragment_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                event_sequence INTEGER NOT NULL
+            );
+            CREATE TABLE config_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                config_sha256 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE cancel_handles (
+                handle_id TEXT PRIMARY KEY,
+                codex_task_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER
+            );
+            CREATE TABLE event_counters (
+                counter_name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            """
+        )
+        seed.execute(
+            f"""
+            CREATE TABLE compact_boundaries (
+                codex_task_id TEXT PRIMARY KEY,
+                boundary_response_id TEXT NOT NULL,
+                boundary_created_at INTEGER NOT NULL,
+                boundary_event_sequence {boundary_definition}
+            )
+            """
+        )
+        seed.execute("PRAGMA user_version = 3")
+        seed.execute(
+            "INSERT INTO response_links VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("local-1", "upstream-1", "chat", 10, "task-1", None, 1),
+        )
+        seed.execute(
+            "INSERT INTO compact_boundaries VALUES (?, ?, ?, ?)",
+            ("task-1", "local-1", 10, boundary_value),
+        )
+        seed.execute(
+            "INSERT INTO event_counters VALUES ('state', 1)"
+        )
+        seed.commit()
+
+        sidecars = {
+            "-wal": path.with_name(f"{path.name}-wal"),
+            "-shm": path.with_name(f"{path.name}-shm"),
+        }
+        assert all(sidecar.exists() for sidecar in sidecars.values())
+        evidence = {"": path.read_bytes()}
+        evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
+        connection_modes: list[str] = []
+        original_connect = state_module.sqlite3.connect
+
+        def record_connect(database, *args, **kwargs):
+            connection_modes.append(
+                "ro"
+                if kwargs.get("uri") and "?mode=ro" in str(database)
+                else "writable"
+            )
+            return original_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(state_module.sqlite3, "connect", record_connect)
+
+        with pytest.raises(DatabaseCorruptionError, match=error_pattern):
+            StateStore(path, secret_key_provider)
+
+        assert connection_modes == ["ro"]
+        assert path.read_bytes() == evidence[""]
+        assert sidecars["-wal"].read_bytes() == evidence["-wal"]
+        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+        quarantine_main = next(
+            item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+        )
+        assert quarantine_main.read_bytes() == evidence[""]
+        assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
     finally:
         seed.close()
 
@@ -910,10 +1158,36 @@ def test_inconsistent_event_state_is_quarantined_before_writes(
                 "WHERE local_response_id = 'local-2'"
             )
         elif corruption == "missing":
+            connection.execute("ALTER TABLE response_links RENAME TO response_links_old")
             connection.execute(
-                "UPDATE response_links SET event_sequence = NULL "
-                "WHERE local_response_id = 'local-2'"
+                """
+                CREATE TABLE response_links (
+                    local_response_id TEXT PRIMARY KEY,
+                    upstream_response_id TEXT NOT NULL,
+                    route_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    codex_task_id TEXT,
+                    expires_at INTEGER,
+                    event_sequence INTEGER
+                )
+                """
             )
+            connection.execute(
+                """
+                INSERT INTO response_links (
+                    local_response_id, upstream_response_id, route_id, created_at,
+                    codex_task_id, expires_at, event_sequence
+                )
+                SELECT local_response_id, upstream_response_id, route_id, created_at,
+                       codex_task_id, expires_at,
+                       CASE local_response_id
+                           WHEN 'local-2' THEN NULL
+                           ELSE event_sequence
+                       END
+                FROM response_links_old
+                """
+            )
+            connection.execute("DROP TABLE response_links_old")
         else:
             connection.execute(
                 "UPDATE response_links SET event_sequence = 0 "
@@ -926,7 +1200,7 @@ def test_inconsistent_event_state_is_quarantined_before_writes(
         "_configure_connection",
         lambda _store: pytest.fail("writable WAL setup ran before event-state preflight"),
     )
-    with pytest.raises(DatabaseCorruptionError, match="event (sequence|counter)"):
+    with pytest.raises(DatabaseCorruptionError, match="(event (sequence|counter)|schema)"):
         StateStore(path, secret_key_provider)
 
     assert path.read_bytes() == original_main

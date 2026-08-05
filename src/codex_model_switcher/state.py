@@ -7,6 +7,7 @@ configuration receipts, and cancellation metadata needed by an adapter.
 
 from __future__ import annotations
 
+import mmap
 import re
 import shutil
 import sqlite3
@@ -99,17 +100,17 @@ SCHEMA_COLUMN_SPECS = {
     "route_selections": dict(V2_SCHEMA_COLUMN_SPECS["route_selections"]),
     "response_links": {
         **V2_SCHEMA_COLUMN_SPECS["response_links"],
-        "event_sequence": _ColumnSpec("INTEGER"),
+        "event_sequence": _ColumnSpec("INTEGER", not_null=True),
     },
     "context_fragments": {
         **V2_SCHEMA_COLUMN_SPECS["context_fragments"],
-        "event_sequence": _ColumnSpec("INTEGER"),
+        "event_sequence": _ColumnSpec("INTEGER", not_null=True),
     },
     "config_receipts": dict(V2_SCHEMA_COLUMN_SPECS["config_receipts"]),
     "cancel_handles": dict(V2_SCHEMA_COLUMN_SPECS["cancel_handles"]),
     "compact_boundaries": {
         **V2_SCHEMA_COLUMN_SPECS["compact_boundaries"],
-        "boundary_event_sequence": _ColumnSpec("INTEGER"),
+        "boundary_event_sequence": _ColumnSpec("INTEGER", not_null=True),
     },
     "event_counters": {
         "counter_name": _ColumnSpec("TEXT", primary_key=True, identifier=True),
@@ -224,6 +225,14 @@ def _timestamp() -> int:
     return time.time_ns()
 
 
+def _timestamp_value(value: int, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{field} must be an integer timestamp")
+    if value < 0:
+        raise ValueError(f"{field} must be non-negative")
+    return value
+
+
 def _identifier(value: str, field: str) -> str:
     if not isinstance(value, str) or not value or len(value) > MAX_IDENTIFIER_LENGTH:
         raise ValueError(f"{field} must be a non-empty short identifier")
@@ -233,8 +242,12 @@ def _identifier(value: str, field: str) -> str:
 
 
 def _optional_expiry(value: int | None) -> int | None:
-    if value is not None and not isinstance(value, int):
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError("expires_at must be an integer timestamp or None")
+    if value < 0:
+        raise ValueError("expires_at must be non-negative")
     return value
 
 
@@ -325,19 +338,19 @@ class StateStore:
         source: sqlite3.Connection | None = None
         snapshot: sqlite3.Connection | None = None
         with TemporaryDirectory(prefix=".state-preflight-", dir=self.path.parent) as directory:
-            source_dir = Path(directory) / "source"
             snapshot_dir = Path(directory) / "snapshot"
             evidence_dir = Path(directory) / "evidence"
-            source_dir.mkdir()
             snapshot_dir.mkdir()
             evidence_dir.mkdir()
-            evidence_captured = False
+            original_shm: bytes | None = None
+            original_shm_present = False
             try:
-                self._copy_database_set(evidence_dir)
-                evidence_captured = True
-                self._clone_database_set(evidence_dir, source_dir)
-                self._validate_database_sidecars(evidence_dir)
-                source_path = source_dir / self.path.name
+                shm_path = self.path.with_name(f"{self.path.name}-shm")
+                original_shm_present = shm_path.exists()
+                if original_shm_present:
+                    original_shm = shm_path.read_bytes()
+                source_path = self.path.resolve()
+                self._validate_database_sidecars(source_path.parent)
                 with source_path.open("rb") as database_file:
                     if database_file.read(len(SQLITE_HEADER)) != SQLITE_HEADER:
                         raise DatabaseSnapshotError("state database header is invalid")
@@ -358,6 +371,7 @@ class StateStore:
                     raise UnsupportedSchemaError(
                         f"state database schema {snapshot_version} is unsupported"
                     )
+                self._copy_database_set(evidence_dir)
                 snapshot_path = snapshot_dir / self.path.name
                 snapshot = sqlite3.connect(snapshot_path)
                 source.backup(snapshot, pages=0, sleep=SNAPSHOT_COPY_DELAY_SECONDS)
@@ -375,12 +389,15 @@ class StateStore:
                         source.rollback()
                     source.close()
                     source = None
-                if not evidence_captured:
-                    try:
-                        self._copy_database_set(evidence_dir)
-                    except DatabaseSnapshotError as evidence_error:
-                        failure = evidence_error
-                quarantine = self._quarantine_existing(evidence_dir)
+                try:
+                    self._restore_read_only_shm(original_shm_present, original_shm)
+                except OSError as restore_error:
+                    failure = DatabaseSnapshotError(
+                        "state database shm sidecar could not be restored after "
+                        "read-only preflight"
+                    )
+                    failure.__cause__ = restore_error
+                quarantine = self._quarantine_existing()
                 raise DatabaseCorruptionError(
                     "existing state database snapshot/schema validation failed: "
                     f"{failure}; "
@@ -391,6 +408,35 @@ class StateStore:
                     snapshot.close()
                 if source is not None:
                     source.close()
+
+    def _restore_read_only_shm(
+        self, originally_present: bool, original_shm: bytes | None
+    ) -> None:
+        shm_path = self.path.with_name(f"{self.path.name}-shm")
+        if not originally_present:
+            if shm_path.exists():
+                shm_path.unlink()
+            return
+        if original_shm is None:
+            raise OSError("original shm evidence is unavailable")
+        if not shm_path.exists():
+            raise OSError("original shm sidecar disappeared during preflight")
+        if shm_path.stat().st_size != len(original_shm):
+            raise OSError("original shm sidecar size changed during preflight")
+        if shm_path.read_bytes() == original_shm:
+            return
+        # SQLite keeps the WAL-index mapped and may deny ordinary writes to the
+        # sidecar while another connection is alive.  Writing the saved bytes
+        # through the existing mapping restores only the read marks touched by
+        # this read-only preflight without replacing or truncating the file.
+        with shm_path.open("r+b") as sidecar:
+            mapped = mmap.mmap(sidecar.fileno(), 0, access=mmap.ACCESS_WRITE)
+            try:
+                mapped.seek(0)
+                mapped.write(original_shm)
+                mapped.flush()
+            finally:
+                mapped.close()
 
     def _copy_database_set(self, destination: Path) -> None:
         failures: dict[str, DatabaseSnapshotError] = {}
@@ -659,6 +705,29 @@ class StateStore:
         if len(sequences) != len(set(sequences)):
             raise DatabaseSchemaError("state database event sequence values must be unique")
 
+        for task_id, response_id, boundary_sequence in connection.execute(
+            "SELECT codex_task_id, boundary_response_id, boundary_event_sequence "
+            "FROM compact_boundaries"
+        ):
+            if (
+                not isinstance(boundary_sequence, int)
+                or isinstance(boundary_sequence, bool)
+                or boundary_sequence <= 0
+            ):
+                raise DatabaseSchemaError(
+                    "state database boundary event sequence must be a positive integer"
+                )
+            response_sequence = connection.execute(
+                "SELECT event_sequence FROM response_links "
+                "WHERE local_response_id = ? AND codex_task_id = ?",
+                (response_id, task_id),
+            ).fetchone()
+            if response_sequence is None or response_sequence[0] != boundary_sequence:
+                raise DatabaseSchemaError(
+                    "state database compact boundary event sequence does not match "
+                    "its response link"
+                )
+
         counter_rows = connection.execute(
             "SELECT value FROM event_counters WHERE counter_name = 'state'"
         ).fetchall()
@@ -803,9 +872,14 @@ class StateStore:
         connection.execute(
             "INSERT OR IGNORE INTO event_counters (counter_name, value) VALUES ('state', 0)"
         )
-        StateStore._add_column_if_missing(connection, "response_links", "event_sequence", "INTEGER")
         StateStore._add_column_if_missing(
-            connection, "context_fragments", "event_sequence", "INTEGER"
+            connection, "response_links", "event_sequence", "INTEGER NOT NULL DEFAULT 0"
+        )
+        StateStore._add_column_if_missing(
+            connection,
+            "context_fragments",
+            "event_sequence",
+            "INTEGER NOT NULL DEFAULT 0",
         )
         connection.execute(
             """
@@ -817,7 +891,10 @@ class StateStore:
             """
         )
         StateStore._add_column_if_missing(
-            connection, "compact_boundaries", "boundary_event_sequence", "INTEGER"
+            connection,
+            "compact_boundaries",
+            "boundary_event_sequence",
+            "INTEGER NOT NULL DEFAULT 0",
         )
         legacy_events = connection.execute(
             """
@@ -849,7 +926,7 @@ class StateStore:
                 SELECT event_sequence FROM response_links
                 WHERE local_response_id = compact_boundaries.boundary_response_id
             )
-            WHERE boundary_event_sequence IS NULL
+            WHERE boundary_event_sequence IS NULL OR boundary_event_sequence = 0
             """
         )
         connection.execute(
@@ -951,8 +1028,7 @@ class StateStore:
             codex_task_id = _identifier(codex_task_id, "codex_task_id")
         expires_at = _optional_expiry(expires_at)
         created_at = _timestamp() if created_at is None else created_at
-        if not isinstance(created_at, int):
-            raise TypeError("created_at must be an integer timestamp")
+        created_at = _timestamp_value(created_at, "created_at")
 
         def insert(connection: sqlite3.Connection) -> ResponseLink:
             event_sequence = self._next_event_sequence(connection)
@@ -1019,8 +1095,7 @@ class StateStore:
         turn_id = _identifier(turn_id, "turn_id")
         route_id = _identifier(route_id, "route_id")
         selected_at = _timestamp() if selected_at is None else selected_at
-        if not isinstance(selected_at, int):
-            raise TypeError("selected_at must be an integer timestamp")
+        selected_at = _timestamp_value(selected_at, "selected_at")
         selection = RouteSelection(codex_task_id, turn_id, route_id, selected_at)
 
         def insert(connection: sqlite3.Connection) -> RouteSelection:
@@ -1066,8 +1141,8 @@ class StateStore:
         if len(text) > MAX_CONTEXT_FRAGMENT_CHARS:
             raise ValueError("chat fragments exceed the maximum supported size")
         expires_at = _optional_expiry(expires_at)
-        if created_at is not None and not isinstance(created_at, int):
-            raise TypeError("created_at must be an integer timestamp")
+        if created_at is not None:
+            created_at = _timestamp_value(created_at, "created_at")
         ciphertext = self._cipher.encrypt_text(text)
 
         def insert(connection: sqlite3.Connection) -> None:
@@ -1115,8 +1190,7 @@ class StateStore:
         ):
             raise ValueError("config_sha256 must be exactly 64 hexadecimal characters")
         created_at = _timestamp() if created_at is None else created_at
-        if not isinstance(created_at, int):
-            raise TypeError("created_at must be an integer timestamp")
+        created_at = _timestamp_value(created_at, "created_at")
         receipt = ConfigReceipt(receipt_id, config_sha256, created_at)
 
         def insert(connection: sqlite3.Connection) -> ConfigReceipt:
@@ -1158,8 +1232,7 @@ class StateStore:
         route_id = _identifier(route_id, "route_id")
         expires_at = _optional_expiry(expires_at)
         created_at = _timestamp() if created_at is None else created_at
-        if not isinstance(created_at, int):
-            raise TypeError("created_at must be an integer timestamp")
+        created_at = _timestamp_value(created_at, "created_at")
         metadata = CancelHandleMetadata(handle_id, codex_task_id, route_id, created_at, expires_at)
 
         def insert(connection: sqlite3.Connection) -> CancelHandleMetadata:
@@ -1194,8 +1267,7 @@ class StateStore:
 
     def purge_expired(self, *, now: int | None = None) -> int:
         now = _timestamp() if now is None else now
-        if not isinstance(now, int):
-            raise TypeError("now must be an integer timestamp")
+        now = _timestamp_value(now, "now")
 
         def delete(connection: sqlite3.Connection) -> int:
             removed = 0
