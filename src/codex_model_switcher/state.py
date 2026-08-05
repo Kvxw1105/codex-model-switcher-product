@@ -158,6 +158,10 @@ class DatabaseSnapshotError(DatabaseCorruptionError):
     """Raised when a consistent database snapshot cannot be captured."""
 
 
+class DatabaseRecoveryError(DatabaseCorruptionError):
+    """Raised when recovery evidence cannot be captured safely."""
+
+
 class DatabaseQuarantineError(DatabaseCorruptionError):
     """Raised when quarantine could not preserve the complete evidence set."""
 
@@ -435,6 +439,70 @@ class StateStore:
             "state database files changed while capturing quarantine evidence"
         )
 
+    def _open_recovery_lock(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.path,
+            timeout=30.0,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        except (OSError, sqlite3.Error, DatabaseSnapshotError):
+            with suppress(sqlite3.DatabaseError):
+                connection.close()
+            raise
+        return connection
+
+    def _capture_locked_database_set_evidence(
+        self,
+    ) -> tuple[dict[str, _FileFingerprint], dict[str, bytes]]:
+        """Capture raw database files while the caller holds the writer lock."""
+
+        for attempt in range(SNAPSHOT_COPY_ATTEMPTS):
+            try:
+                before = self._capture_database_set_fingerprints()
+                if not before[""].exists:
+                    raise DatabaseRecoveryError(
+                        "state database main file disappeared during locked "
+                        "recovery capture"
+                    )
+                evidence: dict[str, bytes] = {}
+                for suffix, fingerprint in before.items():
+                    if not fingerprint.exists:
+                        continue
+                    path = self.path if not suffix else self.path.with_name(
+                        f"{self.path.name}{suffix}"
+                    )
+                    evidence[suffix] = path.read_bytes()
+                after = self._capture_database_set_fingerprints()
+            except (OSError, DatabaseSnapshotError) as exc:
+                if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
+                    raise DatabaseRecoveryError(
+                        "state database files could not be captured consistently "
+                        "under the recovery writer lock"
+                    ) from exc
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
+                continue
+
+            if before != after or any(
+                sha256(evidence[suffix]).digest() != fingerprint.digest
+                for suffix, fingerprint in after.items()
+                if fingerprint.exists
+            ):
+                if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
+                    raise DatabaseRecoveryError(
+                        "state database files changed while capturing locked "
+                        "recovery evidence"
+                    )
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
+                continue
+            return after, evidence
+
+        raise DatabaseRecoveryError(
+            "state database recovery evidence could not be captured under lock"
+        )
+
     def _write_database_set_evidence(
         self, destination: Path, evidence: dict[str, bytes]
     ) -> None:
@@ -452,8 +520,10 @@ class StateStore:
         with TemporaryDirectory(prefix=".state-preflight-", dir=self.path.parent) as directory:
             snapshot_dir = Path(directory) / "snapshot"
             evidence_dir = Path(directory) / "evidence"
+            recovery_evidence_dir = Path(directory) / "recovery-evidence"
             snapshot_dir.mkdir()
             evidence_dir.mkdir()
+            recovery_evidence_dir.mkdir()
             try:
                 try:
                     initial_fingerprints = self._capture_initial_database_state()
@@ -517,94 +587,143 @@ class StateStore:
                         failure.__cause__ = fingerprint_error
 
                 recovery_lock: sqlite3.Connection | None = None
+                recovery_lock_held = False
                 quarantine_source_directory: Path | None = None
+                quarantine_authorized = not source_preflight_started
+                quarantine: Path | None = None
                 try:
-                    if preflight_evidence is not None:
-                        self._write_database_set_evidence(evidence_dir, preflight_evidence)
-                        quarantine_source_directory = evidence_dir
-                    if (
-                        source_preflight_started
-                        and preflight_fingerprints is not None
-                    ):
+                    if source_preflight_started:
+                        live_set_unchanged = False
+                        recovery_failed = False
                         try:
-                            recovery_lock = sqlite3.connect(
-                                self.path,
-                                timeout=30.0,
-                                isolation_level=None,
-                                check_same_thread=False,
-                            )
-                            recovery_lock.execute("BEGIN IMMEDIATE")
-                            locked_main_wal = {
-                                suffix: self._fingerprint_file(
-                                    self.path
-                                    if not suffix
-                                    else self.path.with_name(f"{self.path.name}{suffix}")
+                            recovery_lock = self._open_recovery_lock()
+                            recovery_lock_held = True
+                            if preflight_fingerprints is not None:
+                                locked_main_wal = {
+                                    suffix: self._fingerprint_file(
+                                        self.path
+                                        if not suffix
+                                        else self.path.with_name(
+                                            f"{self.path.name}{suffix}"
+                                        )
+                                    )
+                                    for suffix in ("", "-wal")
+                                }
+                                shm_path = self.path.with_name(
+                                    f"{self.path.name}-shm"
                                 )
-                                for suffix in ("", "-wal")
-                            }
-                            shm_path = self.path.with_name(f"{self.path.name}-shm")
-                            # The writer lock can hold the WAL-index against raw
-                            # reads on Windows.  The SHM digest was verified when
-                            # preflight_evidence was captured; at the lock point
-                            # compare identity/size and never write an old index.
-                            locked_shm = self._file_identity_and_size(shm_path)
-                            main_wal_unchanged = (
-                                initial_fingerprints is None
-                                or all(
-                                    initial_fingerprints[suffix]
+                                # The writer lock can hold the WAL-index against
+                                # raw reads on Windows.  The SHM identity/size is
+                                # checked at the same lock point; a mismatch must
+                                # never authorize the old preflight evidence.
+                                locked_shm = self._file_identity_and_size(shm_path)
+                                main_wal_unchanged = (
+                                    initial_fingerprints is None
+                                    or all(
+                                        initial_fingerprints[suffix]
+                                        == locked_main_wal[suffix]
+                                        for suffix in ("", "-wal")
+                                    )
+                                )
+                                live_main_wal_unchanged = all(
+                                    preflight_fingerprints[suffix]
                                     == locked_main_wal[suffix]
                                     for suffix in ("", "-wal")
                                 )
-                            )
-                            live_main_wal_unchanged = all(
-                                preflight_fingerprints[suffix] == locked_main_wal[suffix]
-                                for suffix in ("", "-wal")
-                            )
-                            live_shm_identity_unchanged = (
-                                preflight_fingerprints["-shm"].exists == locked_shm[0]
-                                and preflight_fingerprints["-shm"].identity
-                                == locked_shm[1]
-                                and preflight_fingerprints["-shm"].size == locked_shm[2]
-                            )
-                            live_set_unchanged = (
-                                live_main_wal_unchanged
-                                and live_shm_identity_unchanged
-                            )
-                            if not live_set_unchanged:
-                                failure = DatabaseSnapshotError(
-                                    "state database changed during preflight; "
-                                    "live evidence was preserved"
+                                live_shm_identity_unchanged = (
+                                    preflight_fingerprints["-shm"].exists
+                                    == locked_shm[0]
+                                    and preflight_fingerprints["-shm"].identity
+                                    == locked_shm[1]
+                                    and preflight_fingerprints["-shm"].size
+                                    == locked_shm[2]
                                 )
-                                quarantine_source_directory = None
-                            elif not main_wal_unchanged:
-                                failure = DatabaseSnapshotError(
-                                    "state database changed during preflight; "
-                                    "live evidence was preserved"
+                                live_set_unchanged = (
+                                    live_main_wal_unchanged
+                                    and live_shm_identity_unchanged
                                 )
-                            if not live_main_wal_unchanged:
-                                quarantine_source_directory = None
-                        except (
-                            OSError,
-                            sqlite3.Error,
-                            DatabaseSnapshotError,
-                        ) as recovery_error:
-                            failure = DatabaseSnapshotError(
-                                "state database writer lock/fingerprint validation failed; "
-                                "live evidence was preserved"
+                                if not live_set_unchanged:
+                                    failure = DatabaseSnapshotError(
+                                        "state database changed during preflight; "
+                                        "live evidence was preserved"
+                                    )
+                                elif not main_wal_unchanged:
+                                    failure = DatabaseSnapshotError(
+                                        "state database changed during preflight; "
+                                        "live evidence was preserved"
+                                    )
+                        except (OSError, sqlite3.Error, DatabaseCorruptionError) as recovery_error:
+                            recovery_failed = True
+                            failure = DatabaseRecoveryError(
+                                "state database writer lock/fingerprint validation "
+                                "failed; current evidence was not yet captured"
                             )
                             failure.__cause__ = recovery_error
-                    quarantine = self._quarantine_existing(quarantine_source_directory)
+                        if live_set_unchanged and preflight_evidence is not None:
+                            try:
+                                self._write_database_set_evidence(
+                                    recovery_evidence_dir, preflight_evidence
+                                )
+                            except OSError as evidence_error:
+                                failure = DatabaseRecoveryError(
+                                    "state database preflight evidence could not be "
+                                    "materialized safely"
+                                )
+                                failure.__cause__ = evidence_error
+                            else:
+                                quarantine_source_directory = recovery_evidence_dir
+                                quarantine_authorized = True
+                        else:
+                            # The old evidence is deliberately discarded as a
+                            # quarantine source before attempting recovery.  A
+                            # newer writer commit may already be live.
+                            preflight_evidence = None
+                            if not recovery_failed and recovery_lock_held:
+                                failure = DatabaseSnapshotError(
+                                    "state database changed during preflight; "
+                                    "capturing current live evidence under lock"
+                                )
+                            if recovery_lock_held:
+                                try:
+                                    _, current_evidence = (
+                                        self._capture_locked_database_set_evidence()
+                                    )
+                                    self._write_database_set_evidence(
+                                        recovery_evidence_dir, current_evidence
+                                    )
+                                except (
+                                    OSError,
+                                    sqlite3.Error,
+                                    DatabaseCorruptionError,
+                                ) as recapture_error:
+                                    failure = DatabaseRecoveryError(
+                                        "state database recovery evidence could not be "
+                                        "captured under the writer lock; live database "
+                                        "was not quarantined"
+                                    )
+                                    failure.__cause__ = recapture_error
+                                else:
+                                    quarantine_source_directory = recovery_evidence_dir
+                                    quarantine_authorized = True
                 finally:
                     if recovery_lock is not None:
                         with suppress(sqlite3.DatabaseError):
                             recovery_lock.rollback()
                         with suppress(sqlite3.DatabaseError):
                             recovery_lock.close()
-                raise DatabaseCorruptionError(
+                if quarantine_authorized:
+                    quarantine = self._quarantine_existing(
+                        quarantine_source_directory
+                    )
+                message = (
                     "existing state database snapshot/schema validation failed: "
-                    f"{failure}; "
-                    f"quarantined as {quarantine.name}"
-                ) from failure
+                    f"{failure}"
+                )
+                if quarantine is not None:
+                    message += f"; quarantined as {quarantine.name}"
+                elif source_preflight_started:
+                    message += "; recovery evidence unavailable; live database was not quarantined"
+                raise DatabaseCorruptionError(message) from failure
             finally:
                 if snapshot is not None:
                     with suppress(sqlite3.Error):
@@ -647,6 +766,14 @@ class StateStore:
                 with shm_path.open("rb") as shm_file:
                     shm_header = shm_file.read(52)
                 break
+            except FileNotFoundError as exc:
+                if not shm_path.exists():
+                    return
+                if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
+                    raise DatabaseSnapshotError(
+                        "state database shm sidecar cannot be read"
+                    ) from exc
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
             except OSError as exc:
                 if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
                     raise DatabaseSnapshotError(
@@ -1625,7 +1752,7 @@ class StateStore:
                 fallback = self.path if not sidecar_suffix else self.path.with_name(
                     f"{self.path.name}{sidecar_suffix}"
                 )
-                if not source.exists() and fallback.exists():
+                if source_directory is None and not source.exists() and fallback.exists():
                     source = fallback
                 if source.exists():
                     target = quarantine.with_name(f"{quarantine.name}{sidecar_suffix}")

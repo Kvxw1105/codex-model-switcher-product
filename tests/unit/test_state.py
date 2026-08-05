@@ -1377,6 +1377,34 @@ def test_invalid_shm_sidecar_is_quarantined_beside_valid_database(
     assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == original_shm
 
 
+def test_shm_sidecar_removed_during_validation_is_not_treated_as_corruption(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, secret_key_provider)
+    store.close()
+    shm_path = path.with_name(f"{path.name}-shm")
+    shm_path.write_bytes(b"transient shm fixture")
+
+    original_stat = Path.stat
+    stat_calls = 0
+
+    def remove_sidecar_during_stat(candidate: Path, *args, **kwargs):
+        nonlocal stat_calls
+        if candidate == shm_path:
+            stat_calls += 1
+            if stat_calls == 2:
+                shm_path.unlink()
+                raise FileNotFoundError(shm_path)
+        return original_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", remove_sidecar_during_stat)
+    store._validate_database_sidecars(tmp_path)
+
+    assert stat_calls >= 3
+    assert not shm_path.exists()
+
+
 def test_quarantine_sidecar_failure_is_explicit_and_not_success(
     tmp_path, secret_key_provider, monkeypatch
 ) -> None:
@@ -1950,6 +1978,123 @@ def test_preflight_failure_preserves_writer_commit_and_quarantine_evidence(
         assert reopened.get_response_link("local-2").upstream_id == "upstream-2"
     finally:
         reopened.close()
+
+
+def test_recovery_fingerprint_failure_discards_stale_quarantine_evidence(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    initial = StateStore(path, secret_key_provider)
+    initial.link_response(
+        "local-1", "upstream-1", route_id="chat", codex_task_id="task-1"
+    )
+    initial.close()
+
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE writer_marker (value BLOB NOT NULL)")
+        writer.execute("INSERT INTO writer_marker VALUES (?)", (b"old",))
+        writer.commit()
+
+        recovery_started = False
+        original_connect = sqlite3.connect
+        original_fingerprint = StateStore._fingerprint_file
+
+        def connect_with_new_marker(database, *args, **kwargs):
+            nonlocal recovery_started
+            connection = original_connect(database, *args, **kwargs)
+            if (
+                not kwargs.get("uri", False)
+                and Path(database).resolve() == path.resolve()
+            ):
+                writer.execute("INSERT INTO writer_marker VALUES (?)", (b"new",))
+                writer.commit()
+                recovery_started = True
+            return connection
+
+        def fail_recovery_fingerprint(fingerprint_path: Path):
+            if recovery_started:
+                raise OSError("injected recovery fingerprint failure")
+            return original_fingerprint(fingerprint_path)
+
+        def fail_preflight(connection: sqlite3.Connection) -> None:
+            raise DatabaseCorruptionError("injected preflight failure")
+
+        monkeypatch.setattr(
+            state_module.sqlite3, "connect", connect_with_new_marker
+        )
+        monkeypatch.setattr(
+            StateStore,
+            "_fingerprint_file",
+            staticmethod(fail_recovery_fingerprint),
+        )
+        monkeypatch.setattr(
+            StateStore, "_validate_schema", staticmethod(fail_preflight)
+        )
+
+        with pytest.raises(DatabaseCorruptionError, match="not quarantined"):
+            StateStore(path, secret_key_provider)
+        monkeypatch.undo()
+
+        live_connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            assert live_connection.execute(
+                "SELECT value FROM writer_marker ORDER BY rowid"
+            ).fetchall() == [(b"old",), (b"new",)]
+        finally:
+            live_connection.close()
+        assert not list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    finally:
+        writer.close()
+
+
+def test_recovery_lock_failure_does_not_quarantine_stale_evidence(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    initial = StateStore(path, secret_key_provider)
+    initial.link_response(
+        "local-1", "upstream-1", route_id="chat", codex_task_id="task-1"
+    )
+    initial.close()
+
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE writer_marker (value BLOB NOT NULL)")
+        writer.execute("INSERT INTO writer_marker VALUES (?)", (b"old",))
+        writer.commit()
+
+        def fail_recovery_lock(store: StateStore) -> sqlite3.Connection:
+            writer.execute("INSERT INTO writer_marker VALUES (?)", (b"new",))
+            writer.commit()
+            raise OSError("injected recovery writer lock failure")
+
+        def fail_preflight(connection: sqlite3.Connection) -> None:
+            raise DatabaseCorruptionError("injected preflight failure")
+
+        monkeypatch.setattr(StateStore, "_open_recovery_lock", fail_recovery_lock)
+        monkeypatch.setattr(
+            StateStore, "_validate_schema", staticmethod(fail_preflight)
+        )
+
+        with pytest.raises(DatabaseCorruptionError, match="not quarantined"):
+            StateStore(path, secret_key_provider)
+        monkeypatch.undo()
+
+        live_connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            assert live_connection.execute(
+                "SELECT value FROM writer_marker ORDER BY rowid"
+            ).fetchall() == [(b"old",), (b"new",)]
+        finally:
+            live_connection.close()
+        assert not list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    finally:
+        writer.close()
 
 
 def test_concurrent_stores_can_commit_without_losing_links(tmp_path, secret_key_provider) -> None:
