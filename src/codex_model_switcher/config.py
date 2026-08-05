@@ -51,6 +51,27 @@ class ConfigPostCommitError(ConfigError):
         )
 
 
+class ConfigTransactionStateError(ConfigError):
+    """Raised when pre-commit rollback or handle cleanup leaves state uncertain."""
+
+    def __init__(
+        self,
+        path: Path,
+        detail: str,
+        *,
+        backup_path: Path | None = None,
+        state_uncertain: bool = True,
+    ) -> None:
+        self.path = Path(path)
+        self.committed = False
+        self.state_uncertain = state_uncertain
+        self.backup_path = Path(backup_path) if backup_path is not None else None
+        state = "uncertain" if state_uncertain else "not committed"
+        super().__init__(
+            f"Windows transaction is {state}; cleanup failed and backup is retained: {detail}"
+        )
+
+
 @dataclass(frozen=True)
 class ConfigReceipt:
     config_path: Path
@@ -543,11 +564,33 @@ class _PathLease:
                 )
             new_handle = int(new_handle_value)
 
-            if not _commit_windows_transaction(commit_transaction, transaction_handle):
+            def commit_and_mark(handle: int) -> bool:
+                nonlocal committed
+                succeeded = bool(commit_transaction(handle))
+                if succeeded:
+                    committed = True
+                    self._replacement_committed = True
+                return succeeded
+
+            try:
+                commit_succeeded = _commit_windows_transaction(
+                    commit_and_mark,
+                    transaction_handle,
+                )
+            except Exception as error:
+                if committed:
+                    raise ConfigPostCommitError(
+                        target_path,
+                        "CommitTransaction succeeded before post-commit handling failed",
+                        backup_path=self._backup_path,
+                    ) from error
+                raise
+
+            if not commit_succeeded:
                 error = ctypes.get_last_error()
                 raise ConfigError(f"unable to commit Windows config transaction (error {error})")
-            committed = True
-            self._replacement_committed = True
+            if not committed:
+                raise ConfigError("Windows transaction commit was not recorded")
 
             # The share-denying handle was opened before commit.  Install it
             # on the lease before releasing any pre-commit handles so every
@@ -572,33 +615,83 @@ class _PathLease:
                     f"unable to release previous Windows config lock (error {old_error})"
                 )
         finally:
+            transaction_cleanup_error: ConfigError | None = None
+            rollback_error: Exception | None = None
+            transaction_close_error: Exception | None = None
             if transaction is not None:
                 if not committed:
                     try:
-                        rollback_transaction(int(transaction))
-                    except OSError:
-                        pass
+                        if not _rollback_windows_transaction(
+                            rollback_transaction,
+                            int(transaction),
+                        ):
+                            rollback_error = RuntimeError(
+                                "RollbackTransaction returned failure"
+                            )
+                    except Exception as error:
+                        rollback_error = error
                 try:
-                    transaction_closed = bool(close_handle(transaction))
+                    if not _close_windows_transaction(close_handle, transaction):
+                        transaction_close_error = RuntimeError(
+                            f"CloseHandle failed (error {ctypes.get_last_error()})"
+                        )
                 except Exception as error:
-                    if committed:
-                        raise ConfigPostCommitError(
-                            target_path,
-                            "unable to close the Windows transaction handle",
-                        ) from error
-                    raise
-                if committed and not transaction_closed:
-                    error = ctypes.get_last_error()
-                    raise ConfigPostCommitError(
+                    transaction_close_error = error
+                if committed and transaction_close_error is not None:
+                    transaction_cleanup_error = ConfigPostCommitError(
                         target_path,
-                        f"unable to close the Windows transaction handle (error {error})",
+                        "unable to close the Windows transaction handle",
+                        backup_path=self._backup_path,
+                    )
+                    transaction_cleanup_error.__cause__ = transaction_close_error
+                elif not committed and (
+                    rollback_error is not None or transaction_close_error is not None
+                ):
+                    details = []
+                    if rollback_error is not None:
+                        details.append(f"rollback: {rollback_error}")
+                    if transaction_close_error is not None:
+                        details.append(f"close: {transaction_close_error}")
+                    transaction_cleanup_error = ConfigTransactionStateError(
+                        target_path,
+                        "; ".join(details),
+                        backup_path=self._backup_path,
                     )
             if new_handle is not None:
-                close_handle(new_handle)
+                try:
+                    close_handle(new_handle)
+                except Exception as error:
+                    if transaction_cleanup_error is None:
+                        transaction_cleanup_error = ConfigTransactionStateError(
+                            target_path,
+                            "unable to close the pre-commit replacement handle",
+                            backup_path=self._backup_path,
+                        )
+                        transaction_cleanup_error.__cause__ = error
             if source_handle is not None:
-                close_handle(source_handle)
+                try:
+                    close_handle(source_handle)
+                except Exception as error:
+                    if transaction_cleanup_error is None:
+                        transaction_cleanup_error = ConfigTransactionStateError(
+                            target_path,
+                            "unable to close the pre-commit source handle",
+                            backup_path=self._backup_path,
+                        )
+                        transaction_cleanup_error.__cause__ = error
             if not committed:
-                shadow_path.unlink(missing_ok=True)
+                try:
+                    shadow_path.unlink(missing_ok=True)
+                except OSError as error:
+                    if transaction_cleanup_error is None:
+                        transaction_cleanup_error = ConfigTransactionStateError(
+                            target_path,
+                            "unable to remove the pre-commit shadow path",
+                            backup_path=self._backup_path,
+                        )
+                        transaction_cleanup_error.__cause__ = error
+            if transaction_cleanup_error is not None:
+                raise transaction_cleanup_error
 
     def _release_windows(self, raise_on_error: bool) -> None:
         if self._handle is None or self._kernel32 is None:
@@ -756,7 +849,7 @@ def _apply_managed_config_locked(
     try:
         with _exclusive_path_lock(backup_path, create=False) as backup_lease:
             _atomic_write(backup_path, original, expected=b"", lease=backup_lease)
-    except ConfigPostCommitError as error:
+    except (ConfigPostCommitError, ConfigTransactionStateError) as error:
         error.backup_path = backup_path
         raise
     except Exception:
@@ -764,7 +857,7 @@ def _apply_managed_config_locked(
         raise
     try:
         _atomic_write(config_path, written, expected=original, lease=lease)
-    except ConfigPostCommitError as error:
+    except (ConfigPostCommitError, ConfigTransactionStateError) as error:
         error.backup_path = backup_path
         raise
     except Exception:
@@ -974,6 +1067,14 @@ def _commit_windows_transaction(commit_transaction, transaction_handle) -> bool:
     """Keep the transaction linearization point independently testable."""
 
     return bool(commit_transaction(transaction_handle))
+
+
+def _rollback_windows_transaction(rollback_transaction, transaction_handle) -> bool:
+    return bool(rollback_transaction(transaction_handle))
+
+
+def _close_windows_transaction(close_handle, transaction_handle) -> bool:
+    return bool(close_handle(transaction_handle))
 
 
 def _replace_temp_file(

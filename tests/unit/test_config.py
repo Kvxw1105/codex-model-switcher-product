@@ -16,7 +16,9 @@ from codex_model_switcher.config import (
     MANAGED_START,
     ConfigChangedError,
     ConfigError,
+    ConfigPostCommitError,
     ConfigReceipt,
+    ConfigTransactionStateError,
     _replace_or_append_managed_block,
     apply_managed_config,
     render_managed_config,
@@ -410,6 +412,113 @@ def test_windows_postcommit_close_failure_keeps_backup_and_status(
     assert backup_path is not None
     assert backup_path.read_bytes() == original
     assert b'model_provider = "example-provider"' in config_path.read_bytes()
+
+
+def test_windows_commit_success_then_throw_keeps_backup_and_status(
+    tmp_path, monkeypatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows commit boundary is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b"# original bytes\r\n"
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    original_commit = config_module._commit_windows_transaction
+    commit_results: list[bool] = []
+
+    def commit_success_then_throw(commit_transaction, transaction_handle):
+        committed = original_commit(commit_transaction, transaction_handle)
+        commit_results.append(committed)
+        if len(commit_results) == 2 and committed:
+            raise RuntimeError("injected after native CommitTransaction success")
+        return committed
+
+    monkeypatch.setattr(
+        config_module,
+        "_commit_windows_transaction",
+        commit_success_then_throw,
+    )
+
+    with pytest.raises(ConfigPostCommitError) as caught:
+        apply_managed_config(config_path, catalog_path)
+
+    error = caught.value
+    assert commit_results == [True, True]
+    assert error.committed is True
+    assert error.backup_path is not None
+    assert error.backup_path.read_bytes() == original
+    assert b'model_provider = "example-provider"' in config_path.read_bytes()
+
+
+def test_windows_rollback_failure_retains_backup_and_status(tmp_path, monkeypatch) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows transaction rollback is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b"# original bytes\r\n"
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    original_commit = config_module._commit_windows_transaction
+    commit_calls = [0]
+
+    def fail_target_commit(commit_transaction, transaction_handle):
+        commit_calls[0] += 1
+        if commit_calls[0] == 2:
+            return False
+        return original_commit(commit_transaction, transaction_handle)
+
+    monkeypatch.setattr(
+        config_module,
+        "_commit_windows_transaction",
+        fail_target_commit,
+    )
+    monkeypatch.setattr(
+        config_module,
+        "_rollback_windows_transaction",
+        lambda _rollback_transaction, _transaction_handle: False,
+    )
+
+    with pytest.raises(ConfigTransactionStateError) as caught:
+        apply_managed_config(config_path, catalog_path)
+
+    error = caught.value
+    assert commit_calls == [2]
+    assert error.committed is False
+    assert error.state_uncertain is True
+    assert error.backup_path is not None
+    assert error.backup_path.read_bytes() == original
+    assert config_path.read_bytes() == original
 
 
 def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> None:
