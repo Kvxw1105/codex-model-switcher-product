@@ -1,6 +1,8 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
+from io import BytesIO
+from multiprocessing import Process
 from pathlib import Path
 from threading import Event, Thread
 
@@ -11,6 +13,8 @@ from codex_model_switcher import state as state_module
 from codex_model_switcher.state import (
     DatabaseCorruptionError,
     DatabaseQuarantineError,
+    DatabaseSidecarPreflightError,
+    DatabaseSnapshotError,
     StateError,
     StateStore,
 )
@@ -22,6 +26,17 @@ class FakeSecretKeyProvider:
 
     def get_key(self) -> bytes:
         return self.key
+
+
+def _commit_marker_in_subprocess(database_path: str) -> None:
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute(
+            "INSERT INTO writer_marker VALUES (?)", (b"new",)
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 @pytest.fixture
@@ -1346,7 +1361,7 @@ def test_inconsistent_event_state_is_quarantined_before_writes(
     assert quarantine_main.read_bytes() == original_main
 
 
-def test_invalid_shm_sidecar_is_quarantined_beside_valid_database(
+def test_invalid_shm_sidecar_fails_closed_without_quarantine(
     tmp_path, secret_key_provider, monkeypatch
 ) -> None:
     path = tmp_path / "state.sqlite3"
@@ -1357,24 +1372,18 @@ def test_invalid_shm_sidecar_is_quarantined_beside_valid_database(
     shm_path = path.with_name(f"{path.name}-shm")
     shm_path.write_bytes(b"invalid shm fixture")
     original_main = path.read_bytes()
-    original_shm = shm_path.read_bytes()
     monkeypatch.setattr(
         StateStore,
         "_configure_connection",
         lambda _store: pytest.fail("invalid shm must fail before writable setup"),
     )
 
-    with pytest.raises(DatabaseCorruptionError, match="shm"):
+    with pytest.raises(DatabaseCorruptionError, match="not quarantined"):
         StateStore(path, secret_key_provider)
 
     assert path.read_bytes() == original_main
-    assert shm_path.read_bytes() == original_shm
     quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
-    quarantine_main = next(
-        item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
-    )
-    assert quarantine_main.read_bytes() == original_main
-    assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == original_shm
+    assert quarantine_files == []
 
 
 def test_shm_sidecar_removed_during_validation_is_not_treated_as_corruption(
@@ -1403,6 +1412,127 @@ def test_shm_sidecar_removed_during_validation_is_not_treated_as_corruption(
 
     assert stat_calls >= 3
     assert not shm_path.exists()
+
+
+def test_shm_partial_header_retries_until_a_valid_snapshot(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, secret_key_provider)
+    store.link_response("local-1", "upstream-1", route_id="chat")
+    store.close()
+
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE writer_marker (value BLOB NOT NULL)")
+        writer.execute("INSERT INTO writer_marker VALUES (?)", (b"fixture",))
+        writer.commit()
+        shm_path = path.with_name(f"{path.name}-shm")
+        assert shm_path.exists()
+
+        original_open = Path.open
+        shm_reads = 0
+
+        def partial_shm_open(candidate: Path, *args, **kwargs):
+            nonlocal shm_reads
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if candidate == shm_path and "r" in mode:
+                shm_reads += 1
+                if shm_reads == 1:
+                    return BytesIO(b"partial shm header")
+            return original_open(candidate, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", partial_shm_open)
+        store._validate_database_sidecars(tmp_path)
+        assert shm_reads >= 2
+    finally:
+        writer.close()
+
+
+def test_sidecar_preflight_failure_fails_closed_after_locked_recapture_failure(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    initial = StateStore(path, secret_key_provider)
+    initial.link_response("local-1", "upstream-1", route_id="chat")
+    initial.close()
+
+    writer = sqlite3.connect(path)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE writer_marker (value BLOB NOT NULL)")
+        writer.execute("INSERT INTO writer_marker VALUES (?)", (b"old",))
+        writer.commit()
+        writer.close()
+        writer = None
+
+        lock_calls: list[str] = []
+        quarantine_sources: list[Path | None] = []
+        capture_calls: list[str] = []
+        original_open_recovery_lock = StateStore._open_recovery_lock
+        original_quarantine = StateStore._quarantine_existing
+
+        def open_recovery_lock(store: StateStore) -> sqlite3.Connection:
+            lock_calls.append("writer-lock")
+            process = Process(
+                target=_commit_marker_in_subprocess, args=(str(path),)
+            )
+            process.start()
+            process.join(10)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+                raise RuntimeError("subprocess writer did not finish")
+            if process.exitcode != 0:
+                raise RuntimeError("subprocess writer failed")
+            return original_open_recovery_lock(store)
+
+        def fail_sidecar_preflight(store: StateStore, _directory: Path) -> None:
+            raise DatabaseSidecarPreflightError("injected sidecar preflight failure")
+
+        def fail_locked_capture(store: StateStore):
+            capture_calls.append("locked-recapture")
+            raise DatabaseSnapshotError("injected inconsistent locked evidence")
+
+        def quarantine_after_locked_recovery(store: StateStore, *args, **kwargs):
+            source_directory = (
+                args[0] if args else kwargs.get("source_directory")
+            )
+            quarantine_sources.append(source_directory)
+            return original_quarantine(store, *args, **kwargs)
+
+        monkeypatch.setattr(StateStore, "_open_recovery_lock", open_recovery_lock)
+        monkeypatch.setattr(
+            StateStore, "_validate_database_sidecars", fail_sidecar_preflight
+        )
+        monkeypatch.setattr(
+            StateStore, "_capture_locked_database_set_evidence", fail_locked_capture
+        )
+        monkeypatch.setattr(
+            StateStore, "_quarantine_existing", quarantine_after_locked_recovery
+        )
+
+        with pytest.raises(DatabaseCorruptionError, match="not quarantined"):
+            StateStore(path, secret_key_provider)
+        monkeypatch.undo()
+
+        assert lock_calls == ["writer-lock"]
+        assert capture_calls == ["locked-recapture"]
+        assert quarantine_sources == []
+        live_connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        try:
+            assert live_connection.execute(
+                "SELECT value FROM writer_marker ORDER BY rowid"
+            ).fetchall() == [(b"old",), (b"new",)]
+        finally:
+            live_connection.close()
+        assert not list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 def test_quarantine_sidecar_failure_is_explicit_and_not_success(

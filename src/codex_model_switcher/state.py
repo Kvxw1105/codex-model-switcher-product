@@ -158,6 +158,10 @@ class DatabaseSnapshotError(DatabaseCorruptionError):
     """Raised when a consistent database snapshot cannot be captured."""
 
 
+class DatabaseSidecarPreflightError(DatabaseSnapshotError):
+    """Raised when an existing SQLite sidecar cannot be validated safely."""
+
+
 class DatabaseRecoveryError(DatabaseCorruptionError):
     """Raised when recovery evidence cannot be captured safely."""
 
@@ -414,9 +418,9 @@ class StateStore:
         self,
     ) -> tuple[dict[str, _FileFingerprint], dict[str, bytes]]:
         for _attempt in range(SNAPSHOT_COPY_ATTEMPTS):
-            before = self._capture_database_set_fingerprints()
-            evidence: dict[str, bytes] = {}
             try:
+                before = self._capture_database_set_fingerprints()
+                evidence: dict[str, bytes] = {}
                 for suffix, fingerprint in before.items():
                     if not fingerprint.exists:
                         continue
@@ -424,17 +428,21 @@ class StateStore:
                         f"{self.path.name}{suffix}"
                     )
                     evidence[suffix] = path.read_bytes()
-            except OSError:
+                after = self._capture_database_set_fingerprints()
+            except (OSError, DatabaseSnapshotError):
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS)
+                continue
+            if before != after:
                 time.sleep(SNAPSHOT_COPY_DELAY_SECONDS)
                 continue
             if any(
                 sha256(evidence[suffix]).digest() != fingerprint.digest
-                for suffix, fingerprint in before.items()
+                for suffix, fingerprint in after.items()
                 if fingerprint.exists
             ):
                 time.sleep(SNAPSHOT_COPY_DELAY_SECONDS)
                 continue
-            return before, evidence
+            return after, evidence
         raise DatabaseSnapshotError(
             "state database files changed while capturing quarantine evidence"
         )
@@ -516,6 +524,7 @@ class StateStore:
         source: sqlite3.Connection | None = None
         snapshot: sqlite3.Connection | None = None
         source_preflight_started = False
+        sidecar_preflight_failed = False
         initial_fingerprints: dict[str, _FileFingerprint] | None = None
         with TemporaryDirectory(prefix=".state-preflight-", dir=self.path.parent) as directory:
             snapshot_dir = Path(directory) / "snapshot"
@@ -530,7 +539,11 @@ class StateStore:
                 except (OSError, DatabaseSnapshotError):
                     initial_fingerprints = None
                 source_path = self.path.resolve()
-                self._validate_database_sidecars(source_path.parent)
+                try:
+                    self._validate_database_sidecars(source_path.parent)
+                except (OSError, DatabaseSidecarPreflightError):
+                    sidecar_preflight_failed = True
+                    raise
                 with source_path.open("rb") as database_file:
                     if database_file.read(len(SQLITE_HEADER)) != SQLITE_HEADER:
                         raise DatabaseSnapshotError("state database header is invalid")
@@ -589,10 +602,13 @@ class StateStore:
                 recovery_lock: sqlite3.Connection | None = None
                 recovery_lock_held = False
                 quarantine_source_directory: Path | None = None
-                quarantine_authorized = not source_preflight_started
+                recovery_required = (
+                    source_preflight_started or sidecar_preflight_failed
+                )
+                quarantine_authorized = not recovery_required
                 quarantine: Path | None = None
                 try:
-                    if source_preflight_started:
+                    if recovery_required:
                         live_set_unchanged = False
                         recovery_failed = False
                         try:
@@ -659,7 +675,11 @@ class StateStore:
                                 "failed; current evidence was not yet captured"
                             )
                             failure.__cause__ = recovery_error
-                        if live_set_unchanged and preflight_evidence is not None:
+                        if (
+                            live_set_unchanged
+                            and preflight_evidence is not None
+                            and not sidecar_preflight_failed
+                        ):
                             try:
                                 self._write_database_set_evidence(
                                     recovery_evidence_dir, preflight_evidence
@@ -678,7 +698,11 @@ class StateStore:
                             # quarantine source before attempting recovery.  A
                             # newer writer commit may already be live.
                             preflight_evidence = None
-                            if not recovery_failed and recovery_lock_held:
+                            if (
+                                not recovery_failed
+                                and recovery_lock_held
+                                and preflight_fingerprints is not None
+                            ):
                                 failure = DatabaseSnapshotError(
                                     "state database changed during preflight; "
                                     "capturing current live evidence under lock"
@@ -721,7 +745,7 @@ class StateStore:
                 )
                 if quarantine is not None:
                     message += f"; quarantined as {quarantine.name}"
-                elif source_preflight_started:
+                elif recovery_required:
                     message += "; recovery evidence unavailable; live database was not quarantined"
                 raise DatabaseCorruptionError(message) from failure
             finally:
@@ -751,49 +775,87 @@ class StateStore:
 
     def _validate_database_sidecars(self, directory: Path) -> None:
         shm_path = directory / f"{self.path.name}-shm"
-        if not shm_path.exists():
-            return
         main_path = directory / self.path.name
-        with main_path.open("rb") as database_file:
-            header = database_file.read(20)
-        if len(header) < 20 or header[: len(SQLITE_HEADER)] != SQLITE_HEADER:
-            raise DatabaseSnapshotError("state database header is invalid")
-        if header[18] != 2:
-            raise DatabaseSnapshotError("state database has an invalid shm sidecar")
         for attempt in range(SNAPSHOT_COPY_ATTEMPTS):
             try:
-                shm_size = shm_path.stat().st_size
+                main_before = self._file_identity_and_size(main_path)
+                shm_before = self._file_identity_and_size(shm_path)
+                if not shm_before[0]:
+                    return
+                if not main_before[0]:
+                    if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
+                        raise DatabaseSidecarPreflightError(
+                            "state database main file disappeared while validating sidecar"
+                        )
+                    time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
+                    continue
+                with main_path.open("rb") as database_file:
+                    header = database_file.read(20)
                 with shm_path.open("rb") as shm_file:
                     shm_header = shm_file.read(52)
-                break
+                main_after = self._file_identity_and_size(main_path)
+                shm_after = self._file_identity_and_size(shm_path)
             except FileNotFoundError as exc:
-                if not shm_path.exists():
-                    return
                 if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
-                    raise DatabaseSnapshotError(
+                    if not shm_path.exists():
+                        return
+                    raise DatabaseSidecarPreflightError(
                         "state database shm sidecar cannot be read"
                     ) from exc
                 time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
+                continue
             except OSError as exc:
                 if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
-                    raise DatabaseSnapshotError(
+                    raise DatabaseSidecarPreflightError(
                         "state database shm sidecar cannot be read"
                     ) from exc
                 time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
-        database_page_size = int.from_bytes(header[16:18], "big")
-        if database_page_size == 1:
-            database_page_size = 65536
-        shm_page_size = int.from_bytes(shm_header[14:16], "little")
-        if (
-            shm_size < SHM_PAGE_SIZE
-            or shm_size % SHM_PAGE_SIZE != 0
-            or len(shm_header) < 52
-            or shm_header[:4] != SHM_MAGIC
-            or shm_header[48:52] != SHM_MAGIC
-            or shm_header[12] != 1
-            or shm_page_size != database_page_size
-        ):
-            raise DatabaseSnapshotError("state database has an invalid shm sidecar")
+                continue
+
+            if main_before != main_after or shm_before != shm_after:
+                if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
+                    raise DatabaseSidecarPreflightError(
+                        "state database sidecar changed while validating snapshot"
+                    )
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
+                continue
+
+            database_page_size = int.from_bytes(header[16:18], "big") if len(header) >= 18 else 0
+            if database_page_size == 1:
+                database_page_size = 65536
+            shm_page_size = (
+                int.from_bytes(shm_header[14:16], "little")
+                if len(shm_header) >= 16
+                else 0
+            )
+            valid = (
+                len(header) >= 20
+                and header[: len(SQLITE_HEADER)] == SQLITE_HEADER
+                and header[18] == 2
+                and shm_before[2] is not None
+                and shm_before[2] >= SHM_PAGE_SIZE
+                and shm_before[2] % SHM_PAGE_SIZE == 0
+                and len(shm_header) >= 52
+                and shm_header[:4] == SHM_MAGIC
+                and shm_header[48:52] == SHM_MAGIC
+                and shm_header[12] == 1
+                and shm_page_size == database_page_size
+            )
+            if valid:
+                return
+            if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
+                if len(header) < 20 or header[: len(SQLITE_HEADER)] != SQLITE_HEADER:
+                    raise DatabaseSnapshotError(
+                        "state database header is invalid"
+                    )
+                raise DatabaseSidecarPreflightError(
+                    "state database has an invalid shm sidecar"
+                )
+            time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
+
+        raise DatabaseSidecarPreflightError(
+            "state database sidecar validation did not converge"
+        )
 
     def _clone_database_set(self, source_directory: Path, destination: Path) -> None:
         for sidecar_suffix in ("", "-wal", "-shm"):
