@@ -511,21 +511,9 @@ class _PathLease:
                 delete_file_transacted = kernel32.DeleteFileTransactedW
                 delete_file_transacted.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p]
                 delete_file_transacted.restype = ctypes.c_int
-                create_file_transacted = kernel32.CreateFileTransactedW
-                create_file_transacted.argtypes = [
-                    ctypes.c_wchar_p,
-                    ctypes.c_uint32,
-                    ctypes.c_uint32,
-                    ctypes.c_void_p,
-                    ctypes.c_uint32,
-                    ctypes.c_uint32,
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                    ctypes.c_uint32,
-                    ctypes.c_void_p,
-                ]
-                create_file_transacted.restype = ctypes.c_void_p
+                create_file_transacted = _configure_create_file_transacted(
+                    kernel32.CreateFileTransactedW
+                )
                 commit_transaction = transaction_api.CommitTransaction
                 commit_transaction.argtypes = [ctypes.c_void_p]
                 commit_transaction.restype = ctypes.c_int
@@ -592,18 +580,10 @@ class _PathLease:
                     f"unable to remove old config in Windows transaction (error {error})"
                 )
 
-            new_handle_value = create_file_transacted(
-                str(target_path),
-                0x80000000,  # GENERIC_READ
-                0x00000001 | 0x00000002,  # share read/write; deny DELETE/RENAME
-                None,
-                3,  # OPEN_EXISTING
-                0x00000080,  # FILE_ATTRIBUTE_NORMAL
-                None,
+            new_handle_value = _call_create_file_transacted(
+                create_file_transacted,
+                target_path,
                 transaction_handle,
-                None,
-                0,
-                None,
             )
             if new_handle_value in (None, invalid_handle):
                 error = ctypes.get_last_error()
@@ -921,12 +901,12 @@ def _apply_managed_config_locked(
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_path = config_path.with_name(f"{config_path.name}.bak.{timestamp}")
-    lease._backup_path = backup_path
-    lease._pending_backup_cleanup = backup_path
     backup_descriptor = os.open(
         backup_path,
         os.O_CREAT | os.O_EXCL | os.O_WRONLY,
     )
+    lease._backup_path = backup_path
+    lease._pending_backup_cleanup = backup_path
     os.close(backup_descriptor)
     try:
         with _exclusive_path_lock(backup_path, create=False) as backup_lease:
@@ -1153,6 +1133,40 @@ def _atomic_write(
             if body_error is not None:
                 raise state_error from body_error
             raise state_error from cleanup_error
+
+
+def _configure_create_file_transacted(create_file_transacted):
+    """Configure the ten-parameter Win32 CreateFileTransactedW ABI."""
+
+    create_file_transacted.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ushort),
+        ctypes.c_uint32,
+    ]
+    create_file_transacted.restype = ctypes.c_void_p
+    return create_file_transacted
+
+
+def _call_create_file_transacted(create_file_transacted, path: Path, transaction_handle):
+    return create_file_transacted(
+        str(path),
+        0x80000000,  # GENERIC_READ
+        0x00000001 | 0x00000002,  # share read/write; deny DELETE/RENAME
+        None,
+        3,  # OPEN_EXISTING
+        0x00000080,  # FILE_ATTRIBUTE_NORMAL
+        None,
+        transaction_handle,
+        None,
+        0,
+    )
 
 
 def _commit_windows_transaction(commit_transaction, transaction_handle) -> bool:

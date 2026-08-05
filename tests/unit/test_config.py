@@ -1,8 +1,11 @@
+import ctypes
 import hashlib
 import json
 import os
 import subprocess
 import sys
+from datetime import datetime as RealDateTime
+from datetime import timezone
 from pathlib import Path
 
 import pytest
@@ -231,6 +234,88 @@ def test_apply_restore_preserves_original_bytes_with_low_level_render_seam(
     restore_managed_config(config_path, receipt)
 
     assert config_path.read_bytes() == original
+
+
+def test_backup_name_collision_does_not_delete_existing_backup(
+    tmp_path, monkeypatch
+) -> None:
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b'# keep bytes\r\nmodel = "original"\r\n'
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    fixed_now = RealDateTime(2026, 8, 5, tzinfo=timezone.utc)
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls, tz):
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(config_module, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+    backup_path = config_path.with_name("config.toml.bak.20260805T000000000000Z")
+    existing_backup = b"pre-existing backup evidence"
+    backup_path.write_bytes(existing_backup)
+
+    with pytest.raises(FileExistsError):
+        apply_managed_config(config_path, catalog_path)
+
+    assert backup_path.read_bytes() == existing_backup
+    assert config_path.read_bytes() == original
+
+
+def test_create_file_transacted_uses_ten_argument_win32_abi() -> None:
+    import codex_model_switcher.config as config_module
+
+    class FakeFunction:
+        def __init__(self):
+            self.argtypes = None
+            self.restype = None
+            self.calls: list[tuple[object, ...]] = []
+
+        def __call__(self, *args):
+            self.calls.append(args)
+            return 1
+
+    create_file_transacted = FakeFunction()
+    config_module._configure_create_file_transacted(create_file_transacted)
+
+    result = config_module._call_create_file_transacted(
+        create_file_transacted,
+        Path("C:/isolated/candidate.tmp"),
+        7,
+    )
+
+    assert result == 1
+    assert create_file_transacted.argtypes == [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ushort),
+        ctypes.c_uint32,
+    ]
+    assert create_file_transacted.restype is ctypes.c_void_p
+    assert len(create_file_transacted.calls) == 1
+    assert len(create_file_transacted.calls[0]) == 10
+    assert create_file_transacted.calls[0][7] == 7
 
 
 def test_precommit_temp_cleanup_failure_retains_state_evidence(
