@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 import tomllib
 import weakref
 from abc import ABC, abstractmethod
@@ -25,8 +27,46 @@ class CatalogValidationError(ValueError):
     """Raised when a catalog does not contain a complete route contract."""
 
 
+@dataclass(frozen=True)
+class ProviderReference:
+    provider_id: str
+    model: str
+    wire_api: str
+    credential_ref: str
+
+    def __post_init__(self) -> None:
+        for name in ("provider_id", "model", "credential_ref"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise CatalogValidationError(f"{name} must be a non-empty string")
+        if self.wire_api not in {"responses", "chat_completions"}:
+            raise CatalogValidationError("wire_api must be responses or chat_completions")
+
+    def to_mapping(self) -> dict[str, str]:
+        return {
+            "provider_id": self.provider_id,
+            "model": self.model,
+            "wire_api": self.wire_api,
+            "credential_ref": self.credential_ref,
+        }
+
+
 _RECEIPT_SOURCE = "current-client-artifact"
 _REGISTRY_TEST_SOURCE = "registry-test"
+_NATIVE_BASE_INSTRUCTIONS = (
+    "You are a coding assistant routed through the local Codex Model Switcher Router."
+)
+_NATIVE_SENSITIVE_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "credential_ref",
+    "env_key",
+    "experimental_bearer_token",
+    "secret",
+    "token",
+}
 
 
 @dataclass(frozen=True)
@@ -36,14 +76,18 @@ class CatalogDocument:
     provider_id: str
     models: tuple[ModelRoute, ...]
     verification_status: str = "UNVERIFIED"
+    providers: tuple[ProviderReference, ...] = ()
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        mapping: dict[str, object] = {
             "schema_version": self.schema_version,
             "client_version": self.client_version,
             "provider_id": self.provider_id,
             "models": [_route_to_record(route) for route in self.models],
         }
+        if self.providers:
+            mapping["providers"] = [provider.to_mapping() for provider in self.providers]
+        return mapping
 
     def to_candidate_mapping(self) -> dict[str, object]:
         mapping = self.to_mapping()
@@ -266,6 +310,7 @@ def build_catalog(
     client_version: str,
     provider_id: str = "codex-model-switcher",
     schema_version: str | None = None,
+    provider_references: Sequence[ProviderReference | Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     if not isinstance(client_version, str) or not client_version.strip():
         raise CatalogValidationError("client_version must be a non-empty string")
@@ -281,13 +326,19 @@ def build_catalog(
     model_ids = [route.model_id for route in route_list]
     if len(model_ids) != len(set(model_ids)):
         raise CatalogValidationError("model IDs must be unique")
-    return {
+    providers = _normalize_provider_references(provider_references)
+    if provider_references is None:
+        providers = _derive_provider_references(route_list)
+    mapping: dict[str, object] = {
         "schema_version": schema_version,
         "client_version": client_version,
         "provider_id": provider_id,
         "verification_status": "UNVERIFIED",
         "models": [_route_to_record(route) for route in route_list],
     }
+    if providers:
+        mapping["providers"] = [provider.to_mapping() for provider in providers]
+    return mapping
 
 
 def build_catalog_from_model_cache(
@@ -296,6 +347,7 @@ def build_catalog_from_model_cache(
     *,
     provider_id: str = "codex-model-switcher",
     schema_version: str | None = None,
+    provider_references: Sequence[ProviderReference | Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     client_version = read_client_version_from_model_cache(cache_path)
     return build_catalog(
@@ -303,6 +355,7 @@ def build_catalog_from_model_cache(
         client_version=client_version,
         provider_id=provider_id,
         schema_version=schema_version,
+        provider_references=provider_references,
     )
 
 
@@ -329,6 +382,10 @@ def catalog_from_mapping(payload: Mapping[str, object]) -> CatalogDocument:
     if not isinstance(raw_models, list):
         raise CatalogValidationError("models must be an array")
 
+    raw_providers = payload.get("providers", [])
+    if not isinstance(raw_providers, list):
+        raise CatalogValidationError("providers must be an array")
+    providers = _normalize_provider_references(raw_providers)
     routes: list[ModelRoute] = []
     seen_ids: set[str] = set()
     for index, raw_route in enumerate(raw_models):
@@ -346,7 +403,82 @@ def catalog_from_mapping(payload: Mapping[str, object]) -> CatalogDocument:
         provider_id,
         tuple(routes),
         verification_status,
+        providers,
     )
+
+
+def build_native_catalog(
+    catalog: CatalogDocument | Mapping[str, object],
+    *,
+    bundled_catalog: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Adapt the internal route catalog to the native Codex model schema."""
+
+    document = catalog if isinstance(catalog, CatalogDocument) else catalog_from_mapping(catalog)
+    native_models: list[dict[str, object]] = []
+    seen: set[str] = set()
+    if bundled_catalog is not None:
+        raw_models = bundled_catalog.get("models")
+        if not isinstance(raw_models, list):
+            raise CatalogValidationError("bundled native catalog models must be an array")
+        for index, raw_model in enumerate(raw_models):
+            if not isinstance(raw_model, Mapping):
+                raise CatalogValidationError(f"bundled native models[{index}] must be an object")
+            model = json.loads(json.dumps(raw_model, ensure_ascii=False))
+            slug = model.get("slug")
+            if not isinstance(slug, str) or not slug.strip():
+                raise CatalogValidationError(f"bundled native models[{index}] is missing slug")
+            if slug in seen:
+                raise CatalogValidationError(f"bundled native models repeat slug {slug}")
+            _reject_sensitive_native_values(model)
+            seen.add(slug)
+            native_models.append(model)
+    for route in document.models:
+        if route.model_id in seen:
+            continue
+        native_models.append(_route_to_native_record(route))
+        seen.add(route.model_id)
+    if not native_models:
+        raise CatalogValidationError("native catalog must contain at least one model")
+    return {"models": native_models}
+
+
+def write_native_catalog(
+    catalog_path: Path,
+    native_catalog_path: Path,
+    *,
+    bundled_catalog_path: Path | None = None,
+) -> Path:
+    document = load_catalog(Path(catalog_path))
+    bundled = None
+    if bundled_catalog_path is not None:
+        try:
+            raw = json.loads(Path(bundled_catalog_path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise CatalogValidationError("unable to read bundled native catalog") from error
+        if not isinstance(raw, Mapping):
+            raise CatalogValidationError("bundled native catalog must be a JSON object")
+        bundled = raw
+    native = build_native_catalog(document, bundled_catalog=bundled)
+    destination = Path(native_catalog_path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            json.dump(native, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return destination
 
 
 def verify_isolated_picker_contract(
@@ -391,17 +523,30 @@ def verify_isolated_picker_contract(
             catalog.provider_id,
             False,
         )
-    try:
-        configured_catalog = json.loads(raw_catalog)
-    except json.JSONDecodeError:
+    if raw_catalog.lstrip().startswith(("{", "[")):
         return PickerContractResult(
             False,
-            "model_catalog_json is not valid JSON",
+            "model_catalog_json must be a JSON file path",
             evidence,
             provider_id,
             False,
         )
-    if configured_catalog != catalog.to_mapping():
+    native_path = Path(raw_catalog)
+    if not native_path.is_absolute():
+        native_path = config_path.parent / native_path
+    try:
+        configured_catalog = json.loads(native_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return PickerContractResult(
+            False,
+            "model_catalog_json path is not readable",
+            evidence,
+            provider_id,
+            False,
+        )
+    if not isinstance(configured_catalog, Mapping) or not _native_matches_routes(
+        configured_catalog, catalog.models
+    ):
         return PickerContractResult(
             False,
             "model_catalog_json does not match the candidate catalog",
@@ -435,6 +580,111 @@ def _optional_text(payload: Mapping[str, object], field_name: str) -> str | None
     if not isinstance(value, str) or not value.strip():
         raise CatalogValidationError(f"{field_name} must be a non-empty string or None")
     return value
+
+
+def _normalize_provider_references(
+    values: Sequence[ProviderReference | Mapping[str, object]] | None,
+) -> tuple[ProviderReference, ...]:
+    if values is None:
+        return ()
+    providers: list[ProviderReference] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(values):
+        if isinstance(raw, ProviderReference):
+            provider = raw
+        elif isinstance(raw, Mapping):
+            provider = ProviderReference(
+                provider_id=_required_text(raw, "provider_id"),
+                model=_required_text(raw, "model"),
+                wire_api=_required_text(raw, "wire_api"),
+                credential_ref=_required_text(raw, "credential_ref"),
+            )
+        else:
+            raise CatalogValidationError(f"providers[{index}] must be an object")
+        if provider.provider_id in seen:
+            raise CatalogValidationError(f"providers repeat provider ID {provider.provider_id}")
+        seen.add(provider.provider_id)
+        providers.append(provider)
+    return tuple(providers)
+
+
+def _derive_provider_references(routes: Sequence[ModelRoute]) -> tuple[ProviderReference, ...]:
+    deepseek_models = {
+        route.upstream_model for route in routes if route.provider_id == "deepseek"
+    }
+    if len(deepseek_models) != 1:
+        return ()
+    return (
+        ProviderReference(
+            provider_id="deepseek",
+            model=next(iter(deepseek_models)),
+            wire_api="chat_completions",
+            credential_ref="deepseek",
+        ),
+    )
+
+
+def _route_to_native_record(route: ModelRoute) -> dict[str, object]:
+    capability = route.capability
+    return {
+        "slug": route.model_id,
+        "display_name": route.display_name,
+        "description": f"{route.display_name} via the local Router",
+        "default_reasoning_level": None,
+        "supported_reasoning_levels": [],
+        "shell_type": "disabled",
+        "visibility": "list",
+        "supported_in_api": capability.supports_responses,
+        "priority": 0,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": None,
+        "upgrade": None,
+        "base_instructions": _NATIVE_BASE_INSTRUCTIONS,
+        "model_messages": None,
+        "supports_reasoning_summaries": False,
+        "default_reasoning_summary": "none",
+        "support_verbosity": False,
+        "default_verbosity": None,
+        "apply_patch_tool_type": None,
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "tokens", "limit": 10_000},
+        "supports_parallel_tool_calls": False,
+        "supports_image_detail_original": False,
+        "context_window": capability.context_window,
+        "max_context_window": capability.context_window,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"] + (["image"] if capability.supports_images else []),
+        "supports_search_tool": False,
+    }
+
+
+def _reject_sensitive_native_values(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if isinstance(key, str) and key.lower() in _NATIVE_SENSITIVE_KEYS:
+                raise CatalogValidationError("native catalog contains a sensitive field")
+            _reject_sensitive_native_values(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _reject_sensitive_native_values(nested)
+
+
+def _native_matches_routes(payload: Mapping[str, object], routes: Sequence[ModelRoute]) -> bool:
+    raw_models = payload.get("models")
+    if not isinstance(raw_models, list):
+        return False
+    by_slug = {
+        model.get("slug"): model
+        for model in raw_models
+        if isinstance(model, Mapping) and isinstance(model.get("slug"), str)
+    }
+    return all(
+        route.model_id in by_slug
+        and by_slug[route.model_id].get("display_name") == route.display_name
+        for route in routes
+    )
 
 
 def catalog_fingerprint(catalog: CatalogDocument) -> str:
