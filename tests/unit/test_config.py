@@ -112,6 +112,53 @@ def test_restore_refuses_to_overwrite_external_edits(tmp_path) -> None:
         restore_managed_config(config_path, receipt)
 
 
+def test_windows_atomic_replace_requires_lease(tmp_path, monkeypatch) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows replacement handoff is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    temporary_path = tmp_path / "candidate.tmp"
+    target_path = tmp_path / "config.toml"
+    temporary_path.write_bytes(b"new\n")
+    target_path.write_bytes(b"old\n")
+
+    def forbidden_replace(*args, **kwargs):
+        raise AssertionError("Windows replacement must not bypass the path lease")
+
+    monkeypatch.setattr(config_module.os, "replace", forbidden_replace)
+
+    with pytest.raises(ConfigError, match="active path lease"):
+        config_module._replace_temp_file(
+            temporary_path,
+            target_path,
+            expected=b"new\n",
+        )
+
+    assert target_path.read_bytes() == b"old\n"
+
+
+def test_cooperative_lock_requires_fcntl(tmp_path, monkeypatch) -> None:
+    import builtins
+
+    import codex_model_switcher.config as config_module
+
+    lease = config_module._PathLease(tmp_path / "config.toml", create=True)
+    real_import = builtins.__import__
+
+    def missing_fcntl(name, *args, **kwargs):
+        if name == "fcntl":
+            raise ImportError("test missing fcntl")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_fcntl)
+
+    with pytest.raises(ConfigError, match="cooperative config locking"):
+        lease._acquire_cooperative()
+
+    assert lease._cooperative_stream is None
+
+
 def test_replacement_replaces_only_the_managed_block() -> None:
     first_block = "\n".join((MANAGED_START, 'version = "9.9.9"', MANAGED_END))
     second_block = "\n".join((MANAGED_START, 'version = "10.0.0"', MANAGED_END))

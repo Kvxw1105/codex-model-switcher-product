@@ -14,7 +14,7 @@
 - 受管区块 start/end marker 必须各自独占完整行且恰好一对；marker 出现在用户注释、TOML 字符串、嵌入文本或重复区块时直接拒绝替换。
 - apply 会在首次读取、当前 hash 检查、备份、临时文件写入和最终替换期间同时持有同路径临界区。Windows 用 `CreateFileW(FILE_FLAG_OPEN_REQUIRING_OPLOCK)` 在打开目标时取得 OS 级 namespace 保护，并用 `LockFileEx` 做协作进程内的全文件锁；单独的 `LockFileEx` 不被当作跨进程 rename 防线。替换使用 TxF：在同一 `CreateTransaction` 中把旧目标移到临时 shadow、建立新临时文件到目标的硬链接、删除两个临时名字，并用 `CreateFileTransactedW` 预先打开带 `share read/write`（拒绝 `DELETE/RENAME`）的新目标句柄，随后才 `CommitTransaction`。提交返回时新句柄已经存在，因此没有 `ReplaceFileW` 返回到 relock 的路径窗口；TxF/相关 API 不可用时 fail-closed，不回退到普通 `os.replace`。成功 apply 才创建包含写前字节和时间戳的原子备份，receipt 保存写前/写后 SHA-256。
 - 上述 Windows 强保证限定在支持这些 API 语义的本地文件系统；网络盘或特殊文件系统若不能取得 oplock/事务能力会拒绝操作，不把降级路径宣称为全局保护。
-- 非 Windows 使用进程锁和同目录 sidecar `flock`，只保证遵守该协作锁的进程；不参与锁的外部编辑仍可能造成 TOCTOU，代码不会把该 fallback 宣称为全局防护。Windows 锁获取失败、锁定冲突或最终原子替换失败会拒绝操作。
+- 非 Windows 使用进程锁和同目录 sidecar `flock`，只保证遵守该协作锁的进程；不参与锁的外部编辑仍可能造成 TOCTOU，代码不会把该 fallback 宣称为全局防护。若平台没有 `fcntl`，获取协作锁会 fail-closed，拒绝无锁写入。Windows 锁获取失败、锁定冲突或最终原子替换失败会拒绝操作。
 - restore 也在同一目标文件临界区内读取当前 hash、校验备份、写临时文件并替换；当前文件不是本项目最后一次写入的 hash 时拒绝，备份 hash 也必须匹配，恢复结果按字节保留原文件。
 
 ## Gate 1：当前客户端原生 picker

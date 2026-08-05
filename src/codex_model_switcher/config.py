@@ -570,8 +570,10 @@ class _PathLease:
     def _acquire_cooperative(self) -> None:
         try:
             import fcntl
-        except ImportError:
-            return
+        except ImportError as error:
+            raise ConfigError(
+                "cooperative config locking is unavailable; refusing an unlocked write"
+            ) from error
         lock_path = self.path.with_name(f".{self.path.name}.codex-model-switcher.lock")
         stream = None
         try:
@@ -660,7 +662,17 @@ def _apply_managed_config_locked(
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_path = config_path.with_name(f"{config_path.name}.bak.{timestamp}")
-    _atomic_write(backup_path, original)
+    backup_descriptor = os.open(
+        backup_path,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+    )
+    os.close(backup_descriptor)
+    try:
+        with _exclusive_path_lock(backup_path, create=False) as backup_lease:
+            _atomic_write(backup_path, original, expected=b"", lease=backup_lease)
+    except Exception:
+        backup_path.unlink(missing_ok=True)
+        raise
     try:
         _atomic_write(config_path, written, expected=original, lease=lease)
     except Exception:
@@ -852,9 +864,12 @@ def _replace_temp_file(
     lease: _PathLease | None = None,
     expected: bytes | None = None,
 ) -> None:
-    if os.name != "nt" or lease is None:
+    if os.name != "nt":
         os.replace(temporary_path, target_path)
         return
+
+    if lease is None:
+        raise ConfigError("Windows atomic replacement requires an active path lease")
 
     if expected is None:
         raise ConfigError("atomic replacement needs expected bytes for a Windows lock")
