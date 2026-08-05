@@ -1,6 +1,7 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
+from pathlib import Path
 from threading import Event, Thread
 
 import pytest
@@ -248,6 +249,56 @@ def test_corrupt_wal_is_quarantined_with_the_matching_database_set(
         assert quarantine_shm.stat().st_size == len(shm_before)
     finally:
         seed.close()
+
+
+@pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm"])
+def test_orphaned_sidecar_is_quarantined_without_creating_empty_database(
+    tmp_path, secret_key_provider, sidecar_suffix
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    sidecar_path = path.with_name(f"{path.name}{sidecar_suffix}")
+    sidecar_path.write_bytes(b"orphan sidecar evidence")
+
+    with pytest.raises(DatabaseCorruptionError, match="orphan"):
+        StateStore(path, secret_key_provider)
+
+    assert not path.exists()
+    quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    assert len(quarantine_files) == 1
+    assert quarantine_files[0].name.endswith(sidecar_suffix)
+    assert quarantine_files[0].read_bytes() == b"orphan sidecar evidence"
+
+
+def test_orphaned_sidecar_quarantine_captures_main_if_it_appears(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    wal_path = path.with_name(f"{path.name}-wal")
+    shm_path = path.with_name(f"{path.name}-shm")
+    wal_path.write_bytes(b"orphan wal evidence")
+    shm_path.write_bytes(b"orphan shm evidence")
+
+    original_copy2 = state_module.shutil.copy2
+
+    def create_main_during_wal_copy(source, destination, *args, **kwargs):
+        if Path(source) == wal_path and not path.exists():
+            path.write_bytes(b"main appeared evidence")
+        return original_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(state_module.shutil, "copy2", create_main_during_wal_copy)
+
+    with pytest.raises(DatabaseCorruptionError, match="orphan"):
+        StateStore(path, secret_key_provider)
+
+    quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    assert len(quarantine_files) == 3
+    quarantine_main = next(
+        item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+    )
+    assert quarantine_main.read_bytes() == b"main appeared evidence"
+    assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == b"orphan wal evidence"
+    assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == b"orphan shm evidence"
+    assert path.read_bytes() == b"main appeared evidence"
 
 
 def test_reopen_retries_transient_wal_copy_permission_error_during_writer(

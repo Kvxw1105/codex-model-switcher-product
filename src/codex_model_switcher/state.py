@@ -119,16 +119,20 @@ class StateStore:
 
         with _DATABASE_INIT_LOCK:
             existed = self.path.exists()
-            if existed and (not self.path.is_file() or self.path.stat().st_size == 0):
-                quarantine = self._quarantine_existing()
-                raise DatabaseCorruptionError(
-                    "existing state database is empty or not a file; "
-                    f"quarantined as {quarantine.name}"
-                )
             if existed:
+                self._validate_existing_path()
                 self._verify_existing_before_write()
+            else:
+                self._reject_orphaned_sidecars()
 
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not existed and self.path.exists():
+                existed = True
+                self._validate_existing_path()
+                self._verify_existing_before_write()
+            elif not existed:
+                self._reject_orphaned_sidecars()
+
             try:
                 self._connection = sqlite3.connect(
                     self.path,
@@ -157,6 +161,28 @@ class StateStore:
                 raise DatabaseCorruptionError(
                     "new state database could not be initialized"
                 ) from exc
+
+    def _validate_existing_path(self) -> None:
+        if not self.path.is_file() or self.path.stat().st_size == 0:
+            quarantine = self._quarantine_existing()
+            raise DatabaseCorruptionError(
+                "existing state database is empty or not a file; "
+                f"quarantined as {quarantine.name}"
+            )
+
+    def _reject_orphaned_sidecars(self) -> None:
+        if self.path.exists():
+            return
+        if not any(
+            self.path.with_name(f"{self.path.name}{suffix}").exists()
+            for suffix in ("-wal", "-shm")
+        ):
+            return
+        quarantine = self._quarantine_existing()
+        raise DatabaseCorruptionError(
+            "orphaned SQLite sidecar exists without the main database; "
+            f"quarantined as {quarantine.name}"
+        )
 
     def _verify_existing_before_write(self) -> None:
         source: sqlite3.Connection | None = None
@@ -890,13 +916,18 @@ class StateStore:
             quarantine = self.path.with_name(f"{self.path.name}.quarantine-{timestamp}-{suffix}")
             suffix += 1
         source_base = self.path if source_directory is None else source_directory / self.path.name
-        for sidecar_suffix in ("", "-wal", "-shm"):
-            source = source_base if not sidecar_suffix else source_base.with_name(
-                f"{source_base.name}{sidecar_suffix}"
-            )
-            if source.exists():
-                target = quarantine.with_name(f"{quarantine.name}{sidecar_suffix}")
-                self._copy_file_with_retry(source, target)
+        copied_suffixes: set[str] = set()
+        for _pass in range(2):
+            for sidecar_suffix in ("", "-wal", "-shm"):
+                if sidecar_suffix in copied_suffixes:
+                    continue
+                source = source_base if not sidecar_suffix else source_base.with_name(
+                    f"{source_base.name}{sidecar_suffix}"
+                )
+                if source.exists():
+                    target = quarantine.with_name(f"{quarantine.name}{sidecar_suffix}")
+                    self._copy_file_with_retry(source, target)
+                    copied_suffixes.add(sidecar_suffix)
         return quarantine
 
     def __enter__(self) -> StateStore:
