@@ -26,6 +26,7 @@ _LABELED_SECRET_RE = re.compile(
     r"(?:bearer\s+)?[^\s,;]+"
 )
 _KEY_SECRET_RE = re.compile(r"(?i)^sk-[a-z0-9_-]{8,}$")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 _SENSITIVE_KEYS = {
     "access_token",
@@ -337,9 +338,7 @@ class KeyringCredentialStore:
             raise CredentialStoreError("credential backend read failed") from None
         if value is None:
             raise CredentialNotConfiguredError("provider credential is not configured")
-        if not isinstance(value, str):
-            raise CredentialStoreError("credential backend returned an invalid value")
-        return value
+        return _validated_backend_secret(value)
 
     def delete(self, provider_id: str) -> None:
         username = validate_provider_id(provider_id, self._provider_id_verifier)
@@ -353,9 +352,13 @@ class KeyringCredentialStore:
     def exists(self, provider_id: str) -> bool:
         username = validate_provider_id(provider_id, self._provider_id_verifier)
         try:
-            return self._keyring.get_password(self.SERVICE_NAME, username) is not None
+            value = self._keyring.get_password(self.SERVICE_NAME, username)
         except Exception:
             raise CredentialStoreError("credential backend existence check failed") from None
+        if value is None:
+            return False
+        _validated_backend_secret(value)
+        return True
 
 
 WindowsCredentialStore = KeyringCredentialStore
@@ -374,7 +377,9 @@ def configure_credential(
         validate_provider_id(provider_id, provider_id_verifier)
         _validate_secret(secret)
         credential_store.set(provider_id, secret)
-        configured = bool(credential_store.exists(provider_id))
+        readback = credential_store.get(provider_id)
+        _validate_secret(readback)
+        configured = True
     except Exception:
         configured = False
     return {"configured": configured}
@@ -406,6 +411,10 @@ def resolve_upstream_auth(
             raise CredentialStoreError("credential backend read failed") from None
         if not isinstance(secret, str) or not secret:
             raise CredentialNotConfiguredError("provider credential is not configured")
+        try:
+            _validate_secret(secret)
+        except CredentialValueError:
+            raise CredentialStoreError("credential backend returned an invalid value") from None
         return f"Bearer {secret}"
     if lane == "official":
         return inbound_authorization
@@ -441,6 +450,7 @@ def build_third_party_headers(
             continue
         allowed_name = _allowed_third_party_header(raw_name)
         if allowed_name is not None and isinstance(raw_value, str):
+            _validate_header_value(raw_value)
             headers.setdefault(allowed_name, raw_value)
     resolved = resolve_upstream_auth(
         lane="third_party",
@@ -451,6 +461,10 @@ def build_third_party_headers(
     )
     if resolved is None:
         raise CredentialNotConfiguredError("provider credential is not configured")
+    try:
+        _validate_header_value(resolved)
+    except CredentialValueError:
+        raise CredentialStoreError("credential backend returned an invalid value") from None
     headers["Authorization"] = resolved
     return headers
 
@@ -462,6 +476,23 @@ sanitize_third_party_headers = build_third_party_headers
 def _validate_secret(secret: str) -> None:
     if not isinstance(secret, str) or not secret:
         raise CredentialValueError("credential must be non-empty text")
+    if _CONTROL_CHAR_RE.search(secret):
+        raise CredentialValueError("credential contains control characters")
+
+
+def _validated_backend_secret(value: Any) -> str:
+    try:
+        _validate_secret(value)
+    except CredentialValueError:
+        raise CredentialStoreError("credential backend returned an invalid value") from None
+    return value
+
+
+def _validate_header_value(value: Any) -> None:
+    if not isinstance(value, str):
+        raise CredentialValueError("header value must be text")
+    if _CONTROL_CHAR_RE.search(value):
+        raise CredentialValueError("header contains control characters")
 
 
 def _canonical_key(key: object) -> str:
@@ -749,8 +780,11 @@ def _provider_id_from_record(
 def _secret_from_legacy_value(value: Any) -> str | None:
     if not isinstance(value, str) or not value:
         return None
-    bearer = re.match(r"(?i)^bearer\s+(.+)$", value.strip())
-    return bearer.group(1) if bearer else value
+    if _CONTROL_CHAR_RE.search(value):
+        return value
+    stripped = value.strip()
+    bearer = re.fullmatch(r"(?i)bearer[ \t]+(.+)", stripped)
+    return bearer.group(1) if bearer else stripped
 
 
 def _collect_legacy_secrets(value: Any, *, key: object | None = None) -> list[str]:
@@ -781,12 +815,60 @@ def _verify_written_credential(
     secret: str,
 ) -> None:
     try:
+        _validate_secret(secret)
         credential_store.set(provider_id, secret)
         readback = credential_store.get(provider_id)
+        _validate_secret(readback)
     except Exception:
         raise CredentialMigrationError("credential write or verification failed") from None
     if readback != secret:
         raise CredentialMigrationError("credential write or verification failed")
+
+
+_MISSING_CREDENTIAL = object()
+
+
+def _read_migration_original(
+    credential_store: CredentialStore,
+    provider_id: str,
+) -> str | object:
+    try:
+        value = credential_store.get(provider_id)
+    except (CredentialNotConfiguredError, KeyError):
+        return _MISSING_CREDENTIAL
+    except Exception:
+        raise CredentialMigrationError("credential preflight failed") from None
+    try:
+        _validate_secret(value)
+    except CredentialValueError:
+        raise CredentialMigrationError("credential preflight failed") from None
+    return value
+
+
+def _rollback_migration_credentials(
+    credential_store: CredentialStore,
+    original_values: Mapping[str, str | object],
+    touched_provider_ids: Iterable[str],
+) -> None:
+    try:
+        for provider_id in reversed(list(touched_provider_ids)):
+            original = original_values[provider_id]
+            if original is _MISSING_CREDENTIAL:
+                credential_store.delete(provider_id)
+                try:
+                    credential_store.get(provider_id)
+                except (CredentialNotConfiguredError, KeyError):
+                    continue
+                raise CredentialMigrationError("credential rollback failed")
+            credential_store.set(provider_id, original)
+            restored = credential_store.get(provider_id)
+            _validate_secret(restored)
+            if restored != original:
+                raise CredentialMigrationError("credential rollback failed")
+    except CredentialMigrationError:
+        raise
+    except Exception:
+        raise CredentialMigrationError("credential rollback failed") from None
 
 
 def migrate_legacy_catalog(
@@ -811,25 +893,57 @@ def migrate_legacy_catalog(
     if not isinstance(providers, list):
         raise CredentialMigrationError("legacy catalog has no providers list")
 
+    planned_credentials: list[tuple[str, str]] = []
+    seen_provider_ids: set[str] = set()
     for provider in providers:
         if not isinstance(provider, Mapping):
             raise CredentialMigrationError("legacy provider must be an object")
         provider_id = _provider_id_from_record(provider, provider_id_verifier)
+        if provider_id in seen_provider_ids:
+            raise CredentialMigrationError("legacy catalog contains duplicate provider IDs")
+        seen_provider_ids.add(provider_id)
         secret = _find_legacy_secret(provider)
         if secret is not None:
-            _verify_written_credential(credential_store, provider_id, secret)
+            try:
+                _validate_secret(secret)
+            except CredentialValueError:
+                raise CredentialMigrationError("legacy credential is invalid") from None
+            planned_credentials.append((provider_id, secret))
         elif not provider.get("credential_ref"):
             raise CredentialMigrationError("legacy provider has no credential")
 
-    migrated = serialize_catalog(catalog, provider_id_verifier=provider_id_verifier)
-    if destination is not None:
-        destination_path = Path(destination)
+    try:
+        migrated = serialize_catalog(catalog, provider_id_verifier=provider_id_verifier)
+        serialized_catalog = json.dumps(migrated, ensure_ascii=False, indent=2) + "\n"
+    except Exception:
+        raise CredentialMigrationError("could not prepare migrated catalog") from None
+
+    original_values: dict[str, str | object] = {
+        provider_id: _read_migration_original(credential_store, provider_id)
+        for provider_id, _ in planned_credentials
+    }
+    touched_provider_ids: list[str] = []
+    try:
+        for provider_id, secret in planned_credentials:
+            touched_provider_ids.append(provider_id)
+            _verify_written_credential(credential_store, provider_id, secret)
+        if destination is not None:
+            destination_path = Path(destination)
+            try:
+                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                destination_path.write_text(serialized_catalog, encoding="utf-8")
+            except OSError:
+                raise CredentialMigrationError("could not write migrated catalog") from None
+    except Exception as error:
         try:
-            destination_path.parent.mkdir(parents=True, exist_ok=True)
-            destination_path.write_text(
-                json.dumps(migrated, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
+            _rollback_migration_credentials(
+                credential_store,
+                original_values,
+                touched_provider_ids,
             )
-        except OSError:
-            raise CredentialMigrationError("could not write migrated catalog") from None
+        except CredentialMigrationError:
+            raise
+        if isinstance(error, CredentialMigrationError):
+            raise
+        raise CredentialMigrationError("credential migration failed") from None
     return migrated
