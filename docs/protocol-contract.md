@@ -7,8 +7,10 @@
 - `ModelCapability` 与 `ModelRoute` 是 frozen dataclass。
 - 每个 route 必须显式提供全部能力字段；缺失能力会拒绝加载，因此不会为未知模型填充统一 context window。
 - route 的 `model_id`、`provider_id` 和 `upstream_model` 必须是稳定、非空且无空白的标识；display name 必须包含 `Official` 或 `API` lane 标记。
-- 目录生成从调用方提供的模型缓存读取 `client_version`，不会硬编码客户端版本。当前 fixture 只是假版本，用于证明动态传递路径。
+- 目录生成从调用方提供的模型缓存读取 `client_version`，不会硬编码客户端版本。没有 schema 证据时，候选明确带有 `schema_version: null` 和 `verification_status: UNVERIFIED`；`picker-v1` 不再是默认或通过信号。
 - 配置只写入受管区块中的 `model_provider` 与 `model_catalog_json`。没有写入 upstream URL、Authorization、cookie 或凭据字段。
+- `render_managed_config` 与 `apply_managed_config` 必须收到外部产生的 `current-client-artifact` receipt，并校验 schema/version 与候选 catalog SHA-256；缺失 receipt 时拒绝 apply。
+- 受管区块 start/end marker 必须各自独占完整行且恰好一对；marker 出现在用户注释、TOML 字符串、嵌入文本或重复区块时直接拒绝替换。
 - apply 会创建包含写前字节和时间戳的备份，并以同目录临时文件加 `os.replace` 原子替换目标。receipt 保存写前/写后 SHA-256。
 - restore 仅在当前文件仍匹配本项目最后一次写入的 hash 时执行；外部编辑会拒绝覆盖。备份 hash 也必须匹配，恢复结果按字节保留原文件。
 
@@ -18,14 +20,14 @@
 
 本 worktree 没有安全可用的当前 Codex 客户端 schema 或 app-server 证据，且本任务禁止读取或输出真实 `catalog.json`、`auth.json`、token、cookie、Authorization 值。因此无法证明候选 `model_provider + model_catalog_json` 会被当前客户端接受，也不能把候选字段称为官方 picker schema。
 
-代码中的 `verify_isolated_picker_contract` 只在隔离 `CODEX_HOME` 中检查：
+代码中的 `verify_isolated_picker_contract` 只在隔离 `CODEX_HOME` 中做候选一致性检查，结果永远是 `passed: false`，即使 fixture 的 schema/version 与配置完全一致也不会宣称 native picker 通过。它检查：
 
 1. `config.toml` 能被 TOML 解析；
 2. provider 与候选目录匹配；
 3. `model_catalog_json` 是与候选目录相同的 JSON；
-4. 调用方显式提供不含隐私的当前客户端 `schema_version` 与 `client_version` 证据。
+4. 记录调用方提供的不含隐私的候选 schema/version 来源，但不把该字段当作当前客户端通过信号。
 
-缺少第 4 项时结果明确为失败，即使本地配置语法正确也不能宣称 Gate 1 通过。测试只使用 tmp 目录和假值；没有真实客户端启动、付费模型请求或 endpoint 猜测。
+缺少真实外部 receipt 时结果明确为 `FAIL / UNVERIFIED`，即使本地配置语法正确也不能宣称 Gate 1 通过。测试只使用 tmp 目录和假值；没有真实客户端启动、付费模型请求或 endpoint 猜测。
 
 ## app-server、turn 边界与 compact
 

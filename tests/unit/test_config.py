@@ -3,11 +3,27 @@ import json
 
 import pytest
 
+from codex_model_switcher.catalog import (
+    PickerVerificationReceipt,
+    catalog_fingerprint,
+    load_catalog,
+)
 from codex_model_switcher.config import (
     ConfigChangedError,
+    ConfigError,
     apply_managed_config,
     restore_managed_config,
 )
+
+
+def _verification(catalog_path):
+    catalog = load_catalog(catalog_path)
+    return PickerVerificationReceipt(
+        schema_version=catalog.schema_version,
+        client_version=catalog.client_version,
+        catalog_sha256=catalog_fingerprint(catalog),
+        source="current-client-artifact",
+    )
 
 
 def _safe_catalog() -> dict[str, object]:
@@ -46,7 +62,11 @@ def test_apply_then_restore_is_byte_exact(tmp_path, monkeypatch) -> None:
     catalog_path = tmp_path / "safe-picker.json"
     catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
 
-    receipt = apply_managed_config(config_path, catalog_path)
+    receipt = apply_managed_config(
+        config_path,
+        catalog_path,
+        verification=_verification(catalog_path),
+    )
 
     assert config_path.read_bytes() != original
     assert receipt.original_hash == hashlib.sha256(original).hexdigest()
@@ -68,7 +88,11 @@ def test_restore_refuses_to_overwrite_external_edits(tmp_path, monkeypatch) -> N
     catalog_path = tmp_path / "safe-picker.json"
     catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
 
-    receipt = apply_managed_config(config_path, catalog_path)
+    receipt = apply_managed_config(
+        config_path,
+        catalog_path,
+        verification=_verification(catalog_path),
+    )
     config_path.write_bytes(config_path.read_bytes() + b"# external edit\n")
 
     with pytest.raises(ConfigChangedError, match="changed"):
@@ -88,10 +112,72 @@ def test_reapplying_replaces_only_the_managed_block(tmp_path, monkeypatch) -> No
     second_catalog_path = tmp_path / "second-picker.json"
     second_catalog_path.write_text(json.dumps(second_catalog), encoding="utf-8")
 
-    apply_managed_config(config_path, first_catalog_path)
-    apply_managed_config(config_path, second_catalog_path)
+    apply_managed_config(
+        config_path,
+        first_catalog_path,
+        verification=_verification(first_catalog_path),
+    )
+    apply_managed_config(
+        config_path,
+        second_catalog_path,
+        verification=_verification(second_catalog_path),
+    )
 
     rendered = config_path.read_text(encoding="utf-8")
     assert rendered.count("codex-model-switcher managed start") == 1
     assert "# keep this\nmodel = \"original\"\n" in rendered
     assert "10.0.0" in rendered
+
+
+def test_apply_rejects_unverified_candidate_without_external_attestation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    isolated_home = tmp_path / "isolated-codex-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
+    config_path = isolated_home / "config.toml"
+    config_path.write_bytes(b"model = \"original\"\n")
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="UNVERIFIED"):
+        apply_managed_config(config_path, catalog_path)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "# user note: # >>> codex-model-switcher managed start",
+        'note = "# <<< codex-model-switcher managed end"',
+    ],
+)
+def test_marker_substrings_inside_user_content_are_rejected(tmp_path, monkeypatch, line) -> None:
+    isolated_home = tmp_path / "isolated-codex-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
+    config_path = isolated_home / "config.toml"
+    config_path.write_text(line + "\n", encoding="utf-8")
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="marker"):
+        apply_managed_config(config_path, catalog_path, verification=_verification(catalog_path))
+
+
+def test_duplicate_managed_blocks_are_rejected(tmp_path, monkeypatch) -> None:
+    isolated_home = tmp_path / "isolated-codex-home"
+    isolated_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(isolated_home))
+    config_path = isolated_home / "config.toml"
+    config_path.write_bytes(b"model = \"original\"\n")
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+    verification = _verification(catalog_path)
+
+    apply_managed_config(config_path, catalog_path, verification=verification)
+    existing = config_path.read_text(encoding="utf-8")
+    config_path.write_text(existing + existing, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="exactly one|duplicate|marker"):
+        apply_managed_config(config_path, catalog_path, verification=verification)

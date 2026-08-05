@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .catalog import CatalogValidationError, load_catalog
+from .catalog import (
+    CatalogValidationError,
+    PickerVerificationReceipt,
+    load_catalog,
+    validate_picker_verification,
+)
 
 MANAGED_START = "# >>> codex-model-switcher managed start"
 MANAGED_END = "# <<< codex-model-switcher managed end"
@@ -33,11 +38,19 @@ class ConfigReceipt:
     timestamp: str
 
 
-def render_managed_config(catalog_path: Path) -> str:
-    """Render only provider and catalog fields; no endpoint or credentials."""
+def render_managed_config(
+    catalog_path: Path,
+    *,
+    verification: PickerVerificationReceipt | None = None,
+) -> str:
+    """Render only an externally-attested candidate; never endpoint or credentials."""
 
     try:
         catalog = load_catalog(Path(catalog_path))
+    except CatalogValidationError as error:
+        raise ConfigError(str(error)) from error
+    try:
+        validate_picker_verification(catalog, verification)
     except CatalogValidationError as error:
         raise ConfigError(str(error)) from error
     catalog_json = json.dumps(catalog.to_mapping(), ensure_ascii=False, separators=(",", ":"))
@@ -51,7 +64,12 @@ def render_managed_config(catalog_path: Path) -> str:
     )
 
 
-def apply_managed_config(config_path: Path, catalog_path: Path) -> ConfigReceipt:
+def apply_managed_config(
+    config_path: Path,
+    catalog_path: Path,
+    *,
+    verification: PickerVerificationReceipt | None = None,
+) -> ConfigReceipt:
     config_path = Path(config_path).resolve()
     catalog_path = Path(catalog_path)
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,7 +83,7 @@ def apply_managed_config(config_path: Path, catalog_path: Path) -> ConfigReceipt
     backup_path = config_path.with_name(f"{config_path.name}.bak.{timestamp}")
     _atomic_write(backup_path, original)
     try:
-        managed_block = render_managed_config(catalog_path)
+        managed_block = render_managed_config(catalog_path, verification=verification)
         rendered = _replace_or_append_managed_block(original_text, managed_block)
         written = rendered.encode("utf-8")
         _atomic_write(config_path, written)
@@ -98,27 +116,33 @@ def restore_managed_config(config_path: Path, receipt: ConfigReceipt) -> None:
 
 
 def _replace_or_append_managed_block(original: str, block: str) -> str:
-    start = original.find(MANAGED_START)
-    end = original.find(MANAGED_END)
-    if (start == -1) != (end == -1):
-        raise ConfigError("managed config block is incomplete")
-    if start != -1:
-        if end < start:
-            raise ConfigError("managed config block markers are out of order")
-        start_line = original.rfind("\n", 0, start) + 1
-        end_line_end = original.find("\n", end)
-        if end_line_end == -1:
-            newline = ""
-            after = ""
+    lines = original.splitlines(keepends=True)
+    start_lines: list[int] = []
+    end_lines: list[int] = []
+    for index, line in enumerate(lines):
+        content = line.rstrip("\r\n")
+        for marker, matches in ((MANAGED_START, start_lines), (MANAGED_END, end_lines)):
+            if marker in content:
+                if content != marker:
+                    raise ConfigError("managed config marker must occupy a complete line")
+                matches.append(index)
+    if len(start_lines) > 1 or len(end_lines) > 1:
+        raise ConfigError("managed config must contain exactly one marker pair")
+    if len(start_lines) != len(end_lines):
+        raise ConfigError("managed config marker pair is incomplete")
+    if start_lines:
+        start_line = start_lines[0]
+        end_line = end_lines[0]
+        if end_line < start_line:
+            raise ConfigError("managed config marker pair is out of order")
+        existing_end = lines[end_line]
+        if existing_end.endswith("\r\n"):
+            newline = "\r\n"
+        elif existing_end.endswith("\n"):
+            newline = "\n"
         else:
-            newline_start = (
-                end_line_end - 1
-                if end_line_end > 0 and original[end_line_end - 1] == "\r"
-                else end_line_end
-            )
-            newline = original[newline_start : end_line_end + 1]
-            after = original[end_line_end + 1 :]
-        return original[:start_line] + block + newline + after
+            newline = ""
+        return "".join(lines[:start_line] + [block + newline] + lines[end_line + 1 :])
 
     separator = "" if not original or original.endswith(("\n", "\r")) else "\n"
     return original + separator + block + "\n"

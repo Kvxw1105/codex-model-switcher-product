@@ -7,7 +7,9 @@ claim that an unverified candidate is accepted by a particular Codex build.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -23,10 +25,11 @@ class CatalogValidationError(ValueError):
 
 @dataclass(frozen=True)
 class CatalogDocument:
-    schema_version: str
+    schema_version: str | None
     client_version: str
     provider_id: str
     models: tuple[ModelRoute, ...]
+    verification_status: str = "UNVERIFIED"
 
     def to_mapping(self) -> dict[str, object]:
         return {
@@ -36,22 +39,51 @@ class CatalogDocument:
             "models": [_route_to_record(route) for route in self.models],
         }
 
+    def to_candidate_mapping(self) -> dict[str, object]:
+        mapping = self.to_mapping()
+        mapping["verification_status"] = self.verification_status
+        return mapping
+
 
 @dataclass(frozen=True)
 class PickerSchemaEvidence:
-    """Non-sensitive evidence supplied by a current-client verification."""
+    """Non-sensitive evidence about a candidate, never native-client proof."""
+
+    schema_version: str | None
+    client_version: str
+    source: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version is not None and (
+            not isinstance(self.schema_version, str) or not self.schema_version.strip()
+        ):
+            raise ValueError("schema_version must be a non-empty string or None")
+        if not isinstance(self.client_version, str) or not self.client_version.strip():
+            raise ValueError("client_version must be a non-empty string")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("source must be a non-empty string")
+
+
+@dataclass(frozen=True)
+class PickerVerificationReceipt:
+    """An externally-produced, auditable artifact required before apply."""
 
     schema_version: str
     client_version: str
-    verified_by_current_client: bool
+    catalog_sha256: str
+    source: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.schema_version, str) or not self.schema_version.strip():
             raise ValueError("schema_version must be a non-empty string")
         if not isinstance(self.client_version, str) or not self.client_version.strip():
             raise ValueError("client_version must be a non-empty string")
-        if type(self.verified_by_current_client) is not bool:
-            raise ValueError("verified_by_current_client must be a boolean")
+        if not isinstance(self.catalog_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", self.catalog_sha256
+        ):
+            raise ValueError("catalog_sha256 must be a lowercase SHA-256 hex digest")
+        if self.source != "current-client-artifact":
+            raise ValueError("source must identify a current-client-artifact")
 
 
 @dataclass(frozen=True)
@@ -60,12 +92,24 @@ class PickerContractResult:
     reason: str
     evidence: PickerSchemaEvidence
     provider_id: str
+    candidate_matches: bool
+    status: str = "UNVERIFIED"
+
+    def __post_init__(self) -> None:
+        if self.passed:
+            raise ValueError("native picker result must remain UNVERIFIED")
+        if self.status != "UNVERIFIED":
+            raise ValueError("native picker result status must remain UNVERIFIED")
+        if type(self.candidate_matches) is not bool:
+            raise ValueError("candidate_matches must be a boolean")
 
     def to_safe_dict(self) -> dict[str, object]:
         """Return only schema/version/provider evidence; never paths or secrets."""
 
         return {
-            "passed": self.passed,
+            "passed": False,
+            "status": self.status,
+            "candidate_matches": self.candidate_matches,
             "schema_version": self.evidence.schema_version,
             "client_version": self.evidence.client_version,
             "provider_id": self.provider_id,
@@ -76,6 +120,7 @@ def read_client_version_from_model_cache(cache_path: Path) -> str:
     """Read the explicit client version from a supplied model-cache fixture."""
 
     try:
+        cache_path = Path(cache_path)
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise CatalogValidationError(f"unable to read model cache: {cache_path.name}") from error
@@ -92,14 +137,16 @@ def build_catalog(
     *,
     client_version: str,
     provider_id: str = "codex-model-switcher",
-    schema_version: str = "picker-v1",
+    schema_version: str | None = None,
 ) -> dict[str, object]:
     if not isinstance(client_version, str) or not client_version.strip():
         raise CatalogValidationError("client_version must be a non-empty string")
     if not isinstance(provider_id, str) or not provider_id.strip():
         raise CatalogValidationError("provider_id must be a non-empty string")
-    if not isinstance(schema_version, str) or not schema_version.strip():
-        raise CatalogValidationError("schema_version must be a non-empty string")
+    if schema_version is not None and (
+        not isinstance(schema_version, str) or not schema_version.strip()
+    ):
+        raise CatalogValidationError("schema_version must be a non-empty string or None")
     route_list = tuple(routes)
     if any(not isinstance(route, ModelRoute) for route in route_list):
         raise CatalogValidationError("models must contain ModelRoute values")
@@ -110,6 +157,7 @@ def build_catalog(
         "schema_version": schema_version,
         "client_version": client_version,
         "provider_id": provider_id,
+        "verification_status": "UNVERIFIED",
         "models": [_route_to_record(route) for route in route_list],
     }
 
@@ -119,7 +167,7 @@ def build_catalog_from_model_cache(
     routes: Sequence[ModelRoute],
     *,
     provider_id: str = "codex-model-switcher",
-    schema_version: str = "picker-v1",
+    schema_version: str | None = None,
 ) -> dict[str, object]:
     client_version = read_client_version_from_model_cache(cache_path)
     return build_catalog(
@@ -131,6 +179,7 @@ def build_catalog_from_model_cache(
 
 
 def load_catalog(catalog_path: Path) -> CatalogDocument:
+    catalog_path = Path(catalog_path)
     try:
         payload = json.loads(catalog_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -142,9 +191,12 @@ def load_catalog(catalog_path: Path) -> CatalogDocument:
 def catalog_from_mapping(payload: Mapping[str, object]) -> CatalogDocument:
     if not isinstance(payload, Mapping):
         raise CatalogValidationError("catalog must be a JSON object")
-    schema_version = _required_text(payload, "schema_version")
+    schema_version = _optional_text(payload, "schema_version")
     client_version = _required_text(payload, "client_version")
     provider_id = _required_text(payload, "provider_id")
+    verification_status = payload.get("verification_status", "UNVERIFIED")
+    if verification_status != "UNVERIFIED":
+        raise CatalogValidationError("catalog verification_status must remain UNVERIFIED")
     raw_models = payload.get("models")
     if not isinstance(raw_models, list):
         raise CatalogValidationError("models must be an array")
@@ -160,7 +212,13 @@ def catalog_from_mapping(payload: Mapping[str, object]) -> CatalogDocument:
             raise CatalogValidationError(f"models[{index}] repeats model ID {route.model_id}")
         seen_ids.add(route.model_id)
         routes.append(route)
-    return CatalogDocument(schema_version, client_version, provider_id, tuple(routes))
+    return CatalogDocument(
+        schema_version,
+        client_version,
+        provider_id,
+        tuple(routes),
+        verification_status,
+    )
 
 
 def verify_isolated_picker_contract(
@@ -181,7 +239,7 @@ def verify_isolated_picker_contract(
         evidence = PickerSchemaEvidence(
             schema_version=catalog.schema_version,
             client_version=catalog.client_version,
-            verified_by_current_client=False,
+            source="unverified-candidate",
         )
     config_path = codex_home / "config.toml"
     try:
@@ -192,6 +250,7 @@ def verify_isolated_picker_contract(
             "isolated config is not parseable",
             evidence,
             catalog.provider_id,
+            False,
         )
 
     provider_id = config.get("model_provider")
@@ -202,6 +261,7 @@ def verify_isolated_picker_contract(
             "isolated config must contain matching provider and model_catalog_json",
             evidence,
             catalog.provider_id,
+            False,
         )
     try:
         configured_catalog = json.loads(raw_catalog)
@@ -211,6 +271,7 @@ def verify_isolated_picker_contract(
             "model_catalog_json is not valid JSON",
             evidence,
             provider_id,
+            False,
         )
     if configured_catalog != catalog.to_mapping():
         return PickerContractResult(
@@ -218,29 +279,17 @@ def verify_isolated_picker_contract(
             "model_catalog_json does not match the candidate catalog",
             evidence,
             provider_id,
-        )
-    if not evidence.verified_by_current_client:
-        return PickerContractResult(
             False,
-            "current client picker schema evidence is unavailable",
-            evidence,
-            provider_id,
-        )
-    if (
-        evidence.schema_version != catalog.schema_version
-        or evidence.client_version != catalog.client_version
-    ):
-        return PickerContractResult(
-            False,
-            "client evidence does not match the candidate catalog",
-            evidence,
-            provider_id,
         )
     return PickerContractResult(
-        True,
-        "candidate matches supplied current-client picker evidence",
+        False,
+        (
+            "candidate matches in isolation; current-client evidence unavailable; "
+            "native picker remains UNVERIFIED"
+        ),
         evidence,
         provider_id,
+        True,
     )
 
 
@@ -249,6 +298,45 @@ def _required_text(payload: Mapping[str, object], field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise CatalogValidationError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _optional_text(payload: Mapping[str, object], field_name: str) -> str | None:
+    value = payload.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise CatalogValidationError(f"{field_name} must be a non-empty string or None")
+    return value
+
+
+def catalog_fingerprint(catalog: CatalogDocument) -> str:
+    canonical = json.dumps(
+        catalog.to_mapping(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_picker_verification(
+    catalog: CatalogDocument,
+    verification: PickerVerificationReceipt | None,
+) -> None:
+    if verification is None:
+        raise CatalogValidationError(
+            "cannot apply an UNVERIFIED catalog without current-client-artifact evidence"
+        )
+    if catalog.schema_version is None:
+        raise CatalogValidationError(
+            "cannot apply an UNVERIFIED catalog without an evidenced schema_version"
+        )
+    if verification.schema_version != catalog.schema_version:
+        raise CatalogValidationError("verification schema_version does not match the catalog")
+    if verification.client_version != catalog.client_version:
+        raise CatalogValidationError("verification client_version does not match the catalog")
+    if verification.catalog_sha256 != catalog_fingerprint(catalog):
+        raise CatalogValidationError("verification catalog hash does not match the catalog")
 
 
 def _route_from_record(raw_route: object) -> ModelRoute:

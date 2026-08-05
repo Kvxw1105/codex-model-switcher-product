@@ -4,6 +4,7 @@ import pytest
 
 from codex_model_switcher.catalog import (
     CatalogValidationError,
+    PickerContractResult,
     PickerSchemaEvidence,
     build_catalog_from_model_cache,
     load_catalog,
@@ -38,6 +39,8 @@ def test_catalog_generation_reads_client_version_from_model_cache(tmp_path) -> N
     catalog = build_catalog_from_model_cache(cache_path, [_route()])
 
     assert catalog["client_version"] == "9.9.9"
+    assert catalog["schema_version"] is None
+    assert catalog["verification_status"] == "UNVERIFIED"
     assert "0.147.0" not in json.dumps(catalog)
     assert catalog["models"][0]["id"] == "cms-example-chat"
 
@@ -97,7 +100,7 @@ def test_isolated_picker_contract_fails_without_current_client_evidence(tmp_path
     assert str(isolated_home) not in result.to_safe_dict().__repr__()
 
 
-def test_isolated_picker_contract_accepts_explicit_non_sensitive_evidence(tmp_path) -> None:
+def test_isolated_picker_contract_never_claims_native_pass_from_fixture_evidence(tmp_path) -> None:
     isolated_home = tmp_path / "isolated-codex-home"
     isolated_home.mkdir()
     catalog_path = tmp_path / "safe-picker.json"
@@ -117,17 +120,32 @@ def test_isolated_picker_contract_accepts_explicit_non_sensitive_evidence(tmp_pa
     evidence = PickerSchemaEvidence(
         schema_version="picker-v1",
         client_version="9.9.9",
-        verified_by_current_client=True,
+        source="fixture",
     )
     result = verify_isolated_picker_contract(isolated_home, catalog_path, evidence=evidence)
 
-    assert result.passed is True
+    assert result.passed is False
+    assert result.candidate_matches is True
+    assert result.status == "UNVERIFIED"
     assert result.to_safe_dict() == {
-        "passed": True,
+        "passed": False,
+        "status": "UNVERIFIED",
+        "candidate_matches": True,
         "schema_version": "picker-v1",
         "client_version": "9.9.9",
         "provider_id": "example-provider",
     }
+
+
+def test_picker_contract_result_cannot_be_constructed_as_native_pass() -> None:
+    evidence = PickerSchemaEvidence(
+        schema_version="picker-v1",
+        client_version="9.9.9",
+        source="fixture",
+    )
+
+    with pytest.raises(ValueError, match="UNVERIFIED"):
+        PickerContractResult(True, "fake", evidence, "example-provider", True)
 
 
 def _route_to_record() -> dict[str, object]:
