@@ -127,6 +127,72 @@ def _seed_semantically_invalid_source(
     return seed
 
 
+def _seed_v2_boundary_source(
+    path: Path, boundary: tuple[str, str, int]
+) -> sqlite3.Connection:
+    seed = sqlite3.connect(path)
+    seed.execute("PRAGMA journal_mode=WAL")
+    seed.execute("PRAGMA wal_autocheckpoint=0")
+    seed.executescript(
+        """
+        CREATE TABLE route_selections (
+            selection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codex_task_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            selected_at INTEGER NOT NULL
+        );
+        CREATE TABLE response_links (
+            local_response_id TEXT PRIMARY KEY,
+            upstream_response_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            codex_task_id TEXT,
+            expires_at INTEGER
+        );
+        CREATE TABLE context_fragments (
+            fragment_id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL,
+            ciphertext BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER
+        );
+        CREATE TABLE config_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            config_sha256 TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE cancel_handles (
+            handle_id TEXT PRIMARY KEY,
+            codex_task_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER
+        );
+        CREATE TABLE compact_boundaries (
+            codex_task_id TEXT PRIMARY KEY,
+            boundary_response_id TEXT NOT NULL,
+            boundary_created_at INTEGER NOT NULL
+        );
+        """
+    )
+    seed.execute("PRAGMA user_version = 2")
+    seed.execute(
+        "INSERT INTO response_links VALUES (?, ?, ?, ?, ?, ?)",
+        ("r-boundary", "u-boundary", "chat", 300, "task-1", None),
+    )
+    seed.execute(
+        "INSERT INTO compact_boundaries VALUES (?, ?, ?)",
+        boundary,
+    )
+    seed.execute(
+        "INSERT INTO config_receipts VALUES (?, ?, ?)",
+        ("receipt-1", "a" * 64, 300),
+    )
+    seed.commit()
+    return seed
+
+
 def test_new_database_uses_wal_and_current_schema(tmp_path, secret_key_provider) -> None:
     path = tmp_path / "state.sqlite3"
 
@@ -783,6 +849,60 @@ def test_v2_migration_interleaves_history_before_compact_prune(
     assert store.get_response_link("r-boundary") is not None
     assert store.get_chat_fragment("f-new") == "new"
     store.close()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        pytest.param(
+            ("task-1", "missing-response", 300), id="missing-response"
+        ),
+        pytest.param(("task-2", "r-boundary", 300), id="different-task"),
+        pytest.param(("task-1", "r-boundary", 301), id="created-at-mismatch"),
+    ],
+)
+def test_v2_compact_boundary_semantics_are_quarantined_before_writes(
+    tmp_path, secret_key_provider, monkeypatch, boundary
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    seed = _seed_v2_boundary_source(path, boundary)
+    try:
+        sidecars = {
+            "-wal": path.with_name(f"{path.name}-wal"),
+            "-shm": path.with_name(f"{path.name}-shm"),
+        }
+        assert all(sidecar.exists() for sidecar in sidecars.values())
+        evidence = {"": path.read_bytes()}
+        evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
+        connection_modes: list[str] = []
+        original_connect = state_module.sqlite3.connect
+
+        def record_connect(database, *args, **kwargs):
+            connection_modes.append(
+                "ro"
+                if kwargs.get("uri") and "?mode=ro" in str(database)
+                else "writable"
+            )
+            return original_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(state_module.sqlite3, "connect", record_connect)
+
+        with pytest.raises(DatabaseCorruptionError, match="compact boundary"):
+            StateStore(path, secret_key_provider)
+
+        assert connection_modes == ["ro"]
+        assert path.read_bytes() == evidence[""]
+        assert sidecars["-wal"].read_bytes() == evidence["-wal"]
+        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+        quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+        quarantine_main = next(
+            item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+        )
+        assert quarantine_main.read_bytes() == evidence[""]
+        assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+    finally:
+        seed.close()
 
 
 def test_incomplete_v3_schema_is_quarantined_before_first_write(

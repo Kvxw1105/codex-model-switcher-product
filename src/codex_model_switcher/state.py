@@ -604,6 +604,7 @@ class StateStore:
             connection, V2_SCHEMA_COLUMN_SPECS, "state database v2"
         )
         StateStore._validate_config_hashes(connection)
+        StateStore._validate_compact_boundary_references(connection)
 
     @staticmethod
     def _validate_declared_schema(
@@ -693,6 +694,33 @@ class StateStore:
                 )
 
     @staticmethod
+    def _validate_compact_boundary_references(connection: sqlite3.Connection) -> None:
+        for task_id, response_id, boundary_created_at in connection.execute(
+            "SELECT codex_task_id, boundary_response_id, boundary_created_at "
+            "FROM compact_boundaries"
+        ):
+            response = connection.execute(
+                "SELECT codex_task_id, created_at FROM response_links "
+                "WHERE local_response_id = ?",
+                (response_id,),
+            ).fetchone()
+            if response is None:
+                raise DatabaseSchemaError(
+                    "state database compact boundary response link is missing"
+                )
+            response_task_id, response_created_at = response
+            if response_task_id != task_id:
+                raise DatabaseSchemaError(
+                    "state database compact boundary response link task does not match "
+                    "the boundary task"
+                )
+            if response_created_at != boundary_created_at:
+                raise DatabaseSchemaError(
+                    "state database compact boundary created_at does not match "
+                    "the response link"
+                )
+
+    @staticmethod
     def _validate_event_state(connection: sqlite3.Connection) -> None:
         sequences: list[int] = []
         for table in ("response_links", "context_fragments"):
@@ -705,6 +733,7 @@ class StateStore:
         if len(sequences) != len(set(sequences)):
             raise DatabaseSchemaError("state database event sequence values must be unique")
 
+        StateStore._validate_compact_boundary_references(connection)
         for task_id, response_id, boundary_sequence in connection.execute(
             "SELECT codex_task_id, boundary_response_id, boundary_event_sequence "
             "FROM compact_boundaries"
