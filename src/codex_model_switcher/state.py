@@ -24,6 +24,9 @@ from .crypto import FernetCipher, SecretKeyProvider
 SCHEMA_VERSION = 3
 MAX_IDENTIFIER_LENGTH = 512
 MAX_CONTEXT_FRAGMENT_CHARS = 64 * 1024
+SNAPSHOT_COPY_ATTEMPTS = 4
+SNAPSHOT_COPY_DELAY_SECONDS = 0.01
+SQLITE_HEADER = b"SQLite format 3\x00"
 T = TypeVar("T")
 _DATABASE_INIT_LOCK = RLock()
 
@@ -34,6 +37,10 @@ class StateError(Exception):
 
 class DatabaseCorruptionError(StateError):
     """Raised when an existing database cannot be safely opened."""
+
+
+class DatabaseSnapshotError(DatabaseCorruptionError):
+    """Raised when a consistent database snapshot cannot be captured."""
 
 
 class UnsupportedSchemaError(StateError):
@@ -152,33 +159,62 @@ class StateStore:
                 ) from exc
 
     def _verify_existing_before_write(self) -> None:
-        connection: sqlite3.Connection | None = None
+        source: sqlite3.Connection | None = None
+        snapshot: sqlite3.Connection | None = None
         with TemporaryDirectory(prefix=".state-preflight-", dir=self.path.parent) as directory:
             snapshot_dir = Path(directory) / "snapshot"
             evidence_dir = Path(directory) / "evidence"
             snapshot_dir.mkdir()
             evidence_dir.mkdir()
-            self._copy_database_set(snapshot_dir)
-            self._copy_database_set(evidence_dir)
+            evidence_captured = False
             try:
+                self._copy_database_set(evidence_dir)
+                evidence_captured = True
+                with self.path.open("rb") as database_file:
+                    if database_file.read(len(SQLITE_HEADER)) != SQLITE_HEADER:
+                        raise DatabaseSnapshotError("state database header is invalid")
+                source = sqlite3.connect(
+                    self.path,
+                    timeout=30.0,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                source.execute("BEGIN")
                 snapshot_path = snapshot_dir / self.path.name
-                read_only_uri = f"{snapshot_path.as_uri()}?mode=ro"
-                connection = sqlite3.connect(read_only_uri, uri=True, timeout=30.0)
-                result = connection.execute("PRAGMA integrity_check").fetchone()
+                snapshot = sqlite3.connect(snapshot_path)
+                source.backup(snapshot, pages=0, sleep=SNAPSHOT_COPY_DELAY_SECONDS)
+                result = snapshot.execute("PRAGMA integrity_check").fetchone()
                 if not result or str(result[0]).lower() != "ok":
                     raise sqlite3.DatabaseError("state database integrity check failed")
-            except (OSError, sqlite3.DatabaseError) as exc:
-                if connection is not None:
-                    connection.close()
-                    connection = None
+                snapshot.close()
+                snapshot = None
+                source.close()
+                source = None
+            except (OSError, sqlite3.Error, DatabaseSnapshotError) as original_error:
+                failure = original_error
+                if snapshot is not None:
+                    snapshot.close()
+                    snapshot = None
+                if source is not None:
+                    with suppress(sqlite3.Error):
+                        source.rollback()
+                    source.close()
+                    source = None
+                if not evidence_captured:
+                    try:
+                        self._copy_database_set(evidence_dir)
+                    except DatabaseSnapshotError as evidence_error:
+                        failure = evidence_error
                 quarantine = self._quarantine_existing(evidence_dir)
                 raise DatabaseCorruptionError(
-                    "existing state database failed read-only integrity checks; "
+                    "existing state database snapshot failed; "
                     f"quarantined as {quarantine.name}"
-                ) from exc
+                ) from failure
             finally:
-                if connection is not None:
-                    connection.close()
+                if snapshot is not None:
+                    snapshot.close()
+                if source is not None:
+                    source.close()
 
     def _copy_database_set(self, destination: Path) -> None:
         for sidecar_suffix in ("", "-wal", "-shm"):
@@ -186,11 +222,30 @@ class StateStore:
                 f"{self.path.name}{sidecar_suffix}"
             )
             if source.exists():
-                try:
-                    shutil.copy2(source, destination / source.name)
-                except FileNotFoundError:
-                    # SQLite may remove a transient sidecar between stat and copy.
-                    continue
+                self._copy_file_with_retry(source, destination / source.name)
+
+    @staticmethod
+    def _copy_file_with_retry(source: Path, destination: Path) -> None:
+        for attempt in range(SNAPSHOT_COPY_ATTEMPTS):
+            try:
+                shutil.copy2(source, destination)
+                return
+            except PermissionError as exc:
+                if attempt + 1 == SNAPSHOT_COPY_ATTEMPTS:
+                    raise DatabaseSnapshotError(
+                        f"snapshot copy failed after retries for {source.name}"
+                    ) from exc
+                time.sleep(SNAPSHOT_COPY_DELAY_SECONDS * (attempt + 1))
+            except FileNotFoundError as exc:
+                if source.name.endswith(("-wal", "-shm")) and not source.exists():
+                    return
+                raise DatabaseSnapshotError(
+                    f"snapshot source disappeared for {source.name}"
+                ) from exc
+            except OSError as exc:
+                raise DatabaseSnapshotError(
+                    f"snapshot copy failed for {source.name}"
+                ) from exc
 
     def _configure_connection(self) -> None:
         connection = self._require_connection()
@@ -841,7 +896,7 @@ class StateStore:
             )
             if source.exists():
                 target = quarantine.with_name(f"{quarantine.name}{sidecar_suffix}")
-                shutil.copy2(source, target)
+                self._copy_file_with_retry(source, target)
         return quarantine
 
     def __enter__(self) -> StateStore:

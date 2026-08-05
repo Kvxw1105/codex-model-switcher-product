@@ -1,10 +1,12 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
+from threading import Event, Thread
 
 import pytest
 from cryptography.fernet import Fernet
 
+from codex_model_switcher import state as state_module
 from codex_model_switcher.state import (
     DatabaseCorruptionError,
     StateStore,
@@ -246,6 +248,115 @@ def test_corrupt_wal_is_quarantined_with_the_matching_database_set(
         assert quarantine_shm.stat().st_size == len(shm_before)
     finally:
         seed.close()
+
+
+def test_reopen_retries_transient_wal_copy_permission_error_during_writer(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    initial = StateStore(path, secret_key_provider)
+    initial.link_response("local-1", "upstream-1", route_id="chat")
+    initial.close()
+
+    seed = sqlite3.connect(path)
+    try:
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("PRAGMA wal_autocheckpoint=0")
+        seed.execute("CREATE TABLE writer_marker (value BLOB NOT NULL)")
+        seed.commit()
+        seed.execute("INSERT INTO writer_marker VALUES (?)", (b"x" * 100_000,))
+        seed.commit()
+
+        original_copy2 = state_module.shutil.copy2
+        failures = 0
+
+        def flaky_copy2(source, destination, *args, **kwargs):
+            nonlocal failures
+            if str(source).endswith("-wal") and failures < 2:
+                failures += 1
+                raise PermissionError(33, "sharing violation", str(source))
+            return original_copy2(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(state_module.shutil, "copy2", flaky_copy2)
+
+        reopened = StateStore(path, secret_key_provider)
+        assert reopened.get_response_link("local-1").upstream_id == "upstream-1"
+        reopened.close()
+        assert failures == 2
+    finally:
+        seed.close()
+
+
+def test_reopen_captures_wal_snapshot_during_concurrent_writer(
+    tmp_path, secret_key_provider
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    initial = StateStore(path, secret_key_provider)
+    initial.link_response("local-1", "upstream-1", route_id="chat")
+    initial.close()
+
+    writer_started = Event()
+    stop_writer = Event()
+    writer_errors: list[BaseException] = []
+
+    def write_wal_rows() -> None:
+        writer = sqlite3.connect(path, timeout=30.0)
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE writer_marker (value BLOB NOT NULL)")
+            writer.commit()
+            for _index in range(100):
+                if stop_writer.is_set():
+                    break
+                writer.execute("INSERT INTO writer_marker VALUES (?)", (b"writer",))
+                writer.commit()
+                writer_started.set()
+                stop_writer.wait(0.005)
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            writer_errors.append(exc)
+        finally:
+            writer.close()
+
+    writer_thread = Thread(target=write_wal_rows)
+    writer_thread.start()
+    assert writer_started.wait(5)
+
+    try:
+        reopened = StateStore(path, secret_key_provider)
+        assert reopened.get_response_link("local-1").upstream_id == "upstream-1"
+        reopened.close()
+    finally:
+        stop_writer.set()
+        writer_thread.join(5)
+        assert not writer_thread.is_alive()
+        assert not writer_errors
+
+
+def test_persistent_wal_snapshot_permission_error_is_explicit_and_quarantined(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    path.write_bytes(b"not a sqlite database")
+    wal_path = path.with_name(f"{path.name}-wal")
+    wal_path.write_bytes(b"wal evidence")
+
+    original_copy2 = state_module.shutil.copy2
+
+    def always_fail_wal(source, destination, *args, **kwargs):
+        if str(source).endswith("-wal"):
+            raise PermissionError(33, "sharing violation", str(source))
+        return original_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(state_module.shutil, "copy2", always_fail_wal)
+
+    with pytest.raises(DatabaseCorruptionError, match="snapshot"):
+        StateStore(path, secret_key_provider)
+
+    quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    assert any(not item.name.endswith(("-wal", "-shm")) for item in quarantine_files)
+    assert path.read_bytes() == b"not a sqlite database"
+    assert wal_path.read_bytes() == b"wal evidence"
 
 
 def test_concurrent_stores_can_commit_without_losing_links(tmp_path, secret_key_provider) -> None:
