@@ -12,7 +12,8 @@
 - `render_managed_config` 与 `apply_managed_config` 只接受由模块内部可信流程登记的 opaque writer capability；验证同时要求 receipt 对象本身的 `id` 命中私有 identity registry、registry 的 `weakref.ref(receipt) is receipt`，并校验 registry 封存字段与候选 catalog SHA-256。`PickerVerificationReceipt` 没有 public/protected 构造器、`_from_verifier` 或 `issue_receipt` 路径；当前没有真实 receipt 时 render/apply 必须拒绝。
 - `TrustedPickerVerifier` 只是未来真实外部 verifier 的证据读取抽象，本项目没有 concrete implementation，也不接受调用方注入 `evidence_provider`，更不会从 untrusted subclass/provider 生成 receipt。私有 registry 不是当前客户端证据，且不向 caller 暴露 registry/seal。
 - 受管区块 start/end marker 必须各自独占完整行且恰好一对；marker 出现在用户注释、TOML 字符串、嵌入文本或重复区块时直接拒绝替换。
-- apply 会在首次读取、当前 hash 检查、备份、临时文件写入和最终替换期间同时持有同路径临界区。Windows 通过目标文件的 `CreateFileW` + `LockFileEx` 全文件排他锁阻止普通外部写入和替换，并在该句柄仍持有时用 `ReplaceFileW` 原子替换；替换后先对新目标重新加锁并校验写入字节，再释放旧 inode 的句柄，避免替换后的交接窗口。最终 CAS 复用持锁句柄读取的字节。成功 apply 才创建包含写前字节和时间戳的原子备份，receipt 保存写前/写后 SHA-256。
+- apply 会在首次读取、当前 hash 检查、备份、临时文件写入和最终替换期间同时持有同路径临界区。Windows 用 `CreateFileW(FILE_FLAG_OPEN_REQUIRING_OPLOCK)` 在打开目标时取得 OS 级 namespace 保护，并用 `LockFileEx` 做协作进程内的全文件锁；单独的 `LockFileEx` 不被当作跨进程 rename 防线。替换使用 TxF：在同一 `CreateTransaction` 中把旧目标移到临时 shadow、建立新临时文件到目标的硬链接、删除两个临时名字，并用 `CreateFileTransactedW` 预先打开带 `share read/write`（拒绝 `DELETE/RENAME`）的新目标句柄，随后才 `CommitTransaction`。提交返回时新句柄已经存在，因此没有 `ReplaceFileW` 返回到 relock 的路径窗口；TxF/相关 API 不可用时 fail-closed，不回退到普通 `os.replace`。成功 apply 才创建包含写前字节和时间戳的原子备份，receipt 保存写前/写后 SHA-256。
+- 上述 Windows 强保证限定在支持这些 API 语义的本地文件系统；网络盘或特殊文件系统若不能取得 oplock/事务能力会拒绝操作，不把降级路径宣称为全局保护。
 - 非 Windows 使用进程锁和同目录 sidecar `flock`，只保证遵守该协作锁的进程；不参与锁的外部编辑仍可能造成 TOCTOU，代码不会把该 fallback 宣称为全局防护。Windows 锁获取失败、锁定冲突或最终原子替换失败会拒绝操作。
 - restore 也在同一目标文件临界区内读取当前 hash、校验备份、写临时文件并替换；当前文件不是本项目最后一次写入的 hash 时拒绝，备份 hash 也必须匹配，恢复结果按字节保留原文件。
 

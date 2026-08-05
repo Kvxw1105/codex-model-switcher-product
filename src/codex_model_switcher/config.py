@@ -73,10 +73,13 @@ class _WindowsFileInfo(ctypes.Structure):
 class _PathLease:
     """Hold the path lock used for the complete read-to-replace transaction.
 
-    Windows locks the target file itself with a byte-range lock, so an editor
-    cannot write or replace the directory entry while ReplaceFileW is called.
-    Other platforms use a cooperative sidecar lock; the process lock remains
-    the only guarantee when an external editor does not participate there.
+    Windows obtains an open-requiring oplock as part of opening the target and
+    keeps a byte-range lock for in-process readers.  The replacement path
+    opens the new target handle inside the same TxF transaction before commit,
+    with delete sharing denied.  That handle already protects the new target
+    when the transaction commits; there is no old-handle/new-handle relock
+    window.  Other platforms use a cooperative sidecar lock; the process lock
+    remains the only guarantee when an external editor does not participate.
     """
 
     def __init__(self, path: Path, *, create: bool) -> None:
@@ -174,12 +177,15 @@ class _PathLease:
         disposition = 4 if self.create else 3  # OPEN_ALWAYS / OPEN_EXISTING
         handle = create_file(
             str(self.path),
-            0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
-            # ReplaceFileW needs delete sharing; LockFileEx supplies exclusion.
+            0x80000000,  # GENERIC_READ; the transaction needs no target write access
+            # The oplock is the OS-level namespace guard.  The transaction
+            # below uses the handle opened in its transaction view to take
+            # over protection of the committed target before the old handle
+            # is released.
             0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
             None,
             disposition,
-            0x00000080,  # FILE_ATTRIBUTE_NORMAL
+            0x00000080 | 0x00040000,  # NORMAL | FILE_FLAG_OPEN_REQUIRING_OPLOCK
             None,
         )
         invalid_handle = ctypes.c_void_p(-1).value
@@ -266,11 +272,25 @@ class _PathLease:
         finally:
             close_handle(current_handle)
 
-    def relock_after_replace(self, expected: bytes) -> None:
-        """Transfer the lock from the replaced inode to the new target inode."""
+    def replace_with_windows_transaction(
+        self,
+        temporary_path: Path,
+        target_path: Path,
+        expected: bytes,
+    ) -> None:
+        """Commit a protected Windows replacement without a path-lock gap.
+
+        The target handle is opened with ``FILE_FLAG_OPEN_REQUIRING_OPLOCK``
+        before this method is called.  The transaction moves the old target
+        into a private shadow name, creates the new target link, deletes both
+        private names, and opens the new target handle with delete sharing
+        denied *before* ``CommitTransaction``.  The handle therefore already
+        protects the committed target when the commit returns.
+        """
 
         if os.name != "nt" or self._handle is None or self._kernel32 is None:
-            return
+            raise ConfigError("Windows atomic replacement requires an active path lease")
+        self.assert_target(target_path)
         kernel32 = self._kernel32
         old_handle = self._handle
         old_overlapped = self._overlapped
@@ -288,69 +308,218 @@ class _PathLease:
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = [ctypes.c_void_p]
         close_handle.restype = ctypes.c_int
-        lock_file = kernel32.LockFileEx
-        lock_file.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.POINTER(_WindowsOverlapped),
-        ]
-        lock_file.restype = ctypes.c_int
-        new_handle = create_file(
-            str(self.path),
-            0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+        shadow_descriptor, shadow_name = tempfile.mkstemp(
+            prefix=f".{target_path.name}.shadow.",
+            suffix=".tmp",
+            dir=target_path.parent,
+        )
+        os.close(shadow_descriptor)
+        shadow_path = Path(shadow_name)
+        shadow_path.unlink(missing_ok=True)
+
+        source_handle = create_file(
+            str(temporary_path),
+            0x80000000,  # GENERIC_READ; Python fsync completed before this open
             0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
             None,
             3,  # OPEN_EXISTING
-            0x00000080,  # FILE_ATTRIBUTE_NORMAL
+            0x00000080 | 0x80000000 | 0x00040000,  # NORMAL | WRITE_THROUGH | oplock
             None,
         )
         invalid_handle = ctypes.c_void_p(-1).value
-        if new_handle in (None, invalid_handle):
+        if source_handle in (None, invalid_handle):
             error = ctypes.get_last_error()
-            raise ConfigError(f"unable to reopen replaced config for locking (error {error})")
+            shadow_path.unlink(missing_ok=True)
+            raise ConfigError(f"unable to open temporary config for locking (error {error})")
 
-        new_handle_int = int(new_handle)
-        new_overlapped = _WindowsOverlapped()
-        new_locked = False
+        source_handle_int = int(source_handle)
+        transaction = None
+        new_handle: int | None = None
+        committed = False
         try:
-            if not lock_file(
-                new_handle,
-                0x00000002 | 0x00000001,  # LOCKFILE_EXCLUSIVE_LOCK | FAIL_IMMEDIATELY
-                0,
-                0xFFFFFFFF,
-                0xFFFFFFFF,
-                ctypes.byref(new_overlapped),
+            if self._read_windows_handle(source_handle_int, kernel32) != expected:
+                raise ConfigChangedError(
+                    "temporary config changed before atomic replacement; refusing overwrite"
+                )
+
+            try:
+                transaction_api = ctypes.WinDLL("KtmW32", use_last_error=True)
+                create_transaction = transaction_api.CreateTransaction
+                create_transaction.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_wchar_p,
+                ]
+                create_transaction.restype = ctypes.c_void_p
+                move_file_transacted = kernel32.MoveFileTransactedW
+                move_file_transacted.argtypes = [
+                    ctypes.c_wchar_p,
+                    ctypes.c_wchar_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                ]
+                move_file_transacted.restype = ctypes.c_int
+                create_hard_link_transacted = kernel32.CreateHardLinkTransactedW
+                create_hard_link_transacted.argtypes = [
+                    ctypes.c_wchar_p,
+                    ctypes.c_wchar_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                ]
+                create_hard_link_transacted.restype = ctypes.c_int
+                delete_file_transacted = kernel32.DeleteFileTransactedW
+                delete_file_transacted.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p]
+                delete_file_transacted.restype = ctypes.c_int
+                create_file_transacted = kernel32.CreateFileTransactedW
+                create_file_transacted.argtypes = [
+                    ctypes.c_wchar_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_uint32,
+                    ctypes.c_void_p,
+                ]
+                create_file_transacted.restype = ctypes.c_void_p
+                commit_transaction = transaction_api.CommitTransaction
+                commit_transaction.argtypes = [ctypes.c_void_p]
+                commit_transaction.restype = ctypes.c_int
+                rollback_transaction = transaction_api.RollbackTransaction
+                rollback_transaction.argtypes = [ctypes.c_void_p]
+                rollback_transaction.restype = ctypes.c_int
+            except (AttributeError, OSError) as error:
+                raise ConfigError(
+                    "Windows transacted replacement is unavailable; refusing non-atomic apply"
+                ) from error
+
+            transaction = create_transaction(None, None, 0, 0, 0, 0, None)
+            if transaction in (None, invalid_handle):
+                error = ctypes.get_last_error()
+                raise ConfigError(f"unable to start Windows config transaction (error {error})")
+
+            transaction_handle = int(transaction)
+            if not move_file_transacted(
+                str(target_path),
+                str(shadow_path),
+                None,
+                None,
+                0x00000001 | 0x00000008,  # REPLACE_EXISTING | WRITE_THROUGH
+                transaction_handle,
             ):
                 error = ctypes.get_last_error()
-                raise ConfigError(f"unable to relock replaced config (error {error})")
-            new_locked = True
-            self._verify_windows_handle_path_identity(
-                new_handle_int,
-                create_file,
-                close_handle,
-            )
-            if self._read_windows_handle(new_handle_int, kernel32) != expected:
-                raise ConfigChangedError(
-                    "config changed during Windows replacement handoff; refusing overwrite"
+                if error in {5, 32, 33}:
+                    raise ConfigChangedError(
+                        "config became locked or changed during atomic replacement"
+                    )
+                raise ConfigError(f"unable to move config in Windows transaction (error {error})")
+
+            if not create_hard_link_transacted(
+                str(target_path),
+                str(temporary_path),
+                None,
+                transaction_handle,
+            ):
+                error = ctypes.get_last_error()
+                if error in {5, 32, 33}:
+                    raise ConfigChangedError(
+                        "config became locked or changed during atomic replacement"
+                    )
+                raise ConfigError(
+                    f"unable to create config link in Windows transaction (error {error})"
                 )
+
+            if not delete_file_transacted(str(temporary_path), transaction_handle):
+                error = ctypes.get_last_error()
+                if error in {5, 32, 33}:
+                    raise ConfigChangedError(
+                        "temporary config changed during atomic replacement"
+                    )
+                raise ConfigError(
+                    f"unable to remove temporary config in Windows transaction (error {error})"
+                )
+            if not delete_file_transacted(str(shadow_path), transaction_handle):
+                error = ctypes.get_last_error()
+                if error in {5, 32, 33}:
+                    raise ConfigChangedError(
+                        "config became locked during atomic replacement"
+                    )
+                raise ConfigError(
+                    f"unable to remove old config in Windows transaction (error {error})"
+                )
+
+            new_handle_value = create_file_transacted(
+                str(target_path),
+                0x80000000,  # GENERIC_READ
+                0x00000001 | 0x00000002,  # share read/write; deny DELETE/RENAME
+                None,
+                3,  # OPEN_EXISTING
+                0x00000080,  # FILE_ATTRIBUTE_NORMAL
+                None,
+                transaction_handle,
+                None,
+                0,
+                None,
+            )
+            if new_handle_value in (None, invalid_handle):
+                error = ctypes.get_last_error()
+                if error in {5, 32, 33}:
+                    raise ConfigChangedError(
+                        "config became locked during atomic replacement"
+                    )
+                raise ConfigError(
+                    f"unable to pre-open new config handle in Windows transaction (error {error})"
+                )
+            new_handle = int(new_handle_value)
+
+            if not _commit_windows_transaction(commit_transaction, transaction_handle):
+                error = ctypes.get_last_error()
+                raise ConfigError(f"unable to commit Windows config transaction (error {error})")
+            committed = True
+
+            # The share-denying handle was opened before commit.  Install it
+            # on the lease before releasing any pre-commit handles so every
+            # post-commit failure still leaves the target namespace guarded.
+            self._handle = new_handle
+            self._overlapped = None
+            self._locked = False
+            new_handle = None
+
+            source_close_ok = close_handle(source_handle_int)
+            source_close_code = ctypes.get_last_error() if not source_close_ok else None
+            source_handle = None
             old_error = self._release_windows_handle(kernel32, old_handle, old_overlapped)
+            if source_close_code is not None:
+                raise ConfigError(
+                    f"unable to release temporary Windows config handle (error {source_close_code})"
+                )
             if old_error is not None:
                 raise ConfigError(
                     f"unable to release previous Windows config lock (error {old_error})"
                 )
-            self._handle = new_handle_int
-            self._overlapped = new_overlapped
-            self._locked = True
-            new_handle = None
         finally:
+            if transaction is not None:
+                if not committed:
+                    try:
+                        rollback_transaction(int(transaction))
+                    except OSError:
+                        pass
+                close_handle(transaction)
             if new_handle is not None:
-                if new_locked:
-                    self._release_windows_handle(kernel32, new_handle_int, new_overlapped)
-                else:
-                    close_handle(new_handle)
+                close_handle(new_handle)
+            if source_handle is not None:
+                close_handle(source_handle)
+            if not committed:
+                shadow_path.unlink(missing_ok=True)
 
     def _release_windows(self, raise_on_error: bool) -> None:
         if self._handle is None or self._kernel32 is None:
@@ -370,26 +539,27 @@ class _PathLease:
         self,
         kernel32: object,
         handle: int,
-        overlapped: _WindowsOverlapped,
+        overlapped: _WindowsOverlapped | None,
     ) -> int | None:
         unlock_error: int | None = None
-        unlock_file = kernel32.UnlockFileEx
-        unlock_file.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.POINTER(_WindowsOverlapped),
-        ]
-        unlock_file.restype = ctypes.c_int
-        if not unlock_file(
-            handle,
-            0,
-            0xFFFFFFFF,
-            0xFFFFFFFF,
-            ctypes.byref(overlapped),
-        ):
-            unlock_error = ctypes.get_last_error()
+        if overlapped is not None:
+            unlock_file = kernel32.UnlockFileEx
+            unlock_file.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.POINTER(_WindowsOverlapped),
+            ]
+            unlock_file.restype = ctypes.c_int
+            if not unlock_file(
+                handle,
+                0,
+                0xFFFFFFFF,
+                0xFFFFFFFF,
+                ctypes.byref(overlapped),
+            ):
+                unlock_error = ctypes.get_last_error()
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = [ctypes.c_void_p]
         close_handle.restype = ctypes.c_int
@@ -669,6 +839,12 @@ def _atomic_write(
         temporary_path.unlink(missing_ok=True)
 
 
+def _commit_windows_transaction(commit_transaction, transaction_handle) -> bool:
+    """Keep the transaction linearization point independently testable."""
+
+    return bool(commit_transaction(transaction_handle))
+
+
 def _replace_temp_file(
     temporary_path: Path,
     target_path: Path,
@@ -680,36 +856,9 @@ def _replace_temp_file(
         os.replace(temporary_path, target_path)
         return
 
-    lease.assert_target(target_path)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    replace_file = kernel32.ReplaceFileW
-    replace_file.argtypes = [
-        ctypes.c_wchar_p,
-        ctypes.c_wchar_p,
-        ctypes.c_wchar_p,
-        ctypes.c_uint32,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
-    replace_file.restype = ctypes.c_int
-    if replace_file(
-        str(target_path),
-        str(temporary_path),
-        None,
-        0x00000001,  # REPLACEFILE_WRITE_THROUGH
-        None,
-        None,
-    ):
-        if expected is None:
-            raise ConfigError("atomic replacement needs expected bytes for a Windows lock handoff")
-        lease.relock_after_replace(expected)
-        return
-    error = ctypes.get_last_error()
-    if error in {5, 32, 33}:  # access denied / sharing violation / lock violation
-        raise ConfigChangedError(
-            "config became locked or changed during atomic replacement; refusing overwrite"
-        )
-    raise ConfigError(f"atomic Windows config replacement failed (error {error})")
+    if expected is None:
+        raise ConfigError("atomic replacement needs expected bytes for a Windows lock")
+    lease.replace_with_windows_transaction(temporary_path, target_path, expected)
 
 
 def _sha256(data: bytes) -> str:

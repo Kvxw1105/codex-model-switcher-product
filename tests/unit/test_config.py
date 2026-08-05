@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -46,6 +48,22 @@ def _safe_catalog() -> dict[str, object]:
             }
         ],
     }
+
+
+def _assert_child_replace_is_blocked(external_path, target_path) -> None:
+    probe = (
+        "import os, sys\n"
+        "try:\n"
+        "    os.replace(sys.argv[1], sys.argv[2])\n"
+        "except OSError:\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(1)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(external_path), str(target_path)],
+        check=False,
+    )
+    assert result.returncode == 0, "child os.replace crossed the protected rename boundary"
 
 
 def test_managed_block_replacement_round_trips_user_bytes() -> None:
@@ -135,7 +153,9 @@ def test_apply_restore_preserves_original_bytes_with_low_level_render_seam(
 ) -> None:
     import codex_model_switcher.config as config_module
 
-    config_path = tmp_path / "config.toml"
+    config_dir = tmp_path / "codex-home"
+    config_dir.mkdir()
+    config_path = config_dir / "config.toml"
     original = b"# keep bytes\r\nmodel = \"original\"\r\n"
     config_path.write_bytes(original)
     catalog_path = tmp_path / "candidate.json"
@@ -210,7 +230,9 @@ def test_windows_apply_lock_blocks_external_replace_probe(tmp_path, monkeypatch)
 
     import codex_model_switcher.config as config_module
 
-    config_path = tmp_path / "config.toml"
+    config_dir = tmp_path / "codex-home"
+    config_dir.mkdir()
+    config_path = config_dir / "config.toml"
     config_path.write_bytes(b'model = "original"\n')
     catalog_path = tmp_path / "candidate.json"
     external_path = tmp_path / "external.toml"
@@ -234,12 +256,8 @@ def test_windows_apply_lock_blocks_external_replace_probe(tmp_path, monkeypatch)
     def probe_external_replace(temporary_path, target_path, *, lease=None, expected=None):
         if target_path.resolve() == config_path.resolve():
             external_path.write_bytes(b"user-edit\n")
-            try:
-                os.replace(external_path, target_path)
-            except OSError:
-                blocked.append("before")
-            else:
-                raise AssertionError("external replacement bypassed the Windows file lock")
+            _assert_child_replace_is_blocked(external_path, target_path)
+            blocked.append("before")
         result = real_replace_temp_file(
             temporary_path,
             target_path,
@@ -248,12 +266,8 @@ def test_windows_apply_lock_blocks_external_replace_probe(tmp_path, monkeypatch)
         )
         if target_path.resolve() == config_path.resolve():
             external_path.write_bytes(b"user-edit-after-replace\n")
-            try:
-                os.replace(external_path, target_path)
-            except OSError:
-                blocked.append("after")
-            else:
-                raise AssertionError("external replacement bypassed the post-replace lock")
+            _assert_child_replace_is_blocked(external_path, target_path)
+            blocked.append("after")
         return result
 
     monkeypatch.setattr(config_module, "_replace_temp_file", probe_external_replace)
@@ -264,13 +278,58 @@ def test_windows_apply_lock_blocks_external_replace_probe(tmp_path, monkeypatch)
     assert b'model_provider = "example-provider"' in config_path.read_bytes()
 
 
+def test_windows_transaction_commit_handoff_blocks_external_replace(
+    tmp_path, monkeypatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("the OS-level replacement probe is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_dir = tmp_path / "codex-home"
+    config_dir.mkdir()
+    config_path = config_dir / "config.toml"
+    config_path.write_bytes(b"old\n")
+    temporary_path = config_dir / ".candidate.tmp"
+    temporary_path.write_bytes(b"new\n")
+    external_path = tmp_path / "external.toml"
+    original_commit = config_module._commit_windows_transaction
+    handoff_checked: list[bool] = []
+
+    def commit_then_probe(commit_transaction, transaction_handle):
+        committed = original_commit(commit_transaction, transaction_handle)
+        external_path.write_bytes(b"user-edit-at-commit\n")
+        _assert_child_replace_is_blocked(external_path, config_path)
+        handoff_checked.append(committed)
+        return committed
+
+    monkeypatch.setattr(
+        config_module,
+        "_commit_windows_transaction",
+        commit_then_probe,
+    )
+
+    with config_module._exclusive_path_lock(config_path, create=False) as lease:
+        config_module._replace_temp_file(
+            temporary_path,
+            config_path,
+            lease=lease,
+            expected=b"new\n",
+        )
+
+    assert handoff_checked == [True]
+    assert config_path.read_bytes() == b"new\n"
+
+
 def test_windows_restore_lock_blocks_external_replace_probe(tmp_path, monkeypatch) -> None:
     if os.name != "nt":
         pytest.skip("the OS-level replacement probe is Windows-specific")
 
     import codex_model_switcher.config as config_module
 
-    config_path = tmp_path / "config.toml"
+    config_dir = tmp_path / "codex-home"
+    config_dir.mkdir()
+    config_path = config_dir / "config.toml"
     original = b'model = "original"\n'
     written = b'model = "managed"\n'
     config_path.write_bytes(written)
@@ -290,12 +349,8 @@ def test_windows_restore_lock_blocks_external_replace_probe(tmp_path, monkeypatc
     def probe_external_replace(temporary_path, target_path, *, lease=None, expected=None):
         if target_path.resolve() == config_path.resolve():
             external_path.write_bytes(b"user-edit\n")
-            try:
-                os.replace(external_path, target_path)
-            except OSError:
-                blocked.append("before")
-            else:
-                raise AssertionError("external replacement bypassed the Windows file lock")
+            _assert_child_replace_is_blocked(external_path, target_path)
+            blocked.append("before")
         result = real_replace_temp_file(
             temporary_path,
             target_path,
@@ -304,12 +359,8 @@ def test_windows_restore_lock_blocks_external_replace_probe(tmp_path, monkeypatc
         )
         if target_path.resolve() == config_path.resolve():
             external_path.write_bytes(b"user-edit-after-replace\n")
-            try:
-                os.replace(external_path, target_path)
-            except OSError:
-                blocked.append("after")
-            else:
-                raise AssertionError("external replacement bypassed the post-replace lock")
+            _assert_child_replace_is_blocked(external_path, target_path)
+            blocked.append("after")
         return result
 
     monkeypatch.setattr(config_module, "_replace_temp_file", probe_external_replace)
