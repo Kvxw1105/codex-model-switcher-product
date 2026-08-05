@@ -7,6 +7,7 @@ configuration receipts, and cancellation metadata needed by an adapter.
 
 from __future__ import annotations
 
+import re
 import shutil
 import sqlite3
 import time
@@ -14,12 +15,13 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import RLock
 from typing import Callable, TypeVar
 
 from .crypto import FernetCipher, SecretKeyProvider
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_IDENTIFIER_LENGTH = 512
 MAX_CONTEXT_FRAGMENT_CHARS = 64 * 1024
 T = TypeVar("T")
@@ -50,6 +52,7 @@ class ResponseLink:
     codex_task_id: str | None
     created_at: int
     expires_at: int | None
+    event_sequence: int
 
     @property
     def upstream_response_id(self) -> str:
@@ -115,6 +118,8 @@ class StateStore:
                     "existing state database is empty or not a file; "
                     f"quarantined as {quarantine.name}"
                 )
+            if existed:
+                self._verify_existing_before_write()
 
             self.path.parent.mkdir(parents=True, exist_ok=True)
             try:
@@ -134,16 +139,58 @@ class StateStore:
                 self.close()
                 raise
             except (OSError, sqlite3.DatabaseError) as exc:
-                self.close()
                 if existed:
                     quarantine = self._quarantine_existing()
+                    self.close()
                     raise DatabaseCorruptionError(
                         "existing state database failed integrity checks; "
                         f"quarantined as {quarantine.name}"
                     ) from exc
+                self.close()
                 raise DatabaseCorruptionError(
                     "new state database could not be initialized"
                 ) from exc
+
+    def _verify_existing_before_write(self) -> None:
+        connection: sqlite3.Connection | None = None
+        with TemporaryDirectory(prefix=".state-preflight-", dir=self.path.parent) as directory:
+            snapshot_dir = Path(directory) / "snapshot"
+            evidence_dir = Path(directory) / "evidence"
+            snapshot_dir.mkdir()
+            evidence_dir.mkdir()
+            self._copy_database_set(snapshot_dir)
+            self._copy_database_set(evidence_dir)
+            try:
+                snapshot_path = snapshot_dir / self.path.name
+                read_only_uri = f"{snapshot_path.as_uri()}?mode=ro"
+                connection = sqlite3.connect(read_only_uri, uri=True, timeout=30.0)
+                result = connection.execute("PRAGMA integrity_check").fetchone()
+                if not result or str(result[0]).lower() != "ok":
+                    raise sqlite3.DatabaseError("state database integrity check failed")
+            except (OSError, sqlite3.DatabaseError) as exc:
+                if connection is not None:
+                    connection.close()
+                    connection = None
+                quarantine = self._quarantine_existing(evidence_dir)
+                raise DatabaseCorruptionError(
+                    "existing state database failed read-only integrity checks; "
+                    f"quarantined as {quarantine.name}"
+                ) from exc
+            finally:
+                if connection is not None:
+                    connection.close()
+
+    def _copy_database_set(self, destination: Path) -> None:
+        for sidecar_suffix in ("", "-wal", "-shm"):
+            source = self.path if not sidecar_suffix else self.path.with_name(
+                f"{self.path.name}{sidecar_suffix}"
+            )
+            if source.exists():
+                try:
+                    shutil.copy2(source, destination / source.name)
+                except FileNotFoundError:
+                    # SQLite may remove a transient sidecar between stat and copy.
+                    continue
 
     def _configure_connection(self) -> None:
         connection = self._require_connection()
@@ -176,6 +223,9 @@ class StateStore:
                     elif version == 1:
                         self._migrate_one_to_two(connection)
                         version = 2
+                    elif version == 2:
+                        self._migrate_two_to_three(connection)
+                        version = 3
                     else:
                         raise UnsupportedSchemaError(f"unsupported state database schema {version}")
                     connection.execute(f"PRAGMA user_version = {version}")
@@ -299,6 +349,69 @@ class StateStore:
         )
 
     @staticmethod
+    def _migrate_two_to_three(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS event_counters (
+                counter_name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO event_counters (counter_name, value) VALUES ('state', 0)"
+        )
+        StateStore._add_column_if_missing(connection, "response_links", "event_sequence", "INTEGER")
+        StateStore._add_column_if_missing(
+            connection, "context_fragments", "event_sequence", "INTEGER"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS compact_boundaries (
+                codex_task_id TEXT PRIMARY KEY,
+                boundary_response_id TEXT NOT NULL,
+                boundary_created_at INTEGER NOT NULL
+            )
+            """
+        )
+        StateStore._add_column_if_missing(
+            connection, "compact_boundaries", "boundary_event_sequence", "INTEGER"
+        )
+        connection.execute(
+            "UPDATE response_links SET event_sequence = rowid WHERE event_sequence IS NULL"
+        )
+        response_max = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(event_sequence), 0) FROM response_links"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            """
+            UPDATE context_fragments
+            SET event_sequence = ? + rowid
+            WHERE event_sequence IS NULL
+            """,
+            (response_max,),
+        )
+        context_max = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(event_sequence), 0) FROM context_fragments"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "UPDATE event_counters SET value = ? WHERE counter_name = 'state'",
+            (max(response_max, context_max),),
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS response_links_event_order "
+            "ON response_links (codex_task_id, event_sequence)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS context_fragments_event_order "
+            "ON context_fragments (scope_id, event_sequence)"
+        )
+
+    @staticmethod
     def _add_column_if_missing(
         connection: sqlite3.Connection, table: str, column: str, definition: str
     ) -> None:
@@ -336,6 +449,19 @@ class StateStore:
                     connection.execute("ROLLBACK")
                 raise
 
+    @staticmethod
+    def _next_event_sequence(connection: sqlite3.Connection) -> int:
+        updated = connection.execute(
+            "UPDATE event_counters SET value = value + 1 WHERE counter_name = 'state'"
+        ).rowcount
+        if updated != 1:
+            raise StateError("state event counter is missing")
+        return int(
+            connection.execute(
+                "SELECT value FROM event_counters WHERE counter_name = 'state'"
+            ).fetchone()[0]
+        )
+
     def link_response(
         self,
         local_response_id: str,
@@ -357,18 +483,20 @@ class StateStore:
             raise TypeError("created_at must be an integer timestamp")
 
         def insert(connection: sqlite3.Connection) -> ResponseLink:
+            event_sequence = self._next_event_sequence(connection)
             connection.execute(
                 """
                 INSERT INTO response_links (
                     local_response_id, upstream_response_id, route_id,
-                    created_at, codex_task_id, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    created_at, codex_task_id, expires_at, event_sequence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(local_response_id) DO UPDATE SET
                     upstream_response_id = excluded.upstream_response_id,
                     route_id = excluded.route_id,
                     created_at = excluded.created_at,
                     codex_task_id = excluded.codex_task_id,
-                    expires_at = excluded.expires_at
+                    expires_at = excluded.expires_at,
+                    event_sequence = excluded.event_sequence
                 """,
                 (
                     local_response_id,
@@ -377,6 +505,7 @@ class StateStore:
                     created_at,
                     codex_task_id,
                     expires_at,
+                    event_sequence,
                 ),
             )
             return ResponseLink(
@@ -386,6 +515,7 @@ class StateStore:
                 codex_task_id,
                 created_at,
                 expires_at,
+                event_sequence,
             )
 
         return self._write(insert)
@@ -396,7 +526,7 @@ class StateStore:
             row = self._require_connection().execute(
                 """
                 SELECT local_response_id, upstream_response_id, route_id,
-                       codex_task_id, created_at, expires_at
+                       codex_task_id, created_at, expires_at, event_sequence
                 FROM response_links WHERE local_response_id = ?
                 """,
                 (local_response_id,),
@@ -422,6 +552,7 @@ class StateStore:
         selection = RouteSelection(codex_task_id, turn_id, route_id, selected_at)
 
         def insert(connection: sqlite3.Connection) -> RouteSelection:
+            self._next_event_sequence(connection)
             connection.execute(
                 """
                 INSERT INTO route_selections (codex_task_id, turn_id, route_id, selected_at)
@@ -455,6 +586,7 @@ class StateStore:
         text: str,
         *,
         expires_at: int | None = None,
+        created_at: int | None = None,
     ) -> None:
         scope_id = _identifier(scope_id, "scope_id")
         fragment_id = _identifier(fragment_id, "fragment_id")
@@ -463,21 +595,32 @@ class StateStore:
         if len(text) > MAX_CONTEXT_FRAGMENT_CHARS:
             raise ValueError("chat fragments exceed the maximum supported size")
         expires_at = _optional_expiry(expires_at)
+        if created_at is not None and not isinstance(created_at, int):
+            raise TypeError("created_at must be an integer timestamp")
         ciphertext = self._cipher.encrypt_text(text)
 
         def insert(connection: sqlite3.Connection) -> None:
+            event_sequence = self._next_event_sequence(connection)
             connection.execute(
                 """
                 INSERT INTO context_fragments (
-                    fragment_id, scope_id, ciphertext, created_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    fragment_id, scope_id, ciphertext, created_at, expires_at, event_sequence
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fragment_id) DO UPDATE SET
                     scope_id = excluded.scope_id,
                     ciphertext = excluded.ciphertext,
                     created_at = excluded.created_at,
-                    expires_at = excluded.expires_at
+                    expires_at = excluded.expires_at,
+                    event_sequence = excluded.event_sequence
                 """,
-                (fragment_id, scope_id, sqlite3.Binary(ciphertext), _timestamp(), expires_at),
+                (
+                    fragment_id,
+                    scope_id,
+                    sqlite3.Binary(ciphertext),
+                    _timestamp() if created_at is None else created_at,
+                    expires_at,
+                    event_sequence,
+                ),
             )
 
         self._write(insert)
@@ -497,17 +640,16 @@ class StateStore:
         receipt_id = _identifier(receipt_id, "receipt_id")
         if (
             not isinstance(config_sha256, str)
-            or not config_sha256
-            or len(config_sha256) > 128
-            or any(character.isspace() for character in config_sha256)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", config_sha256) is None
         ):
-            raise ValueError("config_sha256 must be a short digest receipt")
+            raise ValueError("config_sha256 must be exactly 64 hexadecimal characters")
         created_at = _timestamp() if created_at is None else created_at
         if not isinstance(created_at, int):
             raise TypeError("created_at must be an integer timestamp")
         receipt = ConfigReceipt(receipt_id, config_sha256, created_at)
 
         def insert(connection: sqlite3.Connection) -> ConfigReceipt:
+            self._next_event_sequence(connection)
             connection.execute(
                 """
                 INSERT INTO config_receipts (receipt_id, config_sha256, created_at)
@@ -551,6 +693,7 @@ class StateStore:
         metadata = CancelHandleMetadata(handle_id, codex_task_id, route_id, created_at, expires_at)
 
         def insert(connection: sqlite3.Connection) -> CancelHandleMetadata:
+            self._next_event_sequence(connection)
             connection.execute(
                 """
                 INSERT INTO cancel_handles (
@@ -603,7 +746,7 @@ class StateStore:
         def prune(connection: sqlite3.Connection) -> int:
             boundary = connection.execute(
                 """
-                SELECT rowid, created_at FROM response_links
+                SELECT created_at, event_sequence FROM response_links
                 WHERE local_response_id = ? AND codex_task_id = ?
                 """,
                 (boundary_response_id, codex_task_id),
@@ -611,49 +754,66 @@ class StateStore:
             if boundary is None:
                 raise StateNotFoundError("compact boundary response link was not found")
 
-            boundary_rowid, boundary_created_at = boundary
+            boundary_created_at, boundary_event_sequence = boundary
             connection.execute(
                 """
                 INSERT INTO compact_boundaries (
-                    codex_task_id, boundary_response_id, boundary_created_at
-                ) VALUES (?, ?, ?)
+                    codex_task_id, boundary_response_id, boundary_created_at,
+                    boundary_event_sequence
+                ) VALUES (?, ?, ?, ?)
                 ON CONFLICT(codex_task_id) DO UPDATE SET
                     boundary_response_id = excluded.boundary_response_id,
-                    boundary_created_at = excluded.boundary_created_at
+                    boundary_created_at = excluded.boundary_created_at,
+                    boundary_event_sequence = excluded.boundary_event_sequence
                 """,
-                (codex_task_id, boundary_response_id, boundary_created_at),
+                (
+                    codex_task_id,
+                    boundary_response_id,
+                    boundary_created_at,
+                    boundary_event_sequence,
+                ),
             )
             connection.execute(
                 """
                 UPDATE response_links
                 SET expires_at = ?
-                WHERE codex_task_id = ? AND rowid < ?
+                WHERE codex_task_id = ? AND event_sequence < ?
                   AND (expires_at IS NULL OR expires_at > ?)
                 """,
-                (boundary_created_at, codex_task_id, boundary_rowid, boundary_created_at),
+                (
+                    boundary_created_at,
+                    codex_task_id,
+                    boundary_event_sequence,
+                    boundary_created_at,
+                ),
             )
             removed_links = connection.execute(
                 """
                 DELETE FROM response_links
-                WHERE codex_task_id = ? AND rowid < ? AND expires_at <= ?
+                WHERE codex_task_id = ? AND event_sequence < ? AND expires_at <= ?
                 """,
-                (codex_task_id, boundary_rowid, boundary_created_at),
+                (codex_task_id, boundary_event_sequence, boundary_created_at),
             ).rowcount
             connection.execute(
                 """
                 UPDATE context_fragments
                 SET expires_at = ?
-                WHERE scope_id = ? AND created_at < ?
+                WHERE scope_id = ? AND event_sequence < ?
                   AND (expires_at IS NULL OR expires_at > ?)
                 """,
-                (boundary_created_at, codex_task_id, boundary_created_at, boundary_created_at),
+                (
+                    boundary_created_at,
+                    codex_task_id,
+                    boundary_event_sequence,
+                    boundary_created_at,
+                ),
             )
             removed_fragments = connection.execute(
                 """
                 DELETE FROM context_fragments
-                WHERE scope_id = ? AND created_at < ? AND expires_at <= ?
+                WHERE scope_id = ? AND event_sequence < ? AND expires_at <= ?
                 """,
-                (codex_task_id, boundary_created_at, boundary_created_at),
+                (codex_task_id, boundary_event_sequence, boundary_created_at),
             ).rowcount
             return removed_links + removed_fragments
 
@@ -667,14 +827,21 @@ class StateStore:
                 self._connection.close()
                 self._connection = None
 
-    def _quarantine_existing(self) -> Path:
+    def _quarantine_existing(self, source_directory: Path | None = None) -> Path:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         quarantine = self.path.with_name(f"{self.path.name}.quarantine-{timestamp}")
         suffix = 1
         while quarantine.exists():
             quarantine = self.path.with_name(f"{self.path.name}.quarantine-{timestamp}-{suffix}")
             suffix += 1
-        shutil.copy2(self.path, quarantine)
+        source_base = self.path if source_directory is None else source_directory / self.path.name
+        for sidecar_suffix in ("", "-wal", "-shm"):
+            source = source_base if not sidecar_suffix else source_base.with_name(
+                f"{source_base.name}{sidecar_suffix}"
+            )
+            if source.exists():
+                target = quarantine.with_name(f"{quarantine.name}{sidecar_suffix}")
+                shutil.copy2(source, target)
         return quarantine
 
     def __enter__(self) -> StateStore:

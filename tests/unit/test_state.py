@@ -29,7 +29,7 @@ def test_new_database_uses_wal_and_current_schema(tmp_path, secret_key_provider)
 
     store = StateStore(path, secret_key_provider)
 
-    assert store.schema_version == 2
+    assert store.schema_version == 3
     assert store.journal_mode == "wal"
     store.close()
 
@@ -43,6 +43,20 @@ def test_response_link_survives_process_reopen(tmp_path, secret_key_provider) ->
     second = StateStore(path, secret_key_provider)
     assert second.get_response_link("local-1").upstream_id == "upstream-7"
     assert second.get_response_link("local-1").route_id == "deepseek"
+    second.close()
+
+
+def test_event_sequence_survives_process_reopen(tmp_path, secret_key_provider) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = StateStore(path, secret_key_provider)
+    first_link = first.link_response("local-1", "upstream-1", route_id="chat")
+    first.close()
+
+    second = StateStore(path, secret_key_provider)
+    second_link = second.link_response("local-2", "upstream-2", route_id="chat")
+
+    assert second_link.event_sequence > first_link.event_sequence
+    assert second.get_response_link("local-2").event_sequence == second_link.event_sequence
     second.close()
 
 
@@ -66,7 +80,7 @@ def test_migration_preserves_v1_response_link(tmp_path, secret_key_provider) -> 
 
     store = StateStore(path, secret_key_provider)
 
-    assert store.schema_version == 2
+    assert store.schema_version == 3
     assert store.get_response_link("old-local").upstream_id == "old-upstream"
     store.close()
 
@@ -110,6 +124,38 @@ def test_compact_prune_removes_only_old_chain_and_keeps_boundary(
     store.close()
 
 
+def test_compact_prune_uses_event_order_when_timestamps_are_equal(
+    tmp_path, secret_key_provider
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, secret_key_provider)
+    store.link_response(
+        "local-old", "upstream-old", route_id="chat", codex_task_id="task-1", created_at=100
+    )
+    store.save_chat_fragment(
+        "task-1", "fragment-old", "old continuation fragment", created_at=100
+    )
+    store.link_response(
+        "local-boundary",
+        "upstream-boundary",
+        route_id="chat",
+        codex_task_id="task-1",
+        created_at=100,
+    )
+    store.save_chat_fragment(
+        "task-1", "fragment-boundary", "boundary continuation fragment", created_at=100
+    )
+
+    removed = store.prune_after_compact("task-1", "local-boundary")
+
+    assert removed == 2
+    assert store.get_response_link("local-old") is None
+    assert store.get_chat_fragment("fragment-old") is None
+    assert store.get_response_link("local-boundary").upstream_id == "upstream-boundary"
+    assert store.get_chat_fragment("fragment-boundary") == "boundary continuation fragment"
+    store.close()
+
+
 def test_expired_mapping_cleanup_is_transactional_and_scoped(tmp_path, secret_key_provider) -> None:
     path = tmp_path / "state.sqlite3"
     store = StateStore(path, secret_key_provider)
@@ -126,16 +172,80 @@ def test_expired_mapping_cleanup_is_transactional_and_scoped(tmp_path, secret_ke
     store.close()
 
 
-def test_corrupt_database_is_quarantined_and_not_recreated(tmp_path, secret_key_provider) -> None:
+def test_corrupt_database_is_quarantined_with_wal_sidecars_before_writes(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
     path = tmp_path / "state.sqlite3"
     path.write_bytes(b"not a sqlite database")
+    wal_path = path.with_name(f"{path.name}-wal")
+    shm_path = path.with_name(f"{path.name}-shm")
+    wal_path.write_bytes(b"wal evidence")
+    shm_path.write_bytes(b"shm evidence")
+
+    def unexpected_write_pragma(_store) -> None:
+        pytest.fail("corruption must be checked before the writable connection is configured")
+
+    monkeypatch.setattr(StateStore, "_configure_connection", unexpected_write_pragma)
 
     with pytest.raises(DatabaseCorruptionError):
         StateStore(path, secret_key_provider)
 
     quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
-    assert len(quarantine_files) == 1
+    assert len(quarantine_files) == 3
+    quarantine_main = next(
+        item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+    )
+    quarantine_wal = tmp_path / f"{quarantine_main.name}-wal"
+    quarantine_shm = tmp_path / f"{quarantine_main.name}-shm"
+    assert quarantine_wal.read_bytes() == b"wal evidence"
+    assert quarantine_shm.read_bytes() == b"shm evidence"
+    assert quarantine_main.read_bytes() == b"not a sqlite database"
     assert path.read_bytes() == b"not a sqlite database"
+    assert wal_path.read_bytes() == b"wal evidence"
+    assert shm_path.read_bytes() == b"shm evidence"
+
+
+def test_corrupt_wal_is_quarantined_with_the_matching_database_set(
+    tmp_path, secret_key_provider
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    seed = sqlite3.connect(path)
+    try:
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("PRAGMA wal_autocheckpoint=0")
+        seed.execute("CREATE TABLE marker (value BLOB NOT NULL)")
+        seed.commit()
+        seed.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        seed.execute("INSERT INTO marker VALUES (?)", (b"x" * 100_000,))
+        seed.commit()
+
+        wal_path = path.with_name(f"{path.name}-wal")
+        shm_path = path.with_name(f"{path.name}-shm")
+        main_before = path.read_bytes()
+        shm_before = shm_path.read_bytes()
+        wal_bytes = bytearray(wal_path.read_bytes())
+        page_size = int.from_bytes(wal_bytes[8:12], "big")
+        frame_size = 24 + page_size
+        frame_count = (len(wal_bytes) - 32) // frame_size
+        last_frame = 32 + (frame_count - 1) * frame_size
+        wal_bytes[last_frame + 24] ^= 0xFF
+        wal_path.write_bytes(wal_bytes)
+        corrupted_wal = bytes(wal_bytes)
+
+        with pytest.raises(DatabaseCorruptionError):
+            StateStore(path, secret_key_provider)
+
+        quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+        quarantine_main = next(
+            item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+        )
+        assert quarantine_main.read_bytes() == main_before
+        assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == corrupted_wal
+        quarantine_shm = tmp_path / f"{quarantine_main.name}-shm"
+        assert quarantine_shm.exists()
+        assert quarantine_shm.stat().st_size == len(shm_before)
+    finally:
+        seed.close()
 
 
 def test_concurrent_stores_can_commit_without_losing_links(tmp_path, secret_key_provider) -> None:
@@ -174,4 +284,25 @@ def test_receipts_and_cancel_handles_store_metadata_only(tmp_path, secret_key_pr
     assert store.get_config_receipt("receipt-1").config_sha256 == digest
     assert store.get_cancel_handle("cancel-1").codex_task_id == "task-1"
     assert store.get_cancel_handle("cancel-1").route_id == "chat"
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "invalid_digest",
+    [
+        "token-like-value",
+        "a" * 63,
+        "g" * 64,
+        "a" * 65,
+        Fernet.generate_key().decode("ascii"),
+    ],
+)
+def test_config_receipt_rejects_non_sha256_values(
+    tmp_path, secret_key_provider, invalid_digest
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3", secret_key_provider)
+
+    with pytest.raises(ValueError):
+        store.save_config_receipt("receipt-invalid", invalid_digest)
+
     store.close()
