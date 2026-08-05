@@ -166,9 +166,9 @@ RouteConfig = RouteTarget
 class DeepSeekContract:
     provider_id: str = "deepseek"
     upstream_model: str = "deepseek-v4-flash"
-    # DeepSeek's documented upstream surface is Chat Completions.  Responses
-    # requests are converted by the local router when Codex faces Responses.
-    wire_api: WireApi = "chat"
+    # Live evidence confirms DeepSeek's official Responses surface for this
+    # low-price model; Responses requests stay on the native wire contract.
+    wire_api: WireApi = "responses"
     base_url: str = "https://api.deepseek.com"
 
 
@@ -183,7 +183,7 @@ def default_deepseek_target(
     *,
     allowed_hosts: Iterable[str] = ("api.deepseek.com",),
 ) -> RouteTarget:
-    """Build the documented DeepSeek Chat Completions target.
+    """Build the confirmed DeepSeek Responses target.
 
     The credential remains external to this object and must be resolved from
     ``CredentialStore`` by the Router.
@@ -201,7 +201,7 @@ def default_deepseek_target(
         base_url=contract.base_url,
         allowed_hosts=frozenset(allowed_hosts),
         wire_api=contract.wire_api,
-        request_path="/chat/completions",
+        request_path="/responses",
     )
 
 

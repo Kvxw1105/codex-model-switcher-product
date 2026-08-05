@@ -9,7 +9,7 @@ from codex_model_switcher.catalog import CatalogDocument
 from codex_model_switcher.credentials import CredentialNotConfiguredError
 from codex_model_switcher.models import ModelCapability, ModelRoute
 from codex_model_switcher.router import Router, RouterRequest
-from codex_model_switcher.routing import RouteTarget
+from codex_model_switcher.routing import RouteTarget, default_deepseek_target
 from codex_model_switcher.upstream import UpstreamClient
 
 
@@ -152,6 +152,65 @@ def test_third_party_request_never_forwards_inbound_chatgpt_identity() -> None:
         assert response.status_code == 200
         assert transport.requests[0].headers["authorization"] == "Bearer deepseek-fixture"
         assert "cookie" not in transport.requests[0].headers
+        await client.aclose()
+
+    asyncio.run(run())
+
+
+def test_default_deepseek_responses_request_preserves_unknown_fields_and_items() -> None:
+    async def run() -> None:
+        bodies: list[dict[str, object]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads((await request.aread()).decode("utf-8")))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "deepseek-r1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [],
+                },
+            )
+
+        deepseek = route(
+            "deepseek-model",
+            lane="third_party",
+            provider_id="deepseek",
+            upstream_model="deepseek-v4-flash",
+        )
+        target = default_deepseek_target(
+            deepseek,
+            allowed_hosts={"api.deepseek.com"},
+        )
+        transport = RecordingTransport(handler)
+        client = UpstreamClient(transport=transport)
+        router = Router(
+            CatalogDocument("test-v1", "fixture", "fixture", (deepseek,)),
+            targets={deepseek.model_id: target},
+            credential_store=MemoryCredentials({"deepseek": "deepseek-fixture"}),
+            upstream_client=client,
+        )
+        payload = {
+            "input": [
+                {"type": "input_text", "text": "hello"},
+                {"type": "future_item", "opaque": {"keep": True}},
+            ],
+            "future_field": {"keep": [1, 2, 3]},
+            "store": False,
+        }
+
+        response = await router.handle(
+            RouterRequest(
+                "deepseek-model",
+                payload,
+                "task-fixture",
+                "turn-responses-preserve",
+            )
+        )
+
+        assert response.status_code == 200
+        assert bodies == [{**payload, "model": "deepseek-v4-flash"}]
         await client.aclose()
 
     asyncio.run(run())

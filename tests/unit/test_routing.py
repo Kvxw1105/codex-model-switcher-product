@@ -73,16 +73,16 @@ def test_official_target_rejects_a_host_outside_the_explicit_allowlist() -> None
     assert caught.value.to_dict()["error"]["type"] == "host_not_allowed"
 
 
-def test_default_deepseek_contract_uses_the_confirmed_third_party_values() -> None:
+def test_default_deepseek_contract_uses_the_confirmed_responses_values() -> None:
     contract = default_deepseek_contract()
 
     assert contract.provider_id == "deepseek"
     assert contract.upstream_model == "deepseek-v4-flash"
-    assert contract.wire_api == "chat"
+    assert contract.wire_api == "responses"
     assert contract.base_url == "https://api.deepseek.com"
 
 
-def test_default_deepseek_target_is_chat_completions_only() -> None:
+def test_default_deepseek_target_is_responses_only() -> None:
     deepseek_route = route(
         "deepseek-model",
         lane="third_party",
@@ -95,5 +95,5 @@ def test_default_deepseek_target_is_chat_completions_only() -> None:
         allowed_hosts={"api.deepseek.com"},
     )
 
-    assert target.wire_api == "chat"
-    assert target.endpoint == "https://api.deepseek.com/chat/completions"
+    assert target.wire_api == "responses"
+    assert target.endpoint == "https://api.deepseek.com/responses"
