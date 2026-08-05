@@ -254,10 +254,56 @@ def test_third_party_headers_strip_inbound_auth_and_inject_only_provider_credent
     )
 
     assert_secret_equal(headers["Authorization"], f"Bearer {provider_secret}")
-    assert_secret_equal(headers["X-Client-Version"], "client-1")
+    assert "X-Client-Version" not in headers
     assert "cookie" not in {name.lower() for name in headers}
     assert "openai-organization" not in {name.lower() for name in headers}
     assert "x-chatgpt-account-id" not in {name.lower() for name in headers}
+    assert_secret_absent(headers, inbound_secret)
+
+
+@pytest.mark.parametrize(
+    "header_name",
+    [
+        "Authorization",
+        "authorization",
+        "COOKIE",
+        "Cookie",
+        "Api-Key",
+        "api_key",
+        "Access-Token",
+        "access_token",
+        "Refresh-Token",
+        "refresh_token",
+        "Account-Id",
+        "account_id",
+        "Account-Email",
+        "account_email",
+        "X-Account-Name",
+        "x_account_name",
+        "OpenAI-Organization",
+        "openai_organization",
+        "ChatGPT-Account-Id",
+        "chatgpt_account_id",
+    ],
+)
+def test_third_party_headers_allowlist_drops_identity_and_credential_variants(
+    header_name: str,
+) -> None:
+    inbound_secret = "fixture-parameterized-inbound-secret-value"
+    provider_secret = "fixture-parameterized-provider-secret-value"
+    store = MemoryCredentialStore()
+    store.set("deepseek", provider_secret)
+    inbound = {"Accept": "application/json", header_name: inbound_secret}
+
+    headers = build_third_party_headers(
+        inbound,
+        provider_id="deepseek",
+        credential_store=store,
+    )
+
+    assert set(headers) == {"Accept", "Authorization"}
+    assert_secret_equal(headers["Accept"], "application/json")
+    assert_secret_equal(headers["Authorization"], f"Bearer {provider_secret}")
     assert_secret_absent(headers, inbound_secret)
 
 

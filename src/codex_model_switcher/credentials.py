@@ -341,29 +341,18 @@ def resolve_upstream_auth(
     raise ValueError("lane must be official or third_party")
 
 
-def _is_third_party_forbidden_header(name: str) -> bool:
+_THIRD_PARTY_HEADER_ALLOWLIST = {
+    "accept": "Accept",
+    "accept-encoding": "Accept-Encoding",
+    "cache-control": "Cache-Control",
+    "content-type": "Content-Type",
+    "user-agent": "User-Agent",
+}
+
+
+def _allowed_third_party_header(name: str) -> str | None:
     normalized = name.strip().lower().replace("_", "-")
-    if normalized in {
-        "authorization",
-        "cookie",
-        "proxy-authorization",
-        "set-cookie",
-    }:
-        return True
-    if any(marker in normalized for marker in ("openai", "chatgpt")):
-        return True
-    if normalized.endswith(("-authorization", "-api-key", "-access-token", "-refresh-token")):
-        return True
-    if normalized in {
-        "x-account-id",
-        "x-account-email",
-        "x-user-id",
-        "x-user-email",
-        "x-organization",
-        "x-organization-id",
-    }:
-        return True
-    return False
+    return _THIRD_PARTY_HEADER_ALLOWLIST.get(normalized)
 
 
 def build_third_party_headers(
@@ -377,10 +366,11 @@ def build_third_party_headers(
 
     headers: dict[str, str] = {}
     for raw_name, raw_value in inbound_headers.items():
-        if not isinstance(raw_name, str) or _is_third_party_forbidden_header(raw_name):
+        if not isinstance(raw_name, str):
             continue
-        if isinstance(raw_value, str):
-            headers[raw_name] = raw_value
+        allowed_name = _allowed_third_party_header(raw_name)
+        if allowed_name is not None and isinstance(raw_value, str):
+            headers.setdefault(allowed_name, raw_value)
     resolved = resolve_upstream_auth(
         lane="third_party",
         provider_id=provider_id,
