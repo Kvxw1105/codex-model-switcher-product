@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 
 import pytest
 
@@ -118,7 +119,54 @@ def test_render_and_apply_reject_without_real_receipt(tmp_path) -> None:
         apply_managed_config(config_path, catalog_path)
 
 
+def test_apply_without_real_receipt_does_not_create_missing_config(tmp_path) -> None:
+    config_path = tmp_path / "missing-config.toml"
+    catalog_path = tmp_path / "safe-picker.json"
+    catalog_path.write_text(json.dumps(_safe_catalog()), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="UNVERIFIED"):
+        apply_managed_config(config_path, catalog_path)
+
+    assert not config_path.exists()
+
+
+def test_apply_restore_preserves_original_bytes_with_low_level_render_seam(
+    tmp_path, monkeypatch
+) -> None:
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b"# keep bytes\r\nmodel = \"original\"\r\n"
+    config_path.write_bytes(original)
+    catalog_path = tmp_path / "candidate.json"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+
+    receipt = apply_managed_config(config_path, catalog_path)
+    assert receipt.backup_path.read_bytes() == original
+    assert config_path.read_bytes() != original
+
+    restore_managed_config(config_path, receipt)
+
+    assert config_path.read_bytes() == original
+
+
 def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> None:
+    if os.name == "nt":
+        pytest.skip("Windows target locking is covered by the OS-level probe")
+
     import codex_model_switcher.config as config_module
 
     config_path = tmp_path / "config.toml"
@@ -141,12 +189,12 @@ def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> 
         lambda _path, *, verification=None: managed_block,
     )
 
-    def racing_atomic_write(path, data, *, expected=None):
+    def racing_atomic_write(path, data, *, expected=None, lease=None):
         if expected is not None and path.resolve() == config_path.resolve():
             config_path.write_bytes(external)
         if expected is None:
             return real_atomic_write(path, data)
-        return real_atomic_write(path, data, expected=expected)
+        return real_atomic_write(path, data, expected=expected, lease=lease)
 
     monkeypatch.setattr(config_module, "_atomic_write", racing_atomic_write)
 
@@ -154,6 +202,122 @@ def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> 
         apply_managed_config(config_path, catalog_path)
 
     assert config_path.read_bytes() == external
+
+
+def test_windows_apply_lock_blocks_external_replace_probe(tmp_path, monkeypatch) -> None:
+    if os.name != "nt":
+        pytest.skip("the OS-level replacement probe is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_bytes(b'model = "original"\n')
+    catalog_path = tmp_path / "candidate.json"
+    external_path = tmp_path / "external.toml"
+    managed_block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "example-provider"',
+            'model_catalog_json = "{}"',
+            MANAGED_END,
+        )
+    )
+    blocked: list[str] = []
+    real_replace_temp_file = config_module._replace_temp_file
+
+    monkeypatch.setattr(
+        config_module,
+        "render_managed_config",
+        lambda _path, *, verification=None: managed_block,
+    )
+
+    def probe_external_replace(temporary_path, target_path, *, lease=None, expected=None):
+        if target_path.resolve() == config_path.resolve():
+            external_path.write_bytes(b"user-edit\n")
+            try:
+                os.replace(external_path, target_path)
+            except OSError:
+                blocked.append("before")
+            else:
+                raise AssertionError("external replacement bypassed the Windows file lock")
+        result = real_replace_temp_file(
+            temporary_path,
+            target_path,
+            lease=lease,
+            expected=expected,
+        )
+        if target_path.resolve() == config_path.resolve():
+            external_path.write_bytes(b"user-edit-after-replace\n")
+            try:
+                os.replace(external_path, target_path)
+            except OSError:
+                blocked.append("after")
+            else:
+                raise AssertionError("external replacement bypassed the post-replace lock")
+        return result
+
+    monkeypatch.setattr(config_module, "_replace_temp_file", probe_external_replace)
+
+    apply_managed_config(config_path, catalog_path)
+
+    assert blocked == ["before", "after"]
+    assert b'model_provider = "example-provider"' in config_path.read_bytes()
+
+
+def test_windows_restore_lock_blocks_external_replace_probe(tmp_path, monkeypatch) -> None:
+    if os.name != "nt":
+        pytest.skip("the OS-level replacement probe is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "config.toml"
+    original = b'model = "original"\n'
+    written = b'model = "managed"\n'
+    config_path.write_bytes(written)
+    backup_path = tmp_path / "config.toml.bak"
+    backup_path.write_bytes(original)
+    receipt = ConfigReceipt(
+        config_path=config_path.resolve(),
+        backup_path=backup_path,
+        original_hash=hashlib.sha256(original).hexdigest(),
+        written_hash=hashlib.sha256(written).hexdigest(),
+        timestamp="20260805T000000000000Z",
+    )
+    external_path = tmp_path / "external.toml"
+    blocked: list[str] = []
+    real_replace_temp_file = config_module._replace_temp_file
+
+    def probe_external_replace(temporary_path, target_path, *, lease=None, expected=None):
+        if target_path.resolve() == config_path.resolve():
+            external_path.write_bytes(b"user-edit\n")
+            try:
+                os.replace(external_path, target_path)
+            except OSError:
+                blocked.append("before")
+            else:
+                raise AssertionError("external replacement bypassed the Windows file lock")
+        result = real_replace_temp_file(
+            temporary_path,
+            target_path,
+            lease=lease,
+            expected=expected,
+        )
+        if target_path.resolve() == config_path.resolve():
+            external_path.write_bytes(b"user-edit-after-replace\n")
+            try:
+                os.replace(external_path, target_path)
+            except OSError:
+                blocked.append("after")
+            else:
+                raise AssertionError("external replacement bypassed the post-replace lock")
+        return result
+
+    monkeypatch.setattr(config_module, "_replace_temp_file", probe_external_replace)
+
+    restore_managed_config(config_path, receipt)
+
+    assert blocked == ["before", "after"]
+    assert config_path.read_bytes() == original
 
 
 def test_public_receipt_construction_cannot_authorize_apply(tmp_path) -> None:
