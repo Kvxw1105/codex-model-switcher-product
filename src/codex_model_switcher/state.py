@@ -27,6 +27,8 @@ MAX_CONTEXT_FRAGMENT_CHARS = 64 * 1024
 SNAPSHOT_COPY_ATTEMPTS = 4
 SNAPSHOT_COPY_DELAY_SECONDS = 0.01
 SQLITE_HEADER = b"SQLite format 3\x00"
+SHM_MAGIC = b"\x18\xe2\x2d\x00"
+SHM_PAGE_SIZE = 32 * 1024
 REQUIRED_SCHEMA_COLUMNS = {
     "route_selections": {
         "selection_id",
@@ -127,6 +129,26 @@ class DatabaseCorruptionError(StateError):
 
 class DatabaseSnapshotError(DatabaseCorruptionError):
     """Raised when a consistent database snapshot cannot be captured."""
+
+
+class DatabaseQuarantineError(DatabaseCorruptionError):
+    """Raised when quarantine could not preserve the complete evidence set."""
+
+    def __init__(
+        self,
+        quarantine: Path,
+        copied_suffixes: tuple[str, ...],
+        failed_suffixes: tuple[str, ...],
+    ) -> None:
+        self.quarantine = quarantine
+        self.copied_suffixes = copied_suffixes
+        self.failed_suffixes = failed_suffixes
+        copied = ",".join(copied_suffixes) or "none"
+        failed = ",".join(failed_suffixes) or "none"
+        super().__init__(
+            "state database quarantine incomplete during snapshot/evidence preservation; "
+            f"quarantine={quarantine.name}; copied={copied}; failed={failed}"
+        )
 
 
 class DatabaseSchemaError(DatabaseCorruptionError):
@@ -296,6 +318,7 @@ class StateStore:
                 self._copy_database_set(evidence_dir)
                 evidence_captured = True
                 self._clone_database_set(evidence_dir, source_dir)
+                self._validate_database_sidecars(evidence_dir)
                 source_path = source_dir / self.path.name
                 with source_path.open("rb") as database_file:
                     if database_file.read(len(SQLITE_HEADER)) != SQLITE_HEADER:
@@ -348,12 +371,53 @@ class StateStore:
                     source.close()
 
     def _copy_database_set(self, destination: Path) -> None:
+        failures: dict[str, DatabaseSnapshotError] = {}
         for sidecar_suffix in ("", "-wal", "-shm"):
             source = self.path if not sidecar_suffix else self.path.with_name(
                 f"{self.path.name}{sidecar_suffix}"
             )
             if source.exists():
-                self._copy_file_with_retry(source, destination / source.name)
+                try:
+                    self._copy_file_with_retry(source, destination / source.name)
+                except DatabaseSnapshotError as exc:
+                    failures[sidecar_suffix or "main"] = exc
+        if failures:
+            failed = ",".join(failures)
+            raise DatabaseSnapshotError(f"snapshot copy failed for: {failed}") from next(
+                iter(failures.values())
+            )
+
+    def _validate_database_sidecars(self, directory: Path) -> None:
+        shm_path = directory / f"{self.path.name}-shm"
+        if not shm_path.exists():
+            return
+        main_path = directory / self.path.name
+        with main_path.open("rb") as database_file:
+            header = database_file.read(20)
+        if len(header) < 20 or header[: len(SQLITE_HEADER)] != SQLITE_HEADER:
+            raise DatabaseSnapshotError("state database header is invalid")
+        if header[18] != 2:
+            raise DatabaseSnapshotError("state database has an invalid shm sidecar")
+        try:
+            shm_size = shm_path.stat().st_size
+            with shm_path.open("rb") as shm_file:
+                shm_header = shm_file.read(52)
+        except OSError as exc:
+            raise DatabaseSnapshotError("state database shm sidecar cannot be read") from exc
+        database_page_size = int.from_bytes(header[16:18], "big")
+        if database_page_size == 1:
+            database_page_size = 65536
+        shm_page_size = int.from_bytes(shm_header[14:16], "little")
+        if (
+            shm_size < SHM_PAGE_SIZE
+            or shm_size % SHM_PAGE_SIZE != 0
+            or len(shm_header) < 52
+            or shm_header[:4] != SHM_MAGIC
+            or shm_header[48:52] != SHM_MAGIC
+            or shm_header[12] != 1
+            or shm_page_size != database_page_size
+        ):
+            raise DatabaseSnapshotError("state database has an invalid shm sidecar")
 
     def _clone_database_set(self, source_directory: Path, destination: Path) -> None:
         for sidecar_suffix in ("", "-wal", "-shm"):
@@ -462,6 +526,7 @@ class StateStore:
             raise DatabaseSchemaError(
                 "state database schema is incomplete: " + ", ".join(missing)
             )
+        StateStore._validate_config_hashes(connection)
         StateStore._validate_event_state(connection)
 
     @staticmethod
@@ -485,12 +550,23 @@ class StateStore:
             raise DatabaseSchemaError(
                 "state database v2 schema is incomplete: " + ", ".join(missing)
             )
+        StateStore._validate_config_hashes(connection)
         for table, column in V2_TIMESTAMP_COLUMNS.items():
             for (value,) in connection.execute(f"SELECT {column} FROM {table}"):
                 if not isinstance(value, int) or isinstance(value, bool):
                     raise DatabaseSchemaError(
                         f"state database v2 {table}.{column} must be an integer"
                     )
+
+    @staticmethod
+    def _validate_config_hashes(connection: sqlite3.Connection) -> None:
+        for (value,) in connection.execute(
+            "SELECT config_sha256 FROM config_receipts"
+        ):
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+                raise DatabaseSchemaError(
+                    "state database config_sha256 values must be exactly 64 hexadecimal characters"
+                )
 
     @staticmethod
     def _validate_event_state(connection: sqlite3.Connection) -> None:
@@ -515,9 +591,10 @@ class StateStore:
             raise DatabaseSchemaError(
                 "state database event counter state must be a non-negative integer"
             )
-        if sequences and counter < max(sequences):
+        maximum = max(sequences, default=0)
+        if counter != maximum:
             raise DatabaseSchemaError(
-                "state database event counter is lower than the highest event sequence"
+                "state database event counter must equal the highest event sequence"
             )
 
     @staticmethod
@@ -761,6 +838,24 @@ class StateStore:
             ).fetchone()[0]
         )
 
+    @staticmethod
+    def _sync_event_counter(connection: sqlite3.Connection) -> None:
+        maximum = connection.execute(
+            """
+            SELECT MAX(event_sequence) FROM (
+                SELECT event_sequence FROM response_links
+                UNION ALL
+                SELECT event_sequence FROM context_fragments
+            )
+            """
+        ).fetchone()[0]
+        updated = connection.execute(
+            "UPDATE event_counters SET value = ? WHERE counter_name = 'state'",
+            (0 if maximum is None else maximum,),
+        ).rowcount
+        if updated != 1:
+            raise StateError("state event counter is missing")
+
     def link_response(
         self,
         local_response_id: str,
@@ -851,7 +946,6 @@ class StateStore:
         selection = RouteSelection(codex_task_id, turn_id, route_id, selected_at)
 
         def insert(connection: sqlite3.Connection) -> RouteSelection:
-            self._next_event_sequence(connection)
             connection.execute(
                 """
                 INSERT INTO route_selections (codex_task_id, turn_id, route_id, selected_at)
@@ -948,7 +1042,6 @@ class StateStore:
         receipt = ConfigReceipt(receipt_id, config_sha256, created_at)
 
         def insert(connection: sqlite3.Connection) -> ConfigReceipt:
-            self._next_event_sequence(connection)
             connection.execute(
                 """
                 INSERT INTO config_receipts (receipt_id, config_sha256, created_at)
@@ -992,7 +1085,6 @@ class StateStore:
         metadata = CancelHandleMetadata(handle_id, codex_task_id, route_id, created_at, expires_at)
 
         def insert(connection: sqlite3.Connection) -> CancelHandleMetadata:
-            self._next_event_sequence(connection)
             connection.execute(
                 """
                 INSERT INTO cancel_handles (
@@ -1034,6 +1126,7 @@ class StateStore:
                     f"DELETE FROM {table} WHERE expires_at IS NOT NULL AND expires_at <= ?", (now,)
                 )
                 removed += cursor.rowcount
+            self._sync_event_counter(connection)
             return removed
 
         return self._write(delete)
@@ -1114,6 +1207,7 @@ class StateStore:
                 """,
                 (codex_task_id, boundary_event_sequence, boundary_created_at),
             ).rowcount
+            self._sync_event_counter(connection)
             return removed_links + removed_fragments
 
         return self._write(prune)
@@ -1135,17 +1229,40 @@ class StateStore:
             suffix += 1
         source_base = self.path if source_directory is None else source_directory / self.path.name
         copied_suffixes: set[str] = set()
+        failures: dict[str, DatabaseSnapshotError] = {}
         for _pass in range(2):
             for sidecar_suffix in ("", "-wal", "-shm"):
-                if sidecar_suffix in copied_suffixes:
+                label = sidecar_suffix or "main"
+                if label in copied_suffixes:
                     continue
                 source = source_base if not sidecar_suffix else source_base.with_name(
                     f"{source_base.name}{sidecar_suffix}"
                 )
+                fallback = self.path if not sidecar_suffix else self.path.with_name(
+                    f"{self.path.name}{sidecar_suffix}"
+                )
+                if not source.exists() and fallback.exists():
+                    source = fallback
                 if source.exists():
                     target = quarantine.with_name(f"{quarantine.name}{sidecar_suffix}")
-                    self._copy_file_with_retry(source, target)
-                    copied_suffixes.add(sidecar_suffix)
+                    try:
+                        self._copy_file_with_retry(source, target)
+                    except DatabaseSnapshotError as exc:
+                        failures[label] = exc
+                        continue
+                    if not target.exists():
+                        failures[label] = DatabaseSnapshotError(
+                            f"quarantine copy produced no evidence for {label}"
+                        )
+                        continue
+                    copied_suffixes.add(label)
+                    failures.pop(label, None)
+        if failures:
+            raise DatabaseQuarantineError(
+                quarantine,
+                tuple(sorted(copied_suffixes)),
+                tuple(sorted(failures)),
+            ) from next(iter(failures.values()))
         return quarantine
 
     def __enter__(self) -> StateStore:

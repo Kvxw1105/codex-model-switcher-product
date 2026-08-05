@@ -10,6 +10,7 @@ from cryptography.fernet import Fernet
 from codex_model_switcher import state as state_module
 from codex_model_switcher.state import (
     DatabaseCorruptionError,
+    DatabaseQuarantineError,
     StateStore,
 )
 
@@ -61,6 +62,44 @@ def test_event_sequence_survives_process_reopen(tmp_path, secret_key_provider) -
     assert second_link.event_sequence > first_link.event_sequence
     assert second.get_response_link("local-2").event_sequence == second_link.event_sequence
     second.close()
+
+
+def test_metadata_writes_keep_event_counter_equal_after_reopen(
+    tmp_path, secret_key_provider
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = StateStore(path, secret_key_provider)
+    first_link = first.link_response("local-1", "upstream-1", route_id="chat")
+    first.save_route_selection("task-1", "turn-1", "chat")
+    first.save_config_receipt("receipt-1", "a" * 64)
+    first.save_cancel_handle("cancel-1", codex_task_id="task-1", route_id="chat")
+
+    def event_state(store: StateStore) -> tuple[int, int]:
+        connection = store._require_connection()
+        counter = connection.execute(
+            "SELECT value FROM event_counters WHERE counter_name = 'state'"
+        ).fetchone()[0]
+        maximum = connection.execute(
+            """
+            SELECT MAX(event_sequence) FROM (
+                SELECT event_sequence FROM response_links
+                UNION ALL
+                SELECT event_sequence FROM context_fragments
+            )
+            """
+        ).fetchone()[0]
+        return counter, 0 if maximum is None else maximum
+
+    assert first_link.event_sequence == 1
+    assert event_state(first) == (1, 1)
+    first.close()
+
+    reopened = StateStore(path, secret_key_provider)
+    assert event_state(reopened) == (1, 1)
+    second_link = reopened.link_response("local-2", "upstream-2", route_id="chat")
+    assert second_link.event_sequence == 2
+    assert event_state(reopened) == (2, 2)
+    reopened.close()
 
 
 def test_migration_preserves_v1_response_link(tmp_path, secret_key_provider) -> None:
@@ -296,7 +335,110 @@ def test_incomplete_v2_schema_is_quarantined_before_wal_setup(
         seed.close()
 
 
-@pytest.mark.parametrize("corruption", ["counter_zero", "duplicate", "missing", "invalid"])
+def test_reopen_rejects_invalid_existing_config_sha256_before_writes(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, secret_key_provider)
+    store.save_config_receipt("receipt-1", "a" * 64)
+    store.close()
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE config_receipts SET config_sha256 = 'invalid-fixture' "
+            "WHERE receipt_id = 'receipt-1'"
+        )
+    original_main = path.read_bytes()
+    monkeypatch.setattr(
+        StateStore,
+        "_configure_connection",
+        lambda _store: pytest.fail("writable WAL setup ran before hash preflight"),
+    )
+
+    with pytest.raises(DatabaseCorruptionError, match="config_sha256"):
+        StateStore(path, secret_key_provider)
+
+    assert path.read_bytes() == original_main
+    quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    quarantine_main = next(
+        item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+    )
+    assert quarantine_main.read_bytes() == original_main
+
+
+def test_v2_migration_rejects_invalid_existing_config_sha256_before_writes(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        PRAGMA user_version = 2;
+        CREATE TABLE route_selections (
+            selection_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            codex_task_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            selected_at INTEGER NOT NULL
+        );
+        CREATE TABLE response_links (
+            local_response_id TEXT PRIMARY KEY,
+            upstream_response_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            codex_task_id TEXT,
+            expires_at INTEGER
+        );
+        CREATE TABLE context_fragments (
+            fragment_id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL,
+            ciphertext BLOB NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER
+        );
+        CREATE TABLE config_receipts (
+            receipt_id TEXT PRIMARY KEY,
+            config_sha256 TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE cancel_handles (
+            handle_id TEXT PRIMARY KEY,
+            codex_task_id TEXT NOT NULL,
+            route_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER
+        );
+        CREATE TABLE compact_boundaries (
+            codex_task_id TEXT PRIMARY KEY,
+            boundary_response_id TEXT NOT NULL,
+            boundary_created_at INTEGER NOT NULL
+        );
+        INSERT INTO config_receipts VALUES ('receipt-1', 'invalid-fixture', 1);
+        """
+    )
+    connection.commit()
+    connection.close()
+    original_main = path.read_bytes()
+    monkeypatch.setattr(
+        StateStore,
+        "_configure_connection",
+        lambda _store: pytest.fail("writable WAL setup ran before v2 hash preflight"),
+    )
+
+    with pytest.raises(DatabaseCorruptionError, match="config_sha256"):
+        StateStore(path, secret_key_provider)
+
+    assert path.read_bytes() == original_main
+    quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    quarantine_main = next(
+        item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+    )
+    assert quarantine_main.read_bytes() == original_main
+
+
+@pytest.mark.parametrize(
+    "corruption", ["counter_zero", "counter_high", "duplicate", "missing", "invalid"]
+)
 def test_inconsistent_event_state_is_quarantined_before_writes(
     tmp_path, secret_key_provider, monkeypatch, corruption
 ) -> None:
@@ -310,6 +452,10 @@ def test_inconsistent_event_state_is_quarantined_before_writes(
         if corruption == "counter_zero":
             connection.execute(
                 "UPDATE event_counters SET value = 0 WHERE counter_name = 'state'"
+            )
+        elif corruption == "counter_high":
+            connection.execute(
+                "UPDATE event_counters SET value = 3 WHERE counter_name = 'state'"
             )
         elif corruption == "duplicate":
             connection.execute(
@@ -342,6 +488,74 @@ def test_inconsistent_event_state_is_quarantined_before_writes(
         item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
     )
     assert quarantine_main.read_bytes() == original_main
+
+
+def test_invalid_shm_sidecar_is_quarantined_beside_valid_database(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, secret_key_provider)
+    store.link_response("local-1", "upstream-1", route_id="chat")
+    store.close()
+
+    shm_path = path.with_name(f"{path.name}-shm")
+    shm_path.write_bytes(b"invalid shm fixture")
+    original_main = path.read_bytes()
+    original_shm = shm_path.read_bytes()
+    monkeypatch.setattr(
+        StateStore,
+        "_configure_connection",
+        lambda _store: pytest.fail("invalid shm must fail before writable setup"),
+    )
+
+    with pytest.raises(DatabaseCorruptionError, match="shm"):
+        StateStore(path, secret_key_provider)
+
+    assert path.read_bytes() == original_main
+    assert shm_path.read_bytes() == original_shm
+    quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    quarantine_main = next(
+        item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+    )
+    assert quarantine_main.read_bytes() == original_main
+    assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == original_shm
+
+
+def test_quarantine_sidecar_failure_is_explicit_and_not_success(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    wal_path = path.with_name(f"{path.name}-wal")
+    shm_path = path.with_name(f"{path.name}-shm")
+    path.write_bytes(b"not a sqlite database")
+    wal_path.write_bytes(b"wal evidence")
+    shm_path.write_bytes(b"shm evidence")
+    original_copy2 = state_module.shutil.copy2
+
+    def fail_quarantine_wal(source, destination, *args, **kwargs):
+        if Path(destination).name.endswith("-wal") and ".quarantine-" in Path(
+            destination
+        ).name:
+            raise PermissionError(33, "sharing violation", str(source))
+        return original_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(state_module.shutil, "copy2", fail_quarantine_wal)
+
+    with pytest.raises(DatabaseQuarantineError, match="quarantine incomplete") as error:
+        StateStore(path, secret_key_provider)
+
+    assert set(error.value.copied_suffixes) == {"main", "-shm"}
+    assert error.value.failed_suffixes == ("-wal",)
+    quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    quarantine_main = next(
+        item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+    )
+    assert quarantine_main.read_bytes() == b"not a sqlite database"
+    assert not (tmp_path / f"{quarantine_main.name}-wal").exists()
+    assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == b"shm evidence"
+    assert path.read_bytes() == b"not a sqlite database"
+    assert wal_path.read_bytes() == b"wal evidence"
+    assert shm_path.read_bytes() == b"shm evidence"
 
 
 def test_chat_fragment_is_encrypted_and_reopens(tmp_path, secret_key_provider) -> None:
@@ -429,6 +643,31 @@ def test_expired_mapping_cleanup_is_transactional_and_scoped(tmp_path, secret_ke
     assert store.get_response_link("expired") is None
     assert store.get_response_link("live").upstream_id == "upstream-live"
     store.close()
+
+
+def test_expiring_highest_event_reconciles_counter_across_reopen(
+    tmp_path, secret_key_provider
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, secret_key_provider)
+    store.link_response(
+        "expired", "upstream-expired", route_id="chat", expires_at=10
+    )
+
+    assert store.purge_expired(now=10) == 1
+    connection = store._require_connection()
+    assert connection.execute(
+        "SELECT value FROM event_counters WHERE counter_name = 'state'"
+    ).fetchone()[0] == 0
+    assert connection.execute(
+        "SELECT MAX(event_sequence) FROM response_links"
+    ).fetchone()[0] is None
+    store.close()
+
+    reopened = StateStore(path, secret_key_provider)
+    next_link = reopened.link_response("next", "upstream-next", route_id="chat")
+    assert next_link.event_sequence == 1
+    reopened.close()
 
 
 def test_corrupt_database_is_quarantined_with_wal_sidecars_before_writes(
