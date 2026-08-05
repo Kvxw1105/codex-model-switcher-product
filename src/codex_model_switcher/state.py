@@ -68,6 +68,51 @@ REQUIRED_SCHEMA_COLUMNS = {
     },
     "event_counters": {"counter_name", "value"},
 }
+REQUIRED_V2_SCHEMA_COLUMNS = {
+    "route_selections": {
+        "selection_id",
+        "codex_task_id",
+        "turn_id",
+        "route_id",
+        "selected_at",
+    },
+    "response_links": {
+        "local_response_id",
+        "upstream_response_id",
+        "route_id",
+        "created_at",
+        "codex_task_id",
+        "expires_at",
+    },
+    "context_fragments": {
+        "fragment_id",
+        "scope_id",
+        "ciphertext",
+        "created_at",
+        "expires_at",
+    },
+    "config_receipts": {"receipt_id", "config_sha256", "created_at"},
+    "cancel_handles": {
+        "handle_id",
+        "codex_task_id",
+        "route_id",
+        "created_at",
+        "expires_at",
+    },
+    "compact_boundaries": {
+        "codex_task_id",
+        "boundary_response_id",
+        "boundary_created_at",
+    },
+}
+V2_TIMESTAMP_COLUMNS = {
+    "route_selections": "selected_at",
+    "response_links": "created_at",
+    "context_fragments": "created_at",
+    "config_receipts": "created_at",
+    "cancel_handles": "created_at",
+    "compact_boundaries": "boundary_created_at",
+}
 T = TypeVar("T")
 _DATABASE_INIT_LOCK = RLock()
 
@@ -267,7 +312,9 @@ class StateStore:
                 snapshot_version = int(
                     snapshot.execute("PRAGMA user_version").fetchone()[0]
                 )
-                if snapshot_version == SCHEMA_VERSION:
+                if snapshot_version == 2:
+                    self._validate_v2_schema(snapshot)
+                elif snapshot_version == SCHEMA_VERSION:
                     self._validate_schema(snapshot)
                 snapshot.close()
                 snapshot = None
@@ -290,7 +337,8 @@ class StateStore:
                         failure = evidence_error
                 quarantine = self._quarantine_existing(evidence_dir)
                 raise DatabaseCorruptionError(
-                    "existing state database snapshot/schema validation failed; "
+                    "existing state database snapshot/schema validation failed: "
+                    f"{failure}; "
                     f"quarantined as {quarantine.name}"
                 ) from failure
             finally:
@@ -401,15 +449,75 @@ class StateStore:
             if (
                 table == "event_counters"
                 and required_columns <= columns
-                and connection.execute(
-                    "SELECT 1 FROM event_counters WHERE counter_name = 'state'"
-                ).fetchone()
-                is None
+                and len(
+                    connection.execute(
+                        "SELECT value FROM event_counters "
+                        "WHERE counter_name = 'state'"
+                    ).fetchall()
+                )
+                != 1
             ):
                 missing.append("event_counters.state")
         if missing:
             raise DatabaseSchemaError(
                 "state database schema is incomplete: " + ", ".join(missing)
+            )
+        StateStore._validate_event_state(connection)
+
+    @staticmethod
+    def _validate_v2_schema(connection: sqlite3.Connection) -> None:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != 2:
+            raise DatabaseSchemaError(
+                f"state database schema version {version} is not the v2 migration source"
+            )
+        missing: list[str] = []
+        for table, required_columns in REQUIRED_V2_SCHEMA_COLUMNS.items():
+            columns = {
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if not columns:
+                missing.append(f"table {table}")
+                continue
+            for column in sorted(required_columns - columns):
+                missing.append(f"{table}.{column}")
+        if missing:
+            raise DatabaseSchemaError(
+                "state database v2 schema is incomplete: " + ", ".join(missing)
+            )
+        for table, column in V2_TIMESTAMP_COLUMNS.items():
+            for (value,) in connection.execute(f"SELECT {column} FROM {table}"):
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise DatabaseSchemaError(
+                        f"state database v2 {table}.{column} must be an integer"
+                    )
+
+    @staticmethod
+    def _validate_event_state(connection: sqlite3.Connection) -> None:
+        sequences: list[int] = []
+        for table in ("response_links", "context_fragments"):
+            for (value,) in connection.execute(f"SELECT event_sequence FROM {table}"):
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise DatabaseSchemaError(
+                        f"state database event sequence in {table} must be a positive integer"
+                    )
+                sequences.append(value)
+        if len(sequences) != len(set(sequences)):
+            raise DatabaseSchemaError("state database event sequence values must be unique")
+
+        counter_rows = connection.execute(
+            "SELECT value FROM event_counters WHERE counter_name = 'state'"
+        ).fetchall()
+        if len(counter_rows) != 1:
+            raise DatabaseSchemaError("state database event counter state is missing or duplicated")
+        counter = counter_rows[0][0]
+        if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+            raise DatabaseSchemaError(
+                "state database event counter state must be a non-negative integer"
+            )
+        if sequences and counter < max(sequences):
+            raise DatabaseSchemaError(
+                "state database event counter is lower than the highest event sequence"
             )
 
     @staticmethod

@@ -240,6 +240,110 @@ def test_incomplete_v3_schema_is_quarantined_before_first_write(
         seed.close()
 
 
+def test_incomplete_v2_schema_is_quarantined_before_wal_setup(
+    tmp_path, secret_key_provider, monkeypatch
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    seed = sqlite3.connect(path)
+    try:
+        seed.execute("PRAGMA journal_mode=WAL")
+        seed.execute("PRAGMA wal_autocheckpoint=0")
+        seed.execute(
+            """
+            CREATE TABLE response_links (
+                local_response_id TEXT PRIMARY KEY,
+                upstream_response_id TEXT NOT NULL,
+                route_id TEXT NOT NULL,
+                codex_task_id TEXT,
+                expires_at INTEGER
+            )
+            """
+        )
+        seed.execute("PRAGMA user_version = 2")
+        seed.execute(
+            "INSERT INTO response_links VALUES (?, ?, ?, ?, ?)",
+            ("local-1", "upstream-1", "chat", "task-1", None),
+        )
+        seed.commit()
+
+        sidecars = {
+            "-wal": path.with_name(f"{path.name}-wal"),
+            "-shm": path.with_name(f"{path.name}-shm"),
+        }
+        assert all(sidecar.exists() for sidecar in sidecars.values())
+        evidence = {"": path.read_bytes()}
+        evidence.update({suffix: sidecar.read_bytes() for suffix, sidecar in sidecars.items()})
+        monkeypatch.setattr(
+            StateStore,
+            "_configure_connection",
+            lambda _store: pytest.fail("writable WAL setup ran before v2 preflight"),
+        )
+
+        with pytest.raises(DatabaseCorruptionError, match="schema"):
+            StateStore(path, secret_key_provider)
+
+        quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+        quarantine_main = next(
+            item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+        )
+        assert quarantine_main.read_bytes() == evidence[""]
+        assert (tmp_path / f"{quarantine_main.name}-wal").read_bytes() == evidence["-wal"]
+        assert (tmp_path / f"{quarantine_main.name}-shm").read_bytes() == evidence["-shm"]
+        assert path.read_bytes() == evidence[""]
+        assert sidecars["-wal"].read_bytes() == evidence["-wal"]
+        assert sidecars["-shm"].read_bytes() == evidence["-shm"]
+    finally:
+        seed.close()
+
+
+@pytest.mark.parametrize("corruption", ["counter_zero", "duplicate", "missing", "invalid"])
+def test_inconsistent_event_state_is_quarantined_before_writes(
+    tmp_path, secret_key_provider, monkeypatch, corruption
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    store = StateStore(path, secret_key_provider)
+    store.link_response("local-1", "upstream-1", route_id="chat", codex_task_id="task-1")
+    store.link_response("local-2", "upstream-2", route_id="chat", codex_task_id="task-1")
+    store.close()
+
+    with sqlite3.connect(path) as connection:
+        if corruption == "counter_zero":
+            connection.execute(
+                "UPDATE event_counters SET value = 0 WHERE counter_name = 'state'"
+            )
+        elif corruption == "duplicate":
+            connection.execute(
+                "UPDATE response_links SET event_sequence = 1 "
+                "WHERE local_response_id = 'local-2'"
+            )
+        elif corruption == "missing":
+            connection.execute(
+                "UPDATE response_links SET event_sequence = NULL "
+                "WHERE local_response_id = 'local-2'"
+            )
+        else:
+            connection.execute(
+                "UPDATE response_links SET event_sequence = 0 "
+                "WHERE local_response_id = 'local-2'"
+            )
+
+    original_main = path.read_bytes()
+    monkeypatch.setattr(
+        StateStore,
+        "_configure_connection",
+        lambda _store: pytest.fail("writable WAL setup ran before event-state preflight"),
+    )
+    with pytest.raises(DatabaseCorruptionError, match="event (sequence|counter)"):
+        StateStore(path, secret_key_provider)
+
+    assert path.read_bytes() == original_main
+    quarantine_files = list(tmp_path.glob("state.sqlite3.quarantine-*"))
+    quarantine_main = next(
+        item for item in quarantine_files if not item.name.endswith(("-wal", "-shm"))
+    )
+    assert quarantine_main.read_bytes() == original_main
+
+
 def test_chat_fragment_is_encrypted_and_reopens(tmp_path, secret_key_provider) -> None:
     path = tmp_path / "state.sqlite3"
     fragment = "只保存第三方 Chat 继续一轮所需的最小文本片段"
