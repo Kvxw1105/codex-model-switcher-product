@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -659,6 +660,46 @@ def test_windows_precommit_lease_close_failure_retains_backup_and_status(
     assert error.backup_path is not None
     assert error.backup_path.read_bytes() == original
     assert config_path.read_bytes() == original
+
+
+def test_windows_lock_acquisition_cleanup_uncertainty_is_state_error(
+    tmp_path, monkeypatch
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows lock acquisition is Windows-specific")
+
+    import codex_model_switcher.config as config_module
+
+    config_path = tmp_path / "new-config.toml"
+    real_close = config_module._close_windows_handle
+    real_unlink = config_module.Path.unlink
+
+    def close_then_report_failure(close_handle, handle):
+        real_close(close_handle, handle)
+        return False
+
+    def fail_rollback_unlink(path, *args, **kwargs):
+        if Path(path).resolve() == config_path.resolve():
+            raise OSError("injected rollback unlink failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(config_module, "_lock_windows_file", lambda *args: False)
+    monkeypatch.setattr(
+        config_module,
+        "_close_windows_handle",
+        close_then_report_failure,
+    )
+    monkeypatch.setattr(config_module.Path, "unlink", fail_rollback_unlink)
+
+    lease = config_module._PathLease(config_path, create=True)
+    with pytest.raises(ConfigTransactionStateError, match="close|rollback") as caught:
+        lease._acquire_windows()
+
+    error = caught.value
+    assert error.committed is False
+    assert error.state_uncertain is True
+    assert config_path.exists()
+    assert "LockFileEx" in str(error)
 
 
 def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> None:

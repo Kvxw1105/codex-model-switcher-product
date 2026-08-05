@@ -298,29 +298,39 @@ class _PathLease:
         ]
         lock_file.restype = ctypes.c_int
         overlapped = _WindowsOverlapped()
-        if not lock_file(
-            handle,
-            0x00000002 | 0x00000001,  # LOCKFILE_EXCLUSIVE_LOCK | FAIL_IMMEDIATELY
-            0,
-            0xFFFFFFFF,
-            0xFFFFFFFF,
-            ctypes.byref(overlapped),
-        ):
+        if not _lock_windows_file(lock_file, handle, overlapped):
             error = ctypes.get_last_error()
-            close_succeeded = _close_windows_handle(close_handle, handle)
+            lock_failure = ConfigError(
+                f"unable to lock config on Windows (LockFileEx error {error})"
+            )
+            close_error: Exception | None = None
+            try:
+                if not _close_windows_handle(close_handle, handle):
+                    close_error = RuntimeError(
+                        "CloseHandle returned failure "
+                        f"(error {ctypes.get_last_error()})"
+                    )
+            except Exception as cleanup_error:
+                close_error = cleanup_error
+            rollback_error: OSError | None = None
             if created_new_path:
                 try:
                     self.path.unlink(missing_ok=True)
                 except OSError as cleanup_error:
-                    raise ConfigError(
-                        "unable to roll back the newly created config file"
-                    ) from cleanup_error
-            if not close_succeeded:
-                raise ConfigTransactionStateError(
+                    rollback_error = cleanup_error
+            if close_error is not None or rollback_error is not None:
+                details = [str(lock_failure)]
+                if close_error is not None:
+                    details.append(f"handle cleanup: {close_error}")
+                if rollback_error is not None:
+                    details.append(f"rollback unlink: {rollback_error}")
+                state_error = ConfigTransactionStateError(
                     self.path,
-                    f"unable to close the Windows config handle (error {ctypes.get_last_error()})",
+                    "; ".join(details),
+                    backup_path=self._backup_path or self._pending_backup_cleanup,
                 )
-            raise ConfigError(f"unable to lock config on Windows (error {error})")
+                raise state_error from lock_failure
+            raise lock_failure
 
         self._kernel32 = kernel32
         self._handle = int(handle)
@@ -1142,6 +1152,19 @@ def _close_windows_transaction(close_handle, transaction_handle) -> bool:
 
 def _close_windows_handle(close_handle, handle) -> bool:
     return bool(close_handle(handle))
+
+
+def _lock_windows_file(lock_file, handle, overlapped: _WindowsOverlapped) -> bool:
+    return bool(
+        lock_file(
+            handle,
+            0x00000002 | 0x00000001,  # LOCKFILE_EXCLUSIVE_LOCK | FAIL_IMMEDIATELY
+            0,
+            0xFFFFFFFF,
+            0xFFFFFFFF,
+            ctypes.byref(overlapped),
+        )
+    )
 
 
 def _close_precommit_handle(close_handle, handle) -> bool:
