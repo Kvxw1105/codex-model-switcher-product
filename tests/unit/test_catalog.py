@@ -53,11 +53,11 @@ def test_catalog_generation_reads_client_version_from_model_cache(tmp_path) -> N
 
 def test_native_adapter_preserves_internal_route_and_provider_reference() -> None:
     route = ModelRoute(
-        model_id="cms-deepseek-chat",
-        display_name="DeepSeek Chat API",
+        model_id="cms-deepseek-v4-flash",
+        display_name="DeepSeek V4 Flash API",
         lane="third_party",
         provider_id="deepseek",
-        upstream_model="deepseek-chat",
+        upstream_model="deepseek-v4-flash",
         capability=ModelCapability(
             context_window=64_000,
             supports_responses=True,
@@ -72,7 +72,7 @@ def test_native_adapter_preserves_internal_route_and_provider_reference() -> Non
     assert generated["providers"] == [
         {
             "provider_id": "deepseek",
-            "model": "deepseek-chat",
+            "model": "deepseek-v4-flash",
             "wire_api": "chat_completions",
             "credential_ref": "deepseek",
         }
@@ -85,7 +85,7 @@ def test_native_adapter_preserves_internal_route_and_provider_reference() -> Non
             "providers": [
                 {
                     "provider_id": "deepseek",
-                    "model": "deepseek-chat",
+                    "model": "deepseek-v4-flash",
                     "wire_api": "chat_completions",
                     "credential_ref": "deepseek",
                 }
@@ -119,14 +119,15 @@ def test_native_adapter_preserves_internal_route_and_provider_reference() -> Non
     assert internal["providers"] == [
         {
             "provider_id": "deepseek",
-            "model": "deepseek-chat",
+            "model": "deepseek-v4-flash",
             "wire_api": "chat_completions",
             "credential_ref": "deepseek",
         }
     ]
     deepseek = next(model for model in native["models"] if model["slug"] == route.model_id)
-    assert deepseek["slug"] == "cms-deepseek-chat"
-    assert deepseek["display_name"] == "DeepSeek Chat API"
+    assert deepseek["slug"] == "cms-deepseek-v4-flash"
+    assert deepseek["display_name"] == "DeepSeek V4 Flash API"
+    assert "deepseek-chat" not in json.dumps(document.to_mapping())
     assert "provider_id" not in deepseek
     assert "credential_ref" not in deepseek
     assert "chat_completions" not in json.dumps(native)

@@ -1463,6 +1463,10 @@ def render_managed_config(
         or parsed.password is not None
     ):
         raise ConfigError("router_base_url must be a loopback URL")
+    if bundled_catalog_path is None:
+        raise ConfigError(
+            "bundled_catalog_path is required to preserve official native models"
+        )
     if native_catalog_path is None:
         native_catalog_path = Path(catalog_path).with_suffix(".native.json")
     native_path = Path(native_catalog_path).resolve()

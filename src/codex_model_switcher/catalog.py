@@ -56,6 +56,7 @@ _REGISTRY_TEST_SOURCE = "registry-test"
 _NATIVE_BASE_INSTRUCTIONS = (
     "You are a coding assistant routed through the local Codex Model Switcher Router."
 )
+_DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 _NATIVE_SENSITIVE_KEYS = {
     "api_key",
     "apikey",
@@ -617,7 +618,7 @@ def _derive_provider_references(routes: Sequence[ModelRoute]) -> tuple[ProviderR
     return (
         ProviderReference(
             provider_id="deepseek",
-            model=next(iter(deepseek_models)),
+            model=_DEFAULT_DEEPSEEK_MODEL,
             wire_api="chat_completions",
             credential_ref="deepseek",
         ),
