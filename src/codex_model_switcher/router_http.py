@@ -35,6 +35,34 @@ def _request_api(path: str) -> str | None:
     return None
 
 
+TURN_METADATA_HEADER = "X-Codex-Turn-Metadata"
+
+
+def _correlation_ids(headers: Mapping[str, str]) -> tuple[str, str]:
+    """Extract task/turn correlation from codex client headers.
+
+    The installed codex CLI (verified against 0.133.0) sends thread/turn
+    identity in the JSON header ``X-Codex-Turn-Metadata``
+    (``thread_id``/``turn_id`` keys).  The legacy custom headers
+    ``X-Codex-Task-Id`` + ``X-Codex-Turn-Id`` are still accepted as a
+    fallback for direct manual use.  ``thread_id`` maps to the router's
+    ``codex_task_id`` (the task/thread scope); ``turn_id`` maps directly.
+    """
+
+    raw_metadata = headers.get(TURN_METADATA_HEADER, "")
+    if raw_metadata.strip():
+        try:
+            metadata = json.loads(raw_metadata)
+        except json.JSONDecodeError:
+            metadata = None
+        if isinstance(metadata, Mapping):
+            thread_id = metadata.get("thread_id")
+            turn_id = metadata.get("turn_id")
+            if isinstance(thread_id, str) and isinstance(turn_id, str):
+                return thread_id.strip(), turn_id.strip()
+    return headers.get(TASK_HEADER, "").strip(), headers.get(TURN_HEADER, "").strip()
+
+
 def _read_json(handler: BaseHTTPRequestHandler) -> Mapping[str, Any] | None:
     raw_length = handler.headers.get("Content-Length")
     try:
@@ -186,14 +214,14 @@ class RouterHttpService:
                 if not isinstance(stream, bool):
                     self._write_error(400, "invalid_request", "stream must be boolean")
                     return
-                task_id = self.headers.get(TASK_HEADER, "")
-                turn_id = self.headers.get(TURN_HEADER, "")
-                if not task_id.strip() or not turn_id.strip():
+                task_id, turn_id = _correlation_ids(self.headers)
+                if not task_id or not turn_id:
                     self._write(
                         400,
                         _json_error(
                             "missing_correlation",
-                            "X-Codex-Task-Id and X-Codex-Turn-Id are required",
+                            "X-Codex-Turn-Metadata (or X-Codex-Task-Id + "
+                            "X-Codex-Turn-Id) is required",
                         ),
                         "application/json; charset=utf-8",
                     )

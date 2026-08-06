@@ -109,6 +109,27 @@ codex app-server generate-ts --out <DIR>   # 可选 TS 绑定
 （RUNTIME LOAD VERIFIED）。仍缺的是 picker 显示、官方→第三方→官方切换、
 compact/工具/重启的完整桌面交互收据。
 
+## 5b. 原生请求实测（codex exec → 本地 Router → 真实上游）
+
+在隔离 CODEX_HOME 中运行 `codex exec`（0.133.0），config 指向本项目 native
+catalog + `[model_providers.deepseek]`（`base_url = http://127.0.0.1:4318/v1`），
+本地 Router 转接到真实 DeepSeek Responses 上游，端到端连续多次成功
+（回复 `OK`、`tokens used` 正常）。实测确认：
+
+- 原生请求确实发往 `model_providers.<id>.base_url` 的 `/v1/responses`，
+  且 `model` 取 native catalog 中的 slug、`instructions` 取
+  `base_instructions`。
+- **关联头是官方 `X-Codex-Turn-Metadata`**（JSON 含 `session_id`/`thread_id`/
+  `turn_id`/`thread_source`），不是自定义的 `X-Codex-Task-Id`/
+  `X-Codex-Turn-Id`。Router 已兼容解析该头（`_correlation_ids`）。
+- 第三方请求**不携带 Authorization**（`requires_openai_auth = false` 生效），
+  官方身份不会转发给第三方 provider。
+- 端到端偶发挂起来自上游瞬时慢响应与 codex 客户端重连等待；重试即恢复。
+
+结论：**同一 task/thread 内把第三方 provider 配置进真实 codex 客户端并完成
+真实 turn** 的运行时收据已取得（RUNTIME TURN VERIFIED）。仍缺的是官方通道
+turn、picker 显示与 compact/工具/重启的桌面交互收据。
+
 ## 6. Gate 1 结论
 
 - picker 可接受的 provider/catalog schema：**已证实**（官方文档 + 本机 schema 生成器 +

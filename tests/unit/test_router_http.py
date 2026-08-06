@@ -311,3 +311,39 @@ def test_router_http_non_stream_timeout_returns_504() -> None:
 
     assert status == 504
     assert json.loads(body)["error"]["type"] == "router_timeout"
+
+
+def test_router_http_accepts_official_turn_metadata_header(service) -> None:
+    instance, router = service
+    metadata = {
+        "session_id": "sess-fixture",
+        "thread_id": "thread-fixture",
+        "thread_source": "user",
+        "turn_id": "turn-fixture",
+        "sandbox": "none",
+    }
+    status, body, _ = _post(
+        instance,
+        "/v1/responses",
+        {"model": "cms-deepseek-v4-flash", "input": "hello", "stream": False},
+        {"X-Codex-Turn-Metadata": json.dumps(metadata)},
+    )
+
+    assert status == 200
+    assert router.requests[0].codex_task_id == "thread-fixture"
+    assert router.requests[0].turn_id == "turn-fixture"
+
+
+def test_router_http_rejects_when_no_correlation_header(service) -> None:
+    instance, router = service
+
+    status, body, _ = _post(
+        instance,
+        "/v1/responses",
+        {"model": "cms-deepseek-v4-flash", "input": "hello"},
+        {},  # no correlation header at all
+    )
+
+    assert status == 400
+    assert json.loads(body)["error"]["type"] == "missing_correlation"
+    assert router.requests == []

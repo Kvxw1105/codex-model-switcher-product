@@ -19,7 +19,7 @@
 
 ## Gate 1：当前客户端原生 picker
 
-状态：`CONTRACT VERIFIED / RUNTIME LOAD VERIFIED / PICKER UNVERIFIED`。
+状态：`CONTRACT VERIFIED / RUNTIME LOAD VERIFIED / RUNTIME TURN VERIFIED / PICKER UNVERIFIED`。
 
 证据文件：`docs/gate1-evidence-2026-08-06.md`（只含官方文档、当前客户端 schema
 生成器、官方开源源码与隔离 CODEX_HOME 实测的不含隐私证据；不复制真实
