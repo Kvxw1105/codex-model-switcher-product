@@ -1609,6 +1609,7 @@ def _replace_or_append_managed_block(original: str, block: str) -> str:
     lines = original.splitlines(keepends=True)
     start_lines: list[int] = []
     end_lines: list[int] = []
+    first_table_index: int | None = None
     multiline_quote: str | None = None
     for index, line in enumerate(lines):
         content = line.rstrip("\r\n")
@@ -1619,27 +1620,36 @@ def _replace_or_append_managed_block(original: str, block: str) -> str:
                 if content != marker:
                     raise ConfigError("managed config marker must occupy a complete line")
                 matches.append(index)
+        stripped = content.strip()
+        if (
+            first_table_index is None
+            and multiline_quote is None
+            and stripped.startswith("[")
+        ):
+            first_table_index = index
         multiline_quote = _advance_toml_multiline_state(line, multiline_quote)
     if len(start_lines) > 1 or len(end_lines) > 1:
         raise ConfigError("managed config must contain exactly one marker pair")
     if len(start_lines) != len(end_lines):
         raise ConfigError("managed config marker pair is incomplete")
+
+    # 移除既有受管区块（若存在）
     if start_lines:
         start_line = start_lines[0]
         end_line = end_lines[0]
         if end_line < start_line:
             raise ConfigError("managed config marker pair is out of order")
-        existing_end = lines[end_line]
-        if existing_end.endswith("\r\n"):
-            newline = "\r\n"
-        elif existing_end.endswith("\n"):
-            newline = "\n"
-        else:
-            newline = ""
-        return "".join(lines[:start_line] + [block + newline] + lines[end_line + 1 :])
+        lines = lines[:start_line] + lines[end_line + 1 :]
+        if first_table_index is not None and end_line < first_table_index:
+            first_table_index = max(0, first_table_index - (end_line - start_line + 1))
 
-    separator = "" if not original or original.endswith(("\n", "\r")) else "\n"
-    return original + separator + block + "\n"
+    # 插入到第一个 table 之前，保证受管顶层键（model_provider /
+    # model_catalog_json）处于顶层作用域，而不是被归入文件尾部某个
+    # `[table]`（TOML 中 table 之后的裸键属于该 table）。
+    newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+    insert_at = first_table_index if first_table_index is not None else len(lines)
+    block_text = block + newline
+    return "".join(lines[:insert_at] + [block_text] + lines[insert_at:])
 
 
 def _advance_toml_multiline_state(line: str, quote: str | None) -> str | None:

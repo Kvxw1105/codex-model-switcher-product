@@ -1458,3 +1458,47 @@ def test_marker_lines_inside_toml_multiline_string_are_rejected() -> None:
 
     with pytest.raises(ConfigError, match="multiline"):
         _replace_or_append_managed_block(config_text, "managed")
+
+
+def test_managed_block_is_inserted_before_first_table_for_top_level_scope() -> None:
+    """Managed top-level keys must stay in the top-level TOML scope.
+
+    Regression: appending the managed block to the end of a config that ends
+    inside a `[table]` puts model_provider / model_catalog_json into that
+    table (TOML bare keys after a table header belong to the table), so the
+    real client never sees them. The block must be inserted before the first
+    table header instead.
+    """
+    original = (
+        'model = "gpt-5.5"\n'
+        "\n"
+        "[features]\n"
+        "goals = true\n"
+        "\n"
+        '[plugins."ponytail@personal"]\n'
+        "enabled = true\n"
+    )
+    block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "deepseek"',
+            'model_catalog_json = "C:/native.json"',
+            MANAGED_END,
+        )
+    )
+
+    written = _replace_or_append_managed_block(original, block)
+
+    # 受管区块出现在 [features] 之前（顶层），而不是末尾的 plugins 表内
+    assert written.index(MANAGED_START) < written.index("[features]")
+    assert written.index("[plugins.") > written.index(MANAGED_END)
+    # 受管顶层键位于任何 table 头之前
+    before_first_table = written[: written.index("[features]")]
+    assert 'model_provider = "deepseek"' in before_first_table
+    assert 'model_catalog_json = "C:/native.json"' in before_first_table
+    # 替换已有区块时也回到顶层作用域
+    rewritten = _replace_or_append_managed_block(
+        written, block.replace("deepseek", "deepseek-v2")
+    )
+    assert rewritten.index("model_provider") < rewritten.index("[features]")
+    assert 'model_provider = "deepseek-v2"' in rewritten[: rewritten.index("[features]")]
