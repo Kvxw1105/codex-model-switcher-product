@@ -19,15 +19,21 @@
 
 ## Gate 1：当前客户端原生 picker
 
-状态：`CONTRACT VERIFIED / RUNTIME UNVERIFIED`。
+状态：`CONTRACT VERIFIED / RUNTIME LOAD VERIFIED / PICKER UNVERIFIED`。
 
 证据文件：`docs/gate1-evidence-2026-08-06.md`（只含官方文档、当前客户端 schema
-生成器与官方开源源码的不含隐私证据；不复制真实 catalog、auth、token、cookie）。
+生成器、官方开源源码与隔离 CODEX_HOME 实测的不含隐私证据；不复制真实
+catalog、auth、token、cookie）。复现脚本：`scripts/verify-native-load.sh`。
 
 - picker 可接受的 provider/catalog schema：官方 `config.toml` 参考明确列出
   `model_provider`、`model_providers.<id>`（`name`/`base_url`/`env_key`/
   `requires_openai_auth`/`wire_api = "responses"` 等）与 `model_catalog_json`；
   `config-advanced.md` 给出完整 TOML 示例。
+- 运行时加载收据（实测）：隔离 CODEX_HOME 中 `model_catalog_json` 指向本项目
+  生成的 native catalog 时，当前客户端（codex-cli 0.133.0）`codex debug models`
+  成功加载并替换 bundled（exit 0、输出本项目模型、无 error）；去掉
+  `model_catalog_json` 后回落官方 bundled。字段名以当前客户端为准
+  （`supports_reasoning_summaries`，非 main 分支的新名）。
 - `client_version` 与模型目录版本关系：官方源码确认 `ModelsResponse` 是
   `/models` 与 `model_catalog_json` 的共同结构，`ClientVersion` 是语义版本
   三元组，models cache 按 `client_version` 键控。
@@ -62,6 +68,8 @@
 
 仍保持未证实的部分：真实客户端运行时行为（picker 是否显示第三方模型、
 compact 具体内容、跨通道 token 语义、官方 endpoint 与认证 header）不以任何
-推断冒充验证；真实桌面 smoke 完成前，相关 Gate 继续标注 RUNTIME UNVERIFIED。
+推断冒充验证；catalog 加载已在隔离 CODEX_HOME 实测通过（RUNTIME LOAD
+VERIFIED），picker 显示与完整桌面切换在完整桌面 smoke 完成前仍标注
+PICKER UNVERIFIED。
 compact 归 app-server/thread 权威。本项目的目录和配置模块不保存聊天历史、
 不生成第二份摘要，也不实现第二套 compact 状态。

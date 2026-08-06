@@ -1,5 +1,6 @@
 import copy
 import json
+from pathlib import Path
 
 import pytest
 
@@ -426,10 +427,40 @@ def test_native_record_matches_official_model_info_contract() -> None:
     assert record["supports_parallel_tool_calls"] is False
     assert record["experimental_supported_tools"] == []
     assert "text" in record["input_modalities"]
-    # Official field name is supports_reasoning_summary_parameter (not ...summaries).
-    assert "supports_reasoning_summary_parameter" in record
-    assert record["supports_reasoning_summary_parameter"] is False
-    assert "supports_reasoning_summaries" not in record
+    # Current installed client (codex-cli 0.133.0) serializes the field as
+    # supports_reasoning_summaries (verified via `codex debug models --bundled`);
+    # GitHub main renamed it later to supports_reasoning_summary_parameter.
+    assert "supports_reasoning_summaries" in record
+    assert record["supports_reasoning_summaries"] is False
+    assert "supports_reasoning_summary_parameter" not in record
     # No upstream, credential, provider, or lane fields may leak into native records.
     for leaked in ("upstream_model", "credential_ref", "provider_id", "lane", "wire_api"):
         assert leaked not in record
+
+
+def test_native_record_keys_are_subset_of_current_client_bundled_fields(
+    tmp_path,
+) -> None:
+    """Lock the runtime-load contract against the installed client's bundled catalog.
+
+    Evidence: `codex debug models --bundled` on codex-cli 0.133.0 (see
+    docs/gate1-evidence-2026-08-06.md). The installed client accepts exactly
+    these ModelInfo keys; our native records must not add unknown keys.
+    """
+    from codex_model_switcher.catalog import build_native_catalog
+
+    bundled_fixture = (
+        Path(__file__).parents[1] / "fixtures" / "catalogs" / "bundled-native.json"
+    )
+    bundled = json.loads(bundled_fixture.read_text(encoding="utf-8"))
+    official_keys = set(bundled["models"][0].keys())
+
+    route = _route()
+    native = build_native_catalog(
+        build_catalog([route], client_version="0.133.0"),
+        bundled_catalog=None,
+    )
+    record = native["models"][0]
+    extra = set(record.keys()) - official_keys
+
+    assert extra == set(), f"native record introduces keys unknown to installed client: {extra}"

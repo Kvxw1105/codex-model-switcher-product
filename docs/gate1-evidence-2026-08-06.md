@@ -83,9 +83,36 @@ codex app-server generate-ts --out <DIR>   # 可选 TS 绑定
   本项目 `build_catalog_from_model_cache` 从调用方提供的模型缓存读取
   `client_version` 的做法与官方语义一致。
 
-## 5. Gate 1 结论
+## 5. 运行时加载收据（codex-cli 0.133.0 实测）
 
-- picker 可接受的 provider/catalog schema：**已证实**（官方文档 + 本机 schema 生成器）。
+在隔离 CODEX_HOME 中实测当前安装客户端（详见 `scripts/verify-native-load.sh`，
+仓库内可复现）：
+
+- 构造隔离 `CODEX_HOME` + `config.toml`，其中 `model_catalog_json` 指向本项目
+  生成的 native catalog，`model_provider = "deepseek"` 配合 `[model_providers.deepseek]`
+  （`base_url = http://127.0.0.1:4318/v1`、`wire_api = "responses"`、
+  `requires_openai_auth = false`）。
+- 运行 `codex debug models`：**exit 0**，输出恰好 1 个模型
+  （`cms-deepseek-v4-flash`），字段（`slug`/`display_name`/`shell_type`=
+  `"disabled"`/`visibility`=`"list"`/`context_window`/`input_modalities` 等）
+  被完整解析，stdout/stderr 无 error/failed。0.6 秒内返回，无网络等待。
+- 基线对照（去掉 `model_catalog_json`）：输出官方 bundled 的 6 个模型
+  （`gpt-5.5` 等）。两组差异证明 `model_catalog_json` 确实被当前客户端
+  读取并**替换**了 bundled catalog——与官方 `config/mod.rs` 的
+  `load_catalog_json` 语义一致。
+- 重要字段名发现：当前 0.133.0 客户端序列化/接受 `supports_reasoning_summaries`；
+  GitHub main 分支（更新版本）才改名 `supports_reasoning_summary_parameter`。
+  本项目以**当前安装客户端**为权威基准，native catalog 输出
+  `supports_reasoning_summaries`。
+
+结论：**当前客户端能加载本项目生成的 catalog 文件**这一运行时收据已取得
+（RUNTIME LOAD VERIFIED）。仍缺的是 picker 显示、官方→第三方→官方切换、
+compact/工具/重启的完整桌面交互收据。
+
+## 6. Gate 1 结论
+
+- picker 可接受的 provider/catalog schema：**已证实**（官方文档 + 本机 schema 生成器 +
+  运行时加载收据）。
 - `client_version` 与模型目录版本关系：**已证实**（官方源码）。
 - 同一 thread 的下一 turn 可指定不同 model ID：**已证实**（官方 schema
   `TurnStartParams.model`）。
@@ -97,14 +124,13 @@ codex app-server generate-ts --out <DIR>   # 可选 TS 绑定
   `env_key`/`auth` 机制（官方文档）；第三方 provider 不使用 OpenAI 认证。
   官方认证 header 的具体值**未取得也不猜测**（遵守约束）。
 
-## 6. 仍未验证（保持阻断的原因）
+## 7. 仍未验证（保持阻断的原因）
 
-- 真实 Codex 客户端启动后是否接受本项目生成的具体 catalog 文件并显示在
-  picker 中：仍需要桌面 smoke（隔离 CODEX_HOME 或显式开关 + 备份 + 恢复 +
-  SHA-256 证据）。
+- picker 是否显示本项目 catalog 中的第三方模型并可在真实 Codex 桌面端选中：
+  需要完整桌面 smoke（`gui --smoke` + `docs/smoke-acceptance-checklist.md`）。
 - 同一 task 的官方→第三方→官方完整桌面切换：未做。
 - compact、工具、文件、重启恢复的真实 Codex smoke：未做。
 - 官方 endpoint / 认证 header 细节：未取得（约束禁止猜测，本项目不需要转发官方身份）。
 
 因此 config apply/restore 继续遵守显式开关与原子备份/恢复/哈希证据约束，
-在真实桌面验收完成前保持阻断，不伪装成可用。
+在完整桌面验收完成前保持阻断，不伪装成可用。
