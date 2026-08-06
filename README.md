@@ -17,7 +17,7 @@
 
 ```powershell
 Set-Location '<PROJECT_ROOT>'
-\.venv\Scripts\python.exe -m codex_model_switcher gui
+.\.venv\Scripts\python.exe -m codex_model_switcher gui
 ```
 
 如果还没有 `.venv`，先执行：
@@ -39,7 +39,7 @@ python -m venv .venv
 开发入口：
 
 - 计划：`docs/superpowers/plans/2026-08-05-codex-dual-lane-hot-switch.md`
-- 当前交接：`.context/handoff/2026-08-05-codex-model-switcher.md`
+- 当前交接：`.context/handoff/2026-08-06-public-handoff.md`
 - 原始解压包和审查副本在仓库外，只作为只读参考。
 
 当前开发已完成本地 Router HTTP 适配和控制中心启停回路；下一步仍需在真实 Codex picker 上取得外部验证收据，之后才能实现并验收真实配置 apply/restore。
