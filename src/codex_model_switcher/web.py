@@ -56,8 +56,20 @@ _SAFE_RESULT_KEYS = {
     "recent_success_at",
     "backup_available",
     "config_applied",
+    "message",
+    "reason",
+    "address",
+    "port",
 }
-_SAFE_STATUSES = {"ok", "failed", "unconfigured", "running", "stopped", "unknown"}
+_SAFE_STATUSES = {
+    "ok",
+    "failed",
+    "unconfigured",
+    "running",
+    "stopped",
+    "unknown",
+    "blocked",
+}
 
 Callback = Callable[..., Mapping[str, object] | None]
 
@@ -196,6 +208,18 @@ def _safe_result(value: object) -> dict[str, object]:
         elif key == "latency_ms":
             if isinstance(item, (int, float)) and not isinstance(item, bool) and item >= 0:
                 result[key] = item
+        elif key == "port":
+            if isinstance(item, int) and not isinstance(item, bool) and 0 < item <= 65535:
+                result[key] = item
+        elif key == "message":
+            if isinstance(item, str) and len(item) <= 256:
+                result[key] = item
+        elif key == "reason":
+            if isinstance(item, str) and len(item) <= 128:
+                result[key] = item
+        elif key == "address":
+            if isinstance(item, str) and len(item) <= 128:
+                result[key] = item
         elif isinstance(item, str) and len(item) <= 64:
             result[key] = item
     return result
@@ -229,6 +253,7 @@ class ControlCenterState:
         self.official_identity_available = bool(official_identity_available)
         self.codex_config_applied = False
         self.router_running = False
+        self.router_address: str | None = None
         self._providers: dict[str, dict[str, object]] = {}
         raw_providers = providers.values() if isinstance(providers, Mapping) else (providers or ())
         for provider in raw_providers:
@@ -290,12 +315,15 @@ class ControlCenterState:
         router_status = "running" if self.router_running else "stopped"
         if not any((self.router_start_callback, self.router_stop_callback)):
             router_status = "unconfigured"
+        router = {
+            "status": router_status,
+            "running": self.router_running,
+            "configured": bool(self.router_start_callback or self.router_stop_callback),
+        }
+        if self.router_address:
+            router["address"] = self.router_address
         return {
-            "router": {
-                "status": router_status,
-                "running": self.router_running,
-                "configured": bool(self.router_start_callback or self.router_stop_callback),
-            },
+            "router": router,
             "codex_config": {
                 "applied": self.codex_config_applied,
                 "status": "applied" if self.codex_config_applied else "not_applied",
@@ -374,15 +402,20 @@ class ControlCenterState:
             return 502, {"status": "failed"}
         result = _safe_result(raw)
         result.setdefault("status", "ok")
-        if name == "config_apply" and result["status"] == "ok":
+        status = result["status"]
+        if name == "config_apply" and status == "ok":
             self.codex_config_applied = True
-        elif name == "config_restore" and result["status"] == "ok":
+        elif name == "config_restore" and status == "ok":
             self.codex_config_applied = False
-        elif name == "router_start" and result["status"] == "ok":
+        elif name == "router_start" and status == "ok":
             self.router_running = True
-        elif name == "router_stop" and result["status"] == "ok":
+            address = result.get("address")
+            self.router_address = address if isinstance(address, str) else None
+        elif name == "router_stop" and status == "ok":
             self.router_running = False
-        return 200, result
+            self.router_address = None
+        status_code = {"blocked": 412, "unconfigured": 501, "failed": 502}.get(status, 200)
+        return status_code, result
 
 
 def _invoke(callback: Callback, *arguments: object) -> Mapping[str, object] | None:

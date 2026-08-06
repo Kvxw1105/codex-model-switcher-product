@@ -105,9 +105,9 @@
             <div><p class="eyebrow">OPERATIONS</p><h3>控制面动作</h3></div>
             <span class="panel-tag">EXPLICIT</span>
           </div>
-          <p class="panel-copy">配置和 Router 动作由协调者注入；未接入时会明确显示未配置。</p>
+          <p class="panel-copy">Router 可在本机回环地址启动；真实 Codex 配置仍需当前 picker 的外部验证收据。</p>
           <div class="action-grid">
-            <button class="button button-primary" data-action="/api/config/apply" type="button">应用 Codex 配置</button>
+            <button class="button button-primary" data-action="/api/config/apply" type="button">应用 Codex 配置（需验证）</button>
             <button class="button button-quiet" data-action="/api/config/restore" type="button">恢复原配置</button>
             <button class="button button-quiet" data-action="/api/router/start" type="button">启动 Router</button>
             <button class="button button-danger" data-action="/api/router/stop" type="button">停止 Router</button>

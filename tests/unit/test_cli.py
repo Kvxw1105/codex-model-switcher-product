@@ -59,6 +59,79 @@ def test_default_state_lists_deepseek_without_exposing_a_secret(monkeypatch):
     assert "credential" not in repr(payload["providers"][0]["base_url"]).lower()
 
 
+def test_default_state_wires_router_lifecycle_callbacks(monkeypatch):
+    from codex_model_switcher import cli
+
+    class FakeStore:
+        def exists(self, _provider_id: str) -> bool:
+            return True
+
+        def get(self, _provider_id: str) -> str:
+            return "fixture"
+
+    monkeypatch.setattr(cli, "_build_credential_store", lambda: FakeStore())
+
+    state = cli.default_control_center_state()
+
+    assert callable(state.router_start_callback)
+    assert callable(state.router_stop_callback)
+    assert callable(state.config_apply_callback)
+    assert callable(state.config_restore_callback)
+
+
+def test_default_state_router_callbacks_start_and_stop_service(monkeypatch):
+    from codex_model_switcher import cli
+
+    class FakeStore:
+        def exists(self, _provider_id: str) -> bool:
+            return True
+
+        def get(self, _provider_id: str) -> str:
+            return "fixture"
+
+    class FakeService:
+        address = ("127.0.0.1", 4318)
+        running = True
+
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    service = FakeService()
+    monkeypatch.setattr(cli, "_build_credential_store", lambda: FakeStore())
+    monkeypatch.setattr(cli, "start_router_http", lambda *_args, **_kwargs: service)
+
+    state = cli.default_control_center_state()
+    started = state.router_start_callback({})
+    stopped = state.router_stop_callback({})
+
+    assert started["status"] == "ok"
+    assert started["running"] is True
+    assert started["address"] == "http://127.0.0.1:4318/v1"
+    assert stopped["status"] == "ok"
+    assert stopped["running"] is False
+    assert service.stopped is True
+
+
+def test_default_state_config_callbacks_report_picker_gate_without_writing(monkeypatch):
+    from codex_model_switcher import cli
+
+    class FakeStore:
+        def exists(self, _provider_id: str) -> bool:
+            return False
+
+    monkeypatch.setattr(cli, "_build_credential_store", lambda: FakeStore())
+    state = cli.default_control_center_state()
+
+    result = state.config_apply_callback({})
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "picker_verification_required"
+    assert result["configured"] is False
+
+
 def test_status_command_is_safe_json_and_does_not_read_credentials(capsys):
     from codex_model_switcher import cli
 

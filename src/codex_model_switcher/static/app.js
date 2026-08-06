@@ -16,7 +16,9 @@
     if (nextToken) csrfToken = nextToken;
     const payload = await result.json();
     if (!result.ok) {
-      const issue = payload && payload.error ? payload.error.message : "操作未完成";
+      const issue = payload && payload.error
+        ? payload.error.message
+        : text(payload && payload.message, text(payload && payload.reason, "操作未完成"));
       throw new Error(issue);
     }
     return payload;
@@ -64,7 +66,9 @@
     const identity = status.official_identity || {};
     const models = Array.isArray(status.models) ? status.models : [];
     byId("router-status").textContent = text(router.status, "unknown");
-    byId("router-detail").textContent = router.running ? "本地 Router 正在运行" : "等待明确启动动作";
+    byId("router-detail").textContent = router.running
+      ? text(router.address, "本地 Router 正在运行")
+      : "等待明确启动动作";
     byId("config-status").textContent = config.applied ? "已应用" : "未应用";
     byId("config-detail").textContent = text(config.message, "尚未应用真实 Codex 配置");
     byId("identity-status").textContent = identity.available ? "可用" : "不可用";
@@ -96,7 +100,10 @@
       if (actionButton) {
         const path = actionButton.getAttribute("data-action");
         const result = await api(path, { method: "POST", body: "{}" });
-        byId("operation-result").textContent = text(result.status, "操作完成");
+        byId("operation-result").textContent = text(
+          result.message,
+          text(result.address, text(result.status, "操作完成"))
+        );
         await refresh();
       }
     } catch (error) {

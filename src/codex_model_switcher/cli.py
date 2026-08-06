@@ -12,7 +12,12 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .catalog import CatalogDocument
 from .credentials import KeyringCredentialStore
+from .models import ModelCapability, ModelRoute
+from .router import Router
+from .router_http import start_router_http
+from .routing import default_deepseek_target
 
 
 def run_control_center(**kwargs: Any) -> Any:
@@ -77,6 +82,38 @@ def _probe_deepseek(
     }
 
 
+def _build_deepseek_router(credential_store: KeyringCredentialStore) -> Router:
+    route = ModelRoute(
+        model_id="cms-deepseek-v4-flash",
+        display_name="DeepSeek V4 Flash API",
+        lane="third_party",
+        provider_id="deepseek",
+        upstream_model="deepseek-v4-flash",
+        capability=ModelCapability(
+            context_window=1,
+            supports_responses=True,
+            supports_streaming=True,
+            supports_tools=False,
+            supports_images=False,
+            supports_files=False,
+            supports_compaction_context=False,
+        ),
+    )
+    catalog = CatalogDocument(
+        schema_version="cms-router-v1",
+        client_version="control-center",
+        provider_id="deepseek",
+        models=(route,),
+        verification_status="UNVERIFIED",
+    )
+    return Router(
+        catalog,
+        targets={route.model_id: default_deepseek_target(route)},
+        credential_store=credential_store,
+        provider_id_verifier={"deepseek"},
+    )
+
+
 def default_control_center_state() -> Any:
     """Build the safe default state for the local DeepSeek control flow."""
 
@@ -110,6 +147,70 @@ def default_control_center_state() -> Any:
             },
         }
     ]
+    router_service: list[Any | None] = [None]
+
+    def router_start(_payload: object) -> dict[str, object]:
+        service = router_service[0]
+        if service is not None and service.running:
+            address = service.address
+            return {
+                "status": "ok",
+                "running": True,
+                "address": f"http://{address[0]}:{address[1]}/v1",
+            }
+        try:
+            if not credential_store.exists("deepseek"):
+                return {
+                    "status": "unconfigured",
+                    "configured": False,
+                    "running": False,
+                    "message": "save the DeepSeek credential first",
+                }
+            router = _build_deepseek_router(credential_store)
+            service = start_router_http(
+                router,
+                host="127.0.0.1",
+                port=4318,
+                model_aliases={"deepseek-v4-flash": "cms-deepseek-v4-flash"},
+            )
+        except (OSError, RuntimeError):
+            return {
+                "status": "failed",
+                "configured": False,
+                "running": False,
+                "message": "router could not bind to its loopback port",
+            }
+        router_service[0] = service
+        address = service.address
+        return {
+            "status": "ok",
+            "running": True,
+            "address": f"http://{address[0]}:{address[1]}/v1",
+        }
+
+    def router_stop(_payload: object) -> dict[str, object]:
+        service = router_service[0]
+        if service is not None:
+            service.stop()
+            router_service[0] = None
+        return {"status": "ok", "running": False}
+
+    def config_apply(_payload: object) -> dict[str, object]:
+        return {
+            "status": "blocked",
+            "configured": False,
+            "reason": "picker_verification_required",
+            "message": "真实 Codex 配置未修改；需要当前 picker 的外部验证收据",
+        }
+
+    def config_restore(_payload: object) -> dict[str, object]:
+        return {
+            "status": "blocked",
+            "configured": False,
+            "reason": "no_config_apply_receipt",
+            "message": "当前没有本工具生成的配置收据可恢复",
+        }
+
     return ControlCenterState(
         providers=providers,
         models=models,
@@ -119,6 +220,10 @@ def default_control_center_state() -> Any:
             dict(provider),
             credential_store,
         ),
+        config_apply=config_apply,
+        config_restore=config_restore,
+        router_start=router_start,
+        router_stop=router_stop,
     )
 
 

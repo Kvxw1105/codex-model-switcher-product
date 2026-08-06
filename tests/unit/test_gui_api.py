@@ -289,3 +289,38 @@ def test_probe_callback_result_is_sanitized(server, state: ControlCenterState) -
     assert body == {"status": "ok", "latency_ms": 12}
     assert "fixture-probe-secret" not in raw
     assert "fixture-private-prompt" not in raw
+
+
+def test_blocked_config_operation_reports_picker_gate_without_success() -> None:
+    state = ControlCenterState(
+        config_apply=lambda _payload: {
+            "status": "blocked",
+            "configured": False,
+            "reason": "picker_verification_required",
+            "message": "real Codex config was not modified",
+        }
+    )
+    server = create_control_center_server(state=state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body, raw = _request(
+            server,
+            "POST",
+            "/api/config/apply",
+            {},
+            csrf=state.csrf_token,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 412
+    assert body == {
+        "status": "blocked",
+        "configured": False,
+        "reason": "picker_verification_required",
+        "message": "real Codex config was not modified",
+    }
+    assert "Authorization" not in raw
