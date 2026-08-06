@@ -3,25 +3,86 @@
 
   let csrfToken = "";
   let providers = [];
+  const API_TIMEOUT_MS = 30000;
+  const ACTIONS = {
+    "/api/config/apply": { label: "应用 Codex 配置", busy: "应用中…" },
+    "/api/config/restore": { label: "恢复原配置", busy: "恢复中…" },
+    "/api/router/start": { label: "启动 Router", busy: "启动中…" },
+    "/api/router/stop": { label: "停止 Router", busy: "停止中…" },
+  };
 
   const byId = (id) => document.getElementById(id);
   const text = (value, fallback) => typeof value === "string" && value ? value : fallback;
+  const errorText = (error) => error && error.message ? error.message : "请求失败";
+
+  function setFeedback(id, message, state) {
+    const node = byId(id);
+    if (!node) return;
+    node.textContent = message || "";
+    node.classList.remove("is-pending", "is-success", "is-error");
+    if (state) node.classList.add(`is-${state}`);
+    node.dataset.state = state || "idle";
+    node.setAttribute("aria-live", "polite");
+  }
+
+  function setBusy(button, busyLabel) {
+    if (!button) return () => {};
+    const originalLabel = button.dataset.originalLabel || button.textContent;
+    button.dataset.originalLabel = originalLabel;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.textContent = busyLabel;
+    return () => {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      button.textContent = originalLabel;
+    };
+  }
 
   async function api(path, options) {
     const config = options || {};
-    const headers = Object.assign({ "Content-Type": "application/json" }, config.headers || {});
+    const timeoutMs = config.timeoutMs || API_TIMEOUT_MS;
+    const requestConfig = Object.assign({}, config);
+    delete requestConfig.timeoutMs;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const headers = Object.assign({ "Content-Type": "application/json" }, requestConfig.headers || {});
     if (csrfToken) headers["X-Codex-CSRF"] = csrfToken;
-    const result = await fetch(path, Object.assign({}, config, { headers }));
-    const nextToken = result.headers.get("X-Codex-CSRF");
-    if (nextToken) csrfToken = nextToken;
-    const payload = await result.json();
-    if (!result.ok) {
-      const issue = payload && payload.error
-        ? payload.error.message
-        : text(payload && payload.message, text(payload && payload.reason, "操作未完成"));
-      throw new Error(issue);
+    try {
+      const result = await fetch(path, Object.assign({}, requestConfig, {
+        headers,
+        signal: controller.signal,
+      }));
+      const nextToken = result.headers.get("X-Codex-CSRF");
+      if (nextToken) csrfToken = nextToken;
+      const raw = await result.text();
+      let payload = {};
+      try {
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (_error) {
+        payload = { error: { message: "服务器返回了无效响应" } };
+      }
+      if (!result.ok) {
+        const issue = payload && payload.error && typeof payload.error.message === "string"
+          ? payload.error.message
+          : text(payload && payload.message, text(payload && payload.reason, text(
+            payload && payload.status,
+            "操作未完成"
+          )));
+        throw new Error(issue);
+      }
+      return payload;
+    } catch (error) {
+      if (error && error.name === "AbortError") {
+        throw new Error("请求超时，请检查本地控制中心是否仍在运行");
+      }
+      if (error instanceof TypeError) {
+        throw new Error("无法连接本地控制中心，请确认页面来自 127.0.0.1");
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
-    return payload;
   }
 
   function capabilitySummary(capabilities) {
@@ -83,52 +144,115 @@
       const status = await api("/api/status");
       renderStatus(status);
       renderProviders(status.providers);
+      return { ok: true };
     } catch (error) {
-      byId("operation-result").textContent = error.message;
+      return { ok: false, error };
     }
   }
 
   document.addEventListener("click", async (event) => {
-    const probeButton = event.target.closest("[data-probe]");
-    const actionButton = event.target.closest("[data-action]");
-    try {
-      if (probeButton) {
-        const providerId = probeButton.getAttribute("data-probe");
-        await api(`/api/providers/${encodeURIComponent(providerId)}/probe`, { method: "POST", body: "{}" });
-        await refresh();
-      }
-      if (actionButton) {
-        const path = actionButton.getAttribute("data-action");
-        const result = await api(path, { method: "POST", body: "{}" });
-        byId("operation-result").textContent = text(
-          result.message,
-          text(result.address, text(result.status, "操作完成"))
+    const target = event.target;
+    if (!target || typeof target.closest !== "function") return;
+    const probeButton = target.closest("[data-probe]");
+    const actionButton = target.closest("[data-action]");
+    if (probeButton) {
+      const providerId = probeButton.getAttribute("data-probe");
+      const release = setBusy(probeButton, "探测中…");
+      setFeedback("credential-result", `正在探测 ${providerId}，请稍候…`, "pending");
+      try {
+        const result = await api(
+          `/api/providers/${encodeURIComponent(providerId)}/probe`,
+          { method: "POST", body: "{}" }
         );
-        await refresh();
+        const refreshed = await refresh();
+        if (!refreshed.ok) {
+          setFeedback("credential-result", `探测已返回，但状态刷新失败：${errorText(refreshed.error)}`, "error");
+        } else if (result.status === "ok") {
+          const latency = typeof result.latency_ms === "number" ? `（${result.latency_ms} ms）` : "";
+          setFeedback("credential-result", `探测成功${latency}`, "success");
+        } else {
+          setFeedback("credential-result", `探测结果：${text(result.status, "unknown")}`, "error");
+        }
+      } catch (error) {
+        setFeedback("credential-result", `探测失败：${errorText(error)}`, "error");
+      } finally {
+        release();
       }
-    } catch (error) {
-      byId("operation-result").textContent = error.message;
+      return;
+    }
+    if (actionButton) {
+      const path = actionButton.getAttribute("data-action");
+      const action = ACTIONS[path] || { label: "控制面操作", busy: "处理中…" };
+      const release = setBusy(actionButton, action.busy);
+      setFeedback("operation-result", `${action.label}，请稍候…`, "pending");
+      try {
+        const result = await api(path, { method: "POST", body: "{}" });
+        const refreshed = await refresh();
+        if (!refreshed.ok) {
+          setFeedback("operation-result", `${action.label}已返回，但状态刷新失败：${errorText(refreshed.error)}`, "error");
+        } else {
+          const detail = text(result.message, text(result.address, ""));
+          setFeedback(
+            "operation-result",
+            detail ? `${action.label}成功：${detail}` : `${action.label}成功`,
+            "success"
+          );
+        }
+      } catch (error) {
+        setFeedback("operation-result", `${action.label}失败：${errorText(error)}`, "error");
+      } finally {
+        release();
+      }
     }
   });
 
-  byId("refresh-button").addEventListener("click", refresh);
-  byId("credential-form").addEventListener("submit", async (event) => {
+  const refreshButton = byId("refresh-button");
+  refreshButton.addEventListener("click", async () => {
+    const release = setBusy(refreshButton, "刷新中…");
+    setFeedback("operation-result", "正在刷新状态，请稍候…", "pending");
+    const result = await refresh();
+    if (result.ok) {
+      setFeedback("operation-result", "状态已刷新", "success");
+    } else {
+      setFeedback("operation-result", `刷新失败：${errorText(result.error)}`, "error");
+    }
+    release();
+  });
+
+  const credentialForm = byId("credential-form");
+  credentialForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const providerId = byId("credential-provider").value;
     const keyField = byId("provider-key");
+    const submitButton = event.submitter || credentialForm.querySelector("button[type=submit]");
+    const release = setBusy(submitButton, "保存中…");
+    setFeedback("credential-result", "正在保存凭据，请稍候…", "pending");
     try {
+      if (!keyField.value.trim()) throw new Error("请输入 API key");
       const result = await api(`/api/providers/${encodeURIComponent(providerId)}/credential`, {
         method: "POST",
         body: JSON.stringify({ credential: keyField.value })
       });
       keyField.value = "";
-      byId("credential-result").textContent = result.configured ? "凭据已配置" : "凭据未配置";
-      await refresh();
+      const refreshed = await refresh();
+      if (!refreshed.ok) {
+        setFeedback("credential-result", `凭据已返回，但状态刷新失败：${errorText(refreshed.error)}`, "error");
+      } else {
+        setFeedback(
+          "credential-result",
+          result.configured ? "凭据已保存并配置成功" : "凭据未配置",
+          result.configured ? "success" : "error"
+        );
+      }
     } catch (error) {
       keyField.value = "";
-      byId("credential-result").textContent = error.message;
+      setFeedback("credential-result", `保存失败：${errorText(error)}`, "error");
+    } finally {
+      release();
     }
   });
 
-  refresh();
+  refresh().then((result) => {
+    if (!result.ok) setFeedback("operation-result", `初始状态读取失败：${errorText(result.error)}`, "error");
+  });
 }());

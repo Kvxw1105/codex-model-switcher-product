@@ -67,14 +67,19 @@ td small { margin-top: 4px; }
 form label { display: block; margin-bottom: 13px; color: var(--muted); font-size: 12px; }
 input, select { display: block; width: 100%; margin-top: 7px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 7px; outline: 0; color: var(--ink); background: var(--panel-strong); }
 input:focus, select:focus { border-color: var(--copper); }
-.button { padding: 10px 13px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: transparent; font-size: 12px; transition: border-color .2s, background .2s; }
+.button { padding: 10px 13px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink); background: transparent; font-size: 12px; transition: border-color .2s, background .2s, opacity .2s; }
 .button:hover { border-color: rgba(232, 229, 219, .4); background: rgba(232, 229, 219, .06); }
+.button:disabled, .inline-action:disabled { cursor: wait; opacity: .55; }
+.button[aria-busy="true"] { border-style: dashed; }
 .button-primary { border-color: var(--copper); color: #17120e; background: var(--copper); }
 .button-primary:hover { border-color: #e4ad76; background: #e4ad76; }
 .button-danger { color: var(--danger); }
 .button-quiet { color: var(--muted); }
 .action-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
-.form-result { min-height: 20px; margin-top: 13px; color: var(--muted); font-size: 12px; }
+.form-result { min-height: 20px; margin-top: 13px; padding: 8px 10px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); font-size: 12px; transition: color .2s, border-color .2s, background .2s; }
+.form-result.is-pending { color: var(--copper); border-color: rgba(213, 150, 88, .35); background: rgba(213, 150, 88, .08); }
+.form-result.is-success { color: var(--mint); border-color: rgba(134, 198, 162, .35); background: rgba(134, 198, 162, .08); }
+.form-result.is-error { color: var(--danger); border-color: rgba(224, 124, 104, .4); background: rgba(224, 124, 104, .08); }
 .footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 28px; padding-top: 17px; border-top: 1px solid var(--line); }
 @media (max-width: 780px) {
   .shell { width: min(100% - 24px, 620px); padding-top: 28px; }

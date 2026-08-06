@@ -251,6 +251,23 @@ def test_homepage_static_assets_are_available(server) -> None:
         assert "localStorage" not in raw
 
 
+def test_static_controls_expose_immediate_feedback_contract(server) -> None:
+    status, script, _ = _request(server, "GET", "/static/app.js")
+    assert status == 200
+    for marker in (
+        "setFeedback",
+        "setBusy",
+        "AbortController",
+        "button.disabled = true",
+    ):
+        assert marker in script
+
+    status, styles, _ = _request(server, "GET", "/static/app.css")
+    assert status == 200
+    for marker in (".form-result.is-pending", ".form-result.is-success", ".form-result.is-error"):
+        assert marker in styles
+
+
 def test_run_control_center_returns_bound_server_and_token() -> None:
     instance = run_control_center()
     try:
