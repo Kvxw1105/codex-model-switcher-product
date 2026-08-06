@@ -16,7 +16,7 @@
 在本仓库 PowerShell 中运行：
 
 ```powershell
-Set-Location 'C:\Users\kvxkf\Documents\Codex\2026-08-05\new-chat\work\codex-model-switcher-product'
+Set-Location '<PROJECT_ROOT>'
 \.venv\Scripts\python.exe -m codex_model_switcher gui
 ```
 
@@ -34,7 +34,7 @@ python -m venv .venv
 3. 点击“启动 Router”后，本机代理地址会显示在操作结果中，默认是 `http://127.0.0.1:4318/v1`；调用时必须提供 `X-Codex-Task-Id` 和 `X-Codex-Turn-Id`。
 4. 用 Ctrl+C 停止控制中心；也可以点击“停止 Router”。
 
-当前不要把“探测成功”或“Router 启动”理解成 Codex 原生 picker 已经切换：网页是控制中心，不是第二个聊天窗口；真实聊天历史和 compact 仍由 Codex 官方 GUI 管理。“应用 Codex 配置”和“恢复原配置”目前会返回明确的 `412 blocked`，不会改动真实 `C:\Users\kvxkf\.codex` 配置；这是因为当前 picker 的可验证外部收据尚未建立。
+当前不要把“探测成功”或“Router 启动”理解成 Codex 原生 picker 已经切换：网页是控制中心，不是第二个聊天窗口；真实聊天历史和 compact 仍由 Codex 官方 GUI 管理。“应用 Codex 配置”和“恢复原配置”目前会返回明确的 `412 blocked`，不会改动真实 Codex 配置；这是因为当前 picker 的可验证外部收据尚未建立。
 
 开发入口：
 
