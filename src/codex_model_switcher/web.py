@@ -241,9 +241,11 @@ class ControlCenterState:
         router_start: Callback | None = None,
         router_stop: Callback | None = None,
         official_identity_available: bool = False,
+        smoke: bool = False,
     ) -> None:
         self.csrf_token = secrets.token_urlsafe(32)
         self.startup_token = self.csrf_token
+        self.smoke = bool(smoke)
         self.credential_store = credential_store
         self.probe_callback = probe_callback
         self.config_apply_callback = config_apply
@@ -324,6 +326,15 @@ class ControlCenterState:
             router["address"] = self.router_address
         return {
             "router": router,
+            "smoke": {
+                "enabled": self.smoke,
+                "message": (
+                    "smoke 开关已开启：apply/restore 会修改显式指定的配置并保留"
+                    "备份与 SHA-256 证据"
+                    if self.smoke
+                    else "smoke 开关未开启：config apply/restore 保持阻断"
+                ),
+            },
             "codex_config": {
                 "applied": self.codex_config_applied,
                 "status": "applied" if self.codex_config_applied else "not_applied",

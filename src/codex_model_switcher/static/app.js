@@ -132,6 +132,13 @@
       : "等待明确启动动作";
     byId("config-status").textContent = config.applied ? "已应用" : "未应用";
     byId("config-detail").textContent = text(config.message, "尚未应用真实 Codex 配置");
+    const smoke = status.smoke || {};
+    const smokeNode = byId("smoke-detail");
+    if (smokeNode) {
+      smokeNode.textContent = text(smoke.message, "");
+      smokeNode.hidden = !smoke.enabled;
+      smokeNode.dataset.state = smoke.enabled ? "smoke-on" : "smoke-off";
+    }
     byId("identity-status").textContent = identity.available ? "可用" : "不可用";
     byId("identity-detail").textContent = "官方身份只读，不在此输入或导出";
     byId("routes-status").textContent = String(models.length);

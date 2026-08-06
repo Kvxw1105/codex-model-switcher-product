@@ -34,7 +34,49 @@ python -m venv .venv
 3. 点击“启动 Router”后，本机代理地址会显示在操作结果中，默认是 `http://127.0.0.1:4318/v1`；调用时必须提供 `X-Codex-Task-Id` 和 `X-Codex-Turn-Id`。
 4. 用 Ctrl+C 停止控制中心；也可以点击“停止 Router”。
 
-当前不要把“探测成功”或“Router 启动”理解成 Codex 原生 picker 已经切换：网页是控制中心，不是第二个聊天窗口；真实聊天历史和 compact 仍由 Codex 官方 GUI 管理。“应用 Codex 配置”和“恢复原配置”目前会返回明确的 `412 blocked`，不会改动真实 Codex 配置；这是因为真实客户端运行时收据尚未建立。Gate 1 的契约证据（官方 config.toml schema、per-turn model 覆盖、app-server turn/compact 契约）已取得，见 `docs/gate1-evidence-2026-08-06.md`；但真实桌面 smoke（picker 显示第三方模型、官方→第三方→官方切换、compact/工具/重启恢复）仍未完成，因此 apply/restore 继续阻断，不伪装成可用。
+### 手动验证 Router（不需要 Codex 集成）
+
+Router 只是本地代理，不是 Codex 原生 picker 的开关。可以在命令行直接发
+Responses 请求验证路由回路（在 Router 启动后、本机 PowerShell 中执行）：
+
+```powershell
+$body = @{
+    model  = "<模型 ID，见控制中心目录>"
+    input  = "hi"
+    stream = $false
+} | ConvertTo-Json
+Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://127.0.0.1:4318/v1/responses" `
+    -Headers @{
+        "Content-Type"     = "application/json"
+        "X-Codex-Task-Id"  = "manual-task"
+        "X-Codex-Turn-Id"  = "manual-turn"
+    } `
+    -Body $body
+```
+
+预期返回一个 JSON 对象（含 `id`/`status`）。常见错误对照：
+
+- `404 not_found`：路径不是 `/v1/responses` 或 `/v1/chat/completions`。
+- `400 invalid_json` / `400 invalid_request`：请求体不是合法 JSON 或缺少 `model` 字段。
+- `400 missing_correlation`：缺少 `X-Codex-Task-Id` 或 `X-Codex-Turn-Id`。
+- `409 turn_in_progress`：同一 `task+turn` 已有活动请求，等待其完成或取消。
+- `503 router_not_running`：Router 已停止，回到控制中心重新“启动 Router”。
+- `504 router_timeout`：上游 130 秒内未返回；检查凭据与网络后重试。
+
+### 真实桌面验收开关（默认关闭）
+
+“应用 Codex 配置”和“恢复原配置”默认保持 `412 blocked`，不会改动真实 Codex 配置。
+只有显式以 `--smoke` 启动控制中心才允许真实 apply/restore，且每次 apply 必须显式
+提供 `config_path`、`catalog_path`、`bundled_catalog_path`；apply 会自动生成原子备份、
+字节级恢复和前后 SHA-256 证据。完整验收步骤见 `docs/smoke-acceptance-checklist.md`。
+
+```powershell
+.\.venv\Scripts\python.exe -m codex_model_switcher gui --port 4317 --smoke
+```
+
+当前不要把“探测成功”或“Router 启动”理解成 Codex 原生 picker 已经切换：网页是控制中心，不是第二个聊天窗口；真实聊天历史和 compact 仍由 Codex 官方 GUI 管理。Gate 1 的契约证据（官方 config.toml schema、per-turn model 覆盖、app-server turn/compact 契约）已取得，见 `docs/gate1-evidence-2026-08-06.md`；但真实桌面 smoke（picker 显示第三方模型、官方→第三方→官方切换、compact/工具/重启恢复）仍未完成，因此 apply/restore 保持阻断，不伪装成可用。
 
 开发入口：
 

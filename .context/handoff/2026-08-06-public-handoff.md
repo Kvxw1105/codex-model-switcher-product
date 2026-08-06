@@ -42,3 +42,17 @@
 3. 只在取得当前客户端或官方文档的非敏感证据后处理 Gate 1。
 4. 若 Gate 1 仍失败，保持配置 apply/restore 阻断，并完善手动 Router 使用路径；不要猜测 native picker 集成。
 5. 任何真实配置 smoke 都必须显式开关、字节级备份、恢复和前后 SHA-256 证据。
+
+## 2026-08-06 续（8f486a0 之后的推进）
+
+- Gate 1 契约证据已取得并落盘：`docs/gate1-evidence-2026-08-06.md`（官方 config.toml
+  schema、codex-cli 0.133.0 的 app-server schema 生成器、openai/codex 开源源码）。
+  `docs/protocol-contract.md` 的 Gate 1 状态更新为 `CONTRACT VERIFIED / RUNTIME UNVERIFIED`。
+- 真实客户端运行时收据仍未取得：picker 是否实际显示第三方模型、官方→第三方→官方切换、
+  compact/工具/重启恢复的桌面 smoke 未做，config apply/restore 仍保持阻断（不伪装可用）。
+- Router 手动路径已完善：503/504 区分、流式错误处理、README 手动 curl 验证与错误对照表。
+- 已实现显式 smoke 开关：`gui --smoke`（默认关闭）。开启后 apply/restore 必须显式提供
+  `config_path`/`catalog_path`/`bundled_catalog_path`，自动生成原子备份、字节级恢复与
+  前后 SHA-256 证据。验收步骤见 `docs/smoke-acceptance-checklist.md`。
+- 修复 native ModelInfo 字段名与官方契约一致（`supports_reasoning_summary_parameter`）。
+- 自动化验证基线：`369 passed, 1 skipped`；ruff、node --check 通过。

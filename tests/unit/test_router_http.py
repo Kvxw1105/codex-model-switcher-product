@@ -142,3 +142,122 @@ def test_router_http_stop_closes_router() -> None:
 
     assert router.closed is True
     assert instance.running is False
+
+
+class FailingRouter(FakeRouter):
+    async def handle(self, request: RouterRequest) -> RouterResponse:
+        self.requests.append(request)
+        raise RuntimeError("router event loop is closed")
+
+
+def test_router_http_unknown_endpoint_returns_not_found(service) -> None:
+    instance, router = service
+
+    status, body, _ = _post(
+        instance,
+        "/v1/unknown",
+        {"model": "cms-deepseek-v4-flash"},
+        {"X-Codex-Task-Id": "task", "X-Codex-Turn-Id": "turn"},
+    )
+
+    assert status == 404
+    assert json.loads(body)["error"]["type"] == "not_found"
+    assert router.requests == []
+
+
+def test_router_http_rejects_invalid_json(service) -> None:
+    instance, router = service
+
+    connection = http.client.HTTPConnection(*instance.address, timeout=2)
+    connection.request(
+        "POST",
+        "/v1/responses",
+        body=b"{not-json",
+        headers={
+            "Content-Type": "application/json",
+            "X-Codex-Task-Id": "task",
+            "X-Codex-Turn-Id": "turn",
+        },
+    )
+    response = connection.getresponse()
+    body = response.read().decode("utf-8")
+    connection.close()
+
+    assert response.status == 400
+    assert json.loads(body)["error"]["type"] == "invalid_json"
+    assert router.requests == []
+
+
+def test_router_http_rejects_missing_model_field(service) -> None:
+    instance, router = service
+
+    status, body, _ = _post(
+        instance,
+        "/v1/responses",
+        {"input": "hello"},
+        {"X-Codex-Task-Id": "task", "X-Codex-Turn-Id": "turn"},
+    )
+
+    assert status == 400
+    assert json.loads(body)["error"]["type"] == "invalid_request"
+    assert router.requests == []
+
+
+def test_router_http_non_stream_failure_returns_503_instead_of_router_error() -> None:
+    from codex_model_switcher.router_http import start_router_http
+
+    router = FailingRouter()
+    instance = start_router_http(router, port=0)
+    try:
+        status, body, _ = _post(
+            instance,
+            "/v1/responses",
+            {"model": "cms-deepseek-v4-flash", "input": "hello"},
+            {
+                "X-Codex-Task-Id": "task-fail",
+                "X-Codex-Turn-Id": "turn-fail",
+            },
+        )
+    finally:
+        instance.stop()
+
+    assert status == 503
+    assert json.loads(body)["error"]["type"] == "router_not_running"
+
+
+def test_router_http_stopped_service_submit_raises() -> None:
+    from codex_model_switcher.router_http import RouterHttpService
+
+    router = FakeRouter()
+    instance = RouterHttpService(router, port=0)
+    instance._stopped = True
+
+    async def noop() -> None:
+        return None
+
+    operation = noop()
+    with pytest.raises(RuntimeError, match="stopped"):
+        instance.submit(operation)
+    operation.close()  # stopped-service check runs before scheduling; consume the coroutine
+
+
+def test_router_http_stream_failure_returns_503_instead_of_silent_hang() -> None:
+    from codex_model_switcher.router_http import start_router_http
+
+    router = FailingRouter()
+    instance = start_router_http(router, port=0)
+    try:
+        status, body, _ = _post(
+            instance,
+            "/v1/responses",
+            {"model": "cms-deepseek-v4-flash", "input": "hello", "stream": True},
+            {
+                "X-Codex-Task-Id": "task-fail",
+                "X-Codex-Turn-Id": "turn-fail",
+            },
+        )
+    finally:
+        instance.stop()
+
+    assert status == 503
+    assert json.loads(body)["error"]["type"] == "router_not_running"

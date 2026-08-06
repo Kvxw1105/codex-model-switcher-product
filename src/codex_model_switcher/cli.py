@@ -13,6 +13,10 @@ from urllib.parse import urlsplit
 import httpx
 
 from .catalog import CatalogDocument
+from .config import (
+    apply_managed_config,
+    restore_managed_config,
+)
 from .credentials import KeyringCredentialStore
 from .models import ModelCapability, ModelRoute
 from .router import Router
@@ -25,7 +29,7 @@ def run_control_center(**kwargs: Any) -> Any:
 
     from .web import run_control_center as _run_control_center
 
-    kwargs.setdefault("state", default_control_center_state())
+    kwargs.setdefault("state", default_control_center_state(smoke=bool(kwargs.get("smoke"))))
     return _run_control_center(**kwargs)
 
 
@@ -114,8 +118,13 @@ def _build_deepseek_router(credential_store: KeyringCredentialStore) -> Router:
     )
 
 
-def default_control_center_state() -> Any:
-    """Build the safe default state for the local DeepSeek control flow."""
+def default_control_center_state(*, smoke: bool = False) -> Any:
+    """Build the safe default state for the local DeepSeek control flow.
+
+    ``smoke`` is the explicit opt-in switch for real desktop smoke tests.
+    Without it, config apply/restore stay blocked with ``412`` and never
+    touch a real Codex config.
+    """
 
     from .web import ControlCenterState
 
@@ -148,6 +157,8 @@ def default_control_center_state() -> Any:
         }
     ]
     router_service: list[Any | None] = [None]
+    applied: list[Any] = []
+    restored: list[Any] = []
 
     def router_start(_payload: object) -> dict[str, object]:
         service = router_service[0]
@@ -195,26 +206,98 @@ def default_control_center_state() -> Any:
             router_service[0] = None
         return {"status": "ok", "running": False}
 
-    def config_apply(_payload: object) -> dict[str, object]:
+    def config_apply(payload: object) -> dict[str, object]:
+        if not smoke:
+            return {
+                "status": "blocked",
+                "configured": False,
+                "reason": "picker_verification_required",
+                "message": (
+                    "真实 Codex 配置未修改；需要当前 picker 的外部验证收据，"
+                    "或用 --smoke 显式开启桌面验收"
+                ),
+            }
+        paths = _smoke_paths(payload)
+        if paths is None:
+            return {
+                "status": "failed",
+                "configured": False,
+                "reason": "smoke_paths_required",
+                "message": (
+                    "smoke 模式必须显式提供 config_path、catalog_path "
+                    "与 bundled_catalog_path"
+                ),
+            }
+        config_path, catalog_path, bundled_catalog_path, native_catalog_path = paths
+        try:
+            receipt = apply_managed_config(
+                config_path,
+                catalog_path,
+                native_catalog_path=native_catalog_path,
+                bundled_catalog_path=bundled_catalog_path,
+                router_base_url="http://127.0.0.1:4318/v1",
+                smoke=True,
+            )
+        except Exception as error:
+            return {
+                "status": "failed",
+                "configured": False,
+                "reason": "smoke_apply_failed",
+                "message": str(error),
+            }
+        applied.append(receipt)
         return {
-            "status": "blocked",
-            "configured": False,
-            "reason": "picker_verification_required",
-            "message": "真实 Codex 配置未修改；需要当前 picker 的外部验证收据",
+            "status": "ok",
+            "configured": True,
+            "smoke": True,
+            "backup_path": str(receipt.backup_path),
+            "config_path": str(receipt.config_path),
+            "original_sha256": receipt.original_hash,
+            "written_sha256": receipt.written_hash,
+            "timestamp": receipt.timestamp,
         }
 
-    def config_restore(_payload: object) -> dict[str, object]:
+    def config_restore(payload: object) -> dict[str, object]:
+        if not smoke:
+            return {
+                "status": "blocked",
+                "configured": False,
+                "reason": "no_config_apply_receipt",
+                "message": "当前没有本工具生成的配置收据可恢复",
+            }
+        if not applied:
+            return {
+                "status": "failed",
+                "configured": False,
+                "reason": "no_config_apply_receipt",
+                "message": "smoke 模式尚未应用任何配置，没有可恢复的收据",
+            }
+        receipt = applied[-1]
+        try:
+            restore_managed_config(receipt.config_path, receipt)
+        except Exception as error:
+            return {
+                "status": "failed",
+                "configured": False,
+                "reason": "smoke_restore_failed",
+                "message": str(error),
+            }
+        restored.append(receipt)
         return {
-            "status": "blocked",
+            "status": "ok",
             "configured": False,
-            "reason": "no_config_apply_receipt",
-            "message": "当前没有本工具生成的配置收据可恢复",
+            "smoke": True,
+            "restored_path": str(receipt.config_path),
+            "original_sha256": receipt.original_hash,
+            "written_sha256": receipt.written_hash,
+            "timestamp": receipt.timestamp,
         }
 
     return ControlCenterState(
         providers=providers,
         models=models,
         credential_store=credential_store,
+        smoke=smoke,
         probe_callback=lambda provider_id, provider: _probe_deepseek(
             provider_id,
             dict(provider),
@@ -234,9 +317,38 @@ def _build_parser() -> argparse.ArgumentParser:
     gui = subparsers.add_parser("gui", help="start the loopback web control center")
     gui.add_argument("--host", default="127.0.0.1")
     gui.add_argument("--port", type=int, default=4317)
+    gui.add_argument(
+        "--smoke",
+        action="store_true",
+        help=(
+            "explicitly enable real desktop smoke apply/restore (requires explicit "
+            "config_path, catalog_path and bundled_catalog_path in each apply request); "
+            "without it, config apply/restore stay blocked with 412"
+        ),
+    )
 
     subparsers.add_parser("status", help="print safe local control-center status")
     return parser
+
+
+def _smoke_paths(payload: object) -> tuple[Any, Any, Any, Any] | None:
+    """Extract explicit smoke paths from an apply payload; never auto-discover."""
+    if not isinstance(payload, dict):
+        return None
+    config_path = payload.get("config_path")
+    catalog_path = payload.get("catalog_path")
+    bundled_catalog_path = payload.get("bundled_catalog_path")
+    native_catalog_path = payload.get("native_catalog_path")
+    required = (config_path, catalog_path, bundled_catalog_path)
+    if not all(isinstance(value, str) and value.strip() for value in required):
+        return None
+    native = native_catalog_path if isinstance(native_catalog_path, str) else None
+    return (
+        config_path.strip(),
+        catalog_path.strip(),
+        bundled_catalog_path.strip(),
+        native.strip() if native else None,
+    )
 
 
 def _status_payload() -> dict[str, dict[str, object]]:
@@ -254,7 +366,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "gui":
         if args.host not in {"127.0.0.1", "localhost", "::1"}:
             raise SystemExit("gui must bind to loopback")
-        server = run_control_center(host=args.host, port=args.port)
+        server = run_control_center(host=args.host, port=args.port, smoke=args.smoke)
         if server is None:
             return 0
         address = getattr(

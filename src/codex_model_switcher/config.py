@@ -1443,17 +1443,27 @@ def render_managed_config(
     bundled_catalog_path: Path | None = None,
     router_base_url: str | None = None,
     verification: PickerVerificationReceipt | None = None,
+    smoke: bool = False,
 ) -> str:
-    """Render an externally-attested native catalog path and local Router provider."""
+    """Render an externally-attested native catalog path and local Router provider.
+
+    ``smoke`` is an explicit opt-in for real desktop smoke tests: it skips the
+    current-client verification receipt gate (which cannot be forged) but keeps
+    every other safety check (loopback-only URL, required bundled catalog).
+    Callers must only enable it for an explicit, reversible smoke run; the
+    resulting apply still produces an atomic backup, byte-exact restore and
+    before/after SHA-256 evidence via :func:`apply_managed_config`.
+    """
 
     try:
         catalog = load_catalog(Path(catalog_path))
     except CatalogValidationError as error:
         raise ConfigError(str(error)) from error
-    try:
-        validate_picker_verification(catalog, verification)
-    except CatalogValidationError as error:
-        raise ConfigError(str(error)) from error
+    if not smoke:
+        try:
+            validate_picker_verification(catalog, verification)
+        except CatalogValidationError as error:
+            raise ConfigError(str(error)) from error
     router_base_url = router_base_url or DEFAULT_ROUTER_BASE_URL
     parsed = urlparse(router_base_url)
     if (
@@ -1502,9 +1512,10 @@ def apply_managed_config(
     bundled_catalog_path: Path | None = None,
     router_base_url: str | None = None,
     verification: PickerVerificationReceipt | None = None,
+    smoke: bool = False,
 ) -> ConfigReceipt:
     catalog_path = Path(catalog_path)
-    render_kwargs: dict[str, object] = {"verification": verification}
+    render_kwargs: dict[str, object] = {"verification": verification, "smoke": smoke}
     if native_catalog_path is not None:
         render_kwargs["native_catalog_path"] = native_catalog_path
     if bundled_catalog_path is not None:

@@ -307,7 +307,7 @@ def test_apply_restore_preserves_original_bytes_with_low_level_render_seam(
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
 
     receipt = apply_managed_config(config_path, catalog_path)
@@ -347,7 +347,7 @@ def test_backup_name_collision_does_not_delete_existing_backup(
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     backup_path = config_path.with_name("config.toml.bak.20260805T000000000000Z")
     existing_backup = b"pre-existing backup evidence"
@@ -421,7 +421,7 @@ def test_precommit_temp_cleanup_failure_retains_state_evidence(
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     real_replace_temp_file = config_module._replace_temp_file
     real_unlink = config_module.Path.unlink
@@ -574,7 +574,7 @@ def test_windows_new_config_is_removed_after_precommit_failure(tmp_path, monkeyp
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
 
     def fail_before_replacement(*args, **kwargs):
@@ -607,7 +607,7 @@ def test_windows_new_config_is_removed_after_replacement_failure(tmp_path, monke
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     real_replace_temp_file = config_module._replace_temp_file
 
@@ -652,7 +652,7 @@ def test_windows_postcommit_cleanup_failure_keeps_backup_and_status(
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     real_replace_temp_file = config_module._replace_temp_file
 
@@ -706,7 +706,7 @@ def test_windows_postcommit_close_failure_keeps_backup_and_status(
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     real_release = config_module._PathLease._release_windows_handle
     injected = [False]
@@ -763,7 +763,7 @@ def test_windows_commit_success_then_throw_keeps_backup_and_status(
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     original_commit = config_module._commit_windows_transaction
     commit_results: list[bool] = []
@@ -815,7 +815,7 @@ def test_windows_postcommit_failures_are_structurally_aggregated(
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     original_commit = config_module._commit_windows_transaction
     commit_calls = [0]
@@ -928,7 +928,7 @@ def test_windows_rollback_failure_retains_backup_and_status(tmp_path, monkeypatc
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     original_commit = config_module._commit_windows_transaction
     commit_calls = [0]
@@ -1026,7 +1026,7 @@ def test_windows_precommit_handle_close_failures_retain_backup_and_status(
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     original_commit = config_module._commit_windows_transaction
     commit_calls = [0]
@@ -1097,7 +1097,7 @@ def test_windows_precommit_lease_close_failure_retains_backup_and_status(
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
     real_replace_temp_file = config_module._replace_temp_file
     real_release = config_module._PathLease._release_windows_handle
@@ -1210,7 +1210,7 @@ def test_apply_rejects_concurrent_edit_before_replace(tmp_path, monkeypatch) -> 
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
 
     def racing_atomic_write(path, data, *, expected=None, lease=None):
@@ -1254,7 +1254,7 @@ def test_windows_apply_lock_blocks_external_replace_probe(tmp_path, monkeypatch)
     monkeypatch.setattr(
         config_module,
         "render_managed_config",
-        lambda _path, *, verification=None: managed_block,
+        lambda _path, *, verification=None, smoke=False: managed_block,
     )
 
     def probe_external_replace(temporary_path, target_path, *, lease=None, expected=None):

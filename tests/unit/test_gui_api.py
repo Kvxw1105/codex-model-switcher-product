@@ -219,6 +219,16 @@ def test_unconfigured_operations_are_not_success(server, state: ControlCenterSta
     assert status == 200
     assert body["codex_config"]["applied"] is False
     assert body["codex_config"]["message"] == "尚未应用真实 Codex 配置"
+    assert body["smoke"]["enabled"] is False
+    assert "保持阻断" in body["smoke"]["message"]
+
+
+def test_smoke_enabled_state_is_exposed_in_status() -> None:
+    state = ControlCenterState(smoke=True)
+    status = state.public_status()
+
+    assert status["smoke"]["enabled"] is True
+    assert "备份" in status["smoke"]["message"]
 
 
 def test_invalid_json_has_structured_error(server, state: ControlCenterState) -> None:

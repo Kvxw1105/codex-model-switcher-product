@@ -195,17 +195,46 @@ class RouterHttpService:
                     stream=stream,
                 )
                 if stream:
-                    service.submit(self._stream_response(request))
+                    try:
+                        service.submit(self._stream_response(request))
+                    except RuntimeError as error:
+                        self._write_error(
+                            503,
+                            "router_not_running",
+                            f"router is not running: {error}",
+                        )
                     return
                 try:
                     response = service.submit(service.router.handle(request))
-                except (RuntimeError, TimeoutError):
+                except TimeoutError:
                     self._write_error(504, "router_timeout", "router request timed out")
+                    return
+                except RuntimeError as error:
+                    self._write_error(
+                        503,
+                        "router_not_running",
+                        f"router is not running: {error}",
+                    )
                     return
                 self._write_router_response(response)
 
             async def _stream_response(self, request: RouterRequest) -> None:
-                response = await service.router.handle(request)
+                try:
+                    response = await service.router.handle(request)
+                except (RuntimeError, TimeoutError) as error:
+                    if self.wfile.closed:
+                        return
+                    self._write_error(
+                        503,
+                        "router_not_running",
+                        f"router is not running: {error}",
+                    )
+                    return
+                except Exception as error:
+                    if self.wfile.closed:
+                        return
+                    self._write_error(500, "router_error", f"router request failed: {error}")
+                    return
                 if not response.is_streaming:
                     self._write_router_response(response)
                     return
