@@ -107,6 +107,28 @@
             <span class="panel-tag">EXPLICIT</span>
           </div>
           <p class="panel-copy">Router 可在本机回环地址启动；真实 Codex 配置仍需当前 picker 的外部验证收据。</p>
+          <div class="smoke-paths" id="smoke-paths" hidden>
+            <label class="field">
+              <span>config.toml 路径（将被修改，先确认已备份）</span>
+              <input id="smoke-config-path" type="text" autocomplete="off" spellcheck="false"
+                     placeholder="C:/Users/&lt;you&gt;/.codex/config.toml">
+            </label>
+            <label class="field">
+              <span>catalog_path（候选目录 JSON）</span>
+              <input id="smoke-catalog-path" type="text" autocomplete="off" spellcheck="false"
+                     placeholder="C:/path/to/candidate-catalog.json">
+            </label>
+            <label class="field">
+              <span>bundled_catalog_path（官方 bundled 目录，用于保留官方模型）</span>
+              <input id="smoke-bundled-path" type="text" autocomplete="off" spellcheck="false"
+                     placeholder="C:/path/to/bundled-native.json">
+            </label>
+            <label class="field">
+              <span>native_catalog_path（可选，省略时取 catalog 同名 .native.json）</span>
+              <input id="smoke-native-path" type="text" autocomplete="off" spellcheck="false"
+                     placeholder="C:/path/to/native-models.json">
+            </label>
+          </div>
           <div class="action-grid">
             <button class="button button-primary" data-action="/api/config/apply" type="button">应用 Codex 配置（需验证）</button>
             <button class="button button-quiet" data-action="/api/config/restore" type="button">恢复原配置</button>

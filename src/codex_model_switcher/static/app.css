@@ -76,6 +76,10 @@ input:focus, select:focus { border-color: var(--copper); }
 .button-danger { color: var(--danger); }
 .button-quiet { color: var(--muted); }
 .action-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.smoke-paths { margin-bottom: 15px; padding: 12px; border: 1px dashed var(--copper); border-radius: 9px; background: rgba(213, 150, 88, .05); }
+.smoke-paths .field { margin-bottom: 10px; }
+.smoke-paths .field:last-child { margin-bottom: 0; }
+.smoke-paths span { display: block; margin-bottom: 4px; color: var(--copper); font-size: 12px; }
 .form-result { min-height: 20px; margin-top: 13px; padding: 8px 10px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); font-size: 12px; transition: color .2s, border-color .2s, background .2s; }
 .form-result.is-pending { color: var(--copper); border-color: rgba(213, 150, 88, .35); background: rgba(213, 150, 88, .08); }
 .form-result.is-success { color: var(--mint); border-color: rgba(134, 198, 162, .35); background: rgba(134, 198, 162, .08); }

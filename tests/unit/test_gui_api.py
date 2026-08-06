@@ -351,3 +351,39 @@ def test_blocked_config_operation_reports_picker_gate_without_success() -> None:
         "message": "real Codex config was not modified",
     }
     assert "Authorization" not in raw
+
+
+def test_config_apply_payload_is_forwarded_to_callback_verbatim() -> None:
+    captured: list[object] = []
+    state = ControlCenterState(
+        config_apply=lambda payload: captured.append(payload) or {
+            "status": "ok",
+            "configured": True,
+            "smoke": True,
+        }
+    )
+    server = create_control_center_server(state=state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    payload = {
+        "config_path": "C:/x/config.toml",
+        "catalog_path": "C:/x/catalog.json",
+        "bundled_catalog_path": "C:/x/bundled.json",
+        "native_catalog_path": "C:/x/native.json",
+    }
+    try:
+        status, body, _ = _request(
+            server,
+            "POST",
+            "/api/config/apply",
+            payload,
+            csrf=state.csrf_token,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert captured == [payload]

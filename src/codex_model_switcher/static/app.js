@@ -15,6 +15,20 @@
   const text = (value, fallback) => typeof value === "string" && value ? value : fallback;
   const errorText = (error) => error && error.message ? error.message : "请求失败";
 
+  function smokeBody(path) {
+    if (path !== "/api/config/apply") return "{}";
+    const configPath = byId("smoke-config-path");
+    if (!configPath || !configPath.value.trim()) return "{}";
+    const payload = {
+      config_path: configPath.value.trim(),
+      catalog_path: byId("smoke-catalog-path").value.trim(),
+      bundled_catalog_path: byId("smoke-bundled-path").value.trim(),
+    };
+    const native = byId("smoke-native-path").value.trim();
+    if (native) payload.native_catalog_path = native;
+    return JSON.stringify(payload);
+  }
+
   function setFeedback(id, message, state) {
     const node = byId(id);
     if (!node) return;
@@ -139,6 +153,8 @@
       smokeNode.hidden = !smoke.enabled;
       smokeNode.dataset.state = smoke.enabled ? "smoke-on" : "smoke-off";
     }
+    const smokePaths = byId("smoke-paths");
+    if (smokePaths) smokePaths.hidden = !smoke.enabled;
     byId("identity-status").textContent = identity.available ? "可用" : "不可用";
     byId("identity-detail").textContent = "官方身份只读，不在此输入或导出";
     byId("routes-status").textContent = String(models.length);
@@ -193,7 +209,8 @@
       const release = setBusy(actionButton, action.busy);
       setFeedback("operation-result", `${action.label}，请稍候…`, "pending");
       try {
-        const result = await api(path, { method: "POST", body: "{}" });
+        const body = smokeBody(path);
+        const result = await api(path, { method: "POST", body });
         const refreshed = await refresh();
         if (!refreshed.ok) {
           setFeedback("operation-result", `${action.label}已返回，但状态刷新失败：${errorText(refreshed.error)}`, "error");
