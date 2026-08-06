@@ -643,7 +643,7 @@ def _route_to_native_record(route: ModelRoute) -> dict[str, object]:
         "upgrade": None,
         "base_instructions": _NATIVE_BASE_INSTRUCTIONS,
         "model_messages": None,
-        "supports_reasoning_summaries": False,
+        "supports_reasoning_summary_parameter": False,
         "default_reasoning_summary": "none",
         "support_verbosity": False,
         "default_verbosity": None,

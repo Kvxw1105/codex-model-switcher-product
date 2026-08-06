@@ -19,9 +19,25 @@
 
 ## Gate 1：当前客户端原生 picker
 
-状态：`FAIL / UNVERIFIED`。
+状态：`CONTRACT VERIFIED / RUNTIME UNVERIFIED`。
 
-本 worktree 没有安全可用的当前 Codex 客户端 schema 或 app-server 证据，且本任务禁止读取或输出真实 `catalog.json`、`auth.json`、token、cookie、Authorization 值。因此无法证明候选 `model_provider + model_catalog_json` 会被当前客户端接受，也不能把候选字段称为官方 picker schema。
+证据文件：`docs/gate1-evidence-2026-08-06.md`（只含官方文档、当前客户端 schema
+生成器与官方开源源码的不含隐私证据；不复制真实 catalog、auth、token、cookie）。
+
+- picker 可接受的 provider/catalog schema：官方 `config.toml` 参考明确列出
+  `model_provider`、`model_providers.<id>`（`name`/`base_url`/`env_key`/
+  `requires_openai_auth`/`wire_api = "responses"` 等）与 `model_catalog_json`；
+  `config-advanced.md` 给出完整 TOML 示例。
+- `client_version` 与模型目录版本关系：官方源码确认 `ModelsResponse` 是
+  `/models` 与 `model_catalog_json` 的共同结构，`ClientVersion` 是语义版本
+  三元组，models cache 按 `client_version` 键控。
+- 同一 thread 的下一 turn 可指定不同 model ID：官方 schema
+  `TurnStartParams.model`（"Override the model for this turn and subsequent turns"）。
+- turn 边界与取消：官方 schema `TurnStatus`、`TurnInterruptParams`（threadId+turnId）、
+  `TurnSteerParams.expectedTurnId`。
+- compact：官方 schema `ThreadCompactStartParams` 是 thread 级操作。
+- 官方认证只到官方 host：`requires_openai_auth` 默认 `false`；官方认证 header
+  细节未取得也不猜测。
 
 代码中的 `verify_isolated_picker_contract` 只在隔离 `CODEX_HOME` 中做候选一致性检查，结果永远是 `passed: false`，即使 fixture 的 schema/version 与配置完全一致也不会宣称 native picker 通过。它检查：
 
@@ -34,8 +50,18 @@
 
 ## app-server、turn 边界与 compact
 
-当前安装客户端的 app-server 契约未在本轮获得可安全审查的证据，故以下结论保持未证实：同一 thread 的下一 turn 是否可指定另一个 model ID、完成/取消后的切换边界，以及是否存在稳定且不含隐私的 thread/turn correlation 字段。本项目不虚构 thread/turn ID，也不猜测请求 endpoint、请求头或认证行为。
+当前安装客户端（codex-cli 0.133.0）自带的 `codex app-server generate-json-schema`
+已生成不含隐私的协议 schema（证据见 `docs/gate1-evidence-2026-08-06.md`）。据此：
 
-compact 归 app-server/thread 权威。本项目的目录和配置模块不保存聊天历史、不生成第二份摘要，也不实现第二套 compact 状态。
+- `TurnStartParams.model` 允许同一 thread 的下一 turn 指定不同 model ID；
+- `TurnStatus`（completed/interrupted/failed/inProgress）、`TurnInterruptParams`
+  （threadId+turnId）与 `TurnSteerParams.expectedTurnId` 定义了 turn 边界和取消语义；
+- `ThreadCompactStartParams` 是 thread 级 compact 操作；
+- app-server 提供 `ConfigValueWriteParams`/`ConfigReadParams` 配置读写方法与
+  `ModelReroutedNotification`（threadId/turnId/fromModel/toModel）。
 
-在获得当前客户端或官方文档的非敏感证据前，不能报告官方上游 URL、请求头、认证行为、per-turn model 切换或跨通道 token 行为已验证；相关 Gate 继续保持失败/未验证。
+仍保持未证实的部分：真实客户端运行时行为（picker 是否显示第三方模型、
+compact 具体内容、跨通道 token 语义、官方 endpoint 与认证 header）不以任何
+推断冒充验证；真实桌面 smoke 完成前，相关 Gate 继续标注 RUNTIME UNVERIFIED。
+compact 归 app-server/thread 权威。本项目的目录和配置模块不保存聊天历史、
+不生成第二份摘要，也不实现第二套 compact 状态。

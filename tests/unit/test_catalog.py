@@ -396,3 +396,40 @@ def _route_to_record() -> dict[str, object]:
             "supports_compaction_context": False,
         },
     }
+
+
+def test_native_record_matches_official_model_info_contract() -> None:
+    """Lock the Gate 1 contract: official ModelInfo field names from openai/codex.
+
+    Evidence source: codex-rs/protocol/src/openai_models.rs (main branch),
+    recorded in docs/gate1-evidence-2026-08-06.md. These are field *names*
+    (official snake_case JSON keys), never real client values.
+    """
+
+    route = _route()
+    native = build_native_catalog(
+        build_catalog([route], client_version="0.133.0"),
+        bundled_catalog=None,
+    )
+    record = next(model for model in native["models"] if model["slug"] == route.model_id)
+
+    # Official ModelInfo JSON keys (from the openai/codex source above).
+    assert record["slug"] == route.model_id
+    assert record["display_name"] == route.display_name
+    assert record["supported_reasoning_levels"] == []
+    assert record["shell_type"] == "disabled"
+    assert record["visibility"] == "list"
+    assert record["supported_in_api"] is True
+    assert record["priority"] == 0
+    assert record["support_verbosity"] is False
+    assert record["truncation_policy"] == {"mode": "tokens", "limit": 10_000}
+    assert record["supports_parallel_tool_calls"] is False
+    assert record["experimental_supported_tools"] == []
+    assert "text" in record["input_modalities"]
+    # Official field name is supports_reasoning_summary_parameter (not ...summaries).
+    assert "supports_reasoning_summary_parameter" in record
+    assert record["supports_reasoning_summary_parameter"] is False
+    assert "supports_reasoning_summaries" not in record
+    # No upstream, credential, provider, or lane fields may leak into native records.
+    for leaked in ("upstream_model", "credential_ref", "provider_id", "lane", "wire_api"):
+        assert leaked not in record

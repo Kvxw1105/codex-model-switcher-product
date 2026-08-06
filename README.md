@@ -34,7 +34,7 @@ python -m venv .venv
 3. 点击“启动 Router”后，本机代理地址会显示在操作结果中，默认是 `http://127.0.0.1:4318/v1`；调用时必须提供 `X-Codex-Task-Id` 和 `X-Codex-Turn-Id`。
 4. 用 Ctrl+C 停止控制中心；也可以点击“停止 Router”。
 
-当前不要把“探测成功”或“Router 启动”理解成 Codex 原生 picker 已经切换：网页是控制中心，不是第二个聊天窗口；真实聊天历史和 compact 仍由 Codex 官方 GUI 管理。“应用 Codex 配置”和“恢复原配置”目前会返回明确的 `412 blocked`，不会改动真实 Codex 配置；这是因为当前 picker 的可验证外部收据尚未建立。
+当前不要把“探测成功”或“Router 启动”理解成 Codex 原生 picker 已经切换：网页是控制中心，不是第二个聊天窗口；真实聊天历史和 compact 仍由 Codex 官方 GUI 管理。“应用 Codex 配置”和“恢复原配置”目前会返回明确的 `412 blocked`，不会改动真实 Codex 配置；这是因为真实客户端运行时收据尚未建立。Gate 1 的契约证据（官方 config.toml schema、per-turn model 覆盖、app-server turn/compact 契约）已取得，见 `docs/gate1-evidence-2026-08-06.md`；但真实桌面 smoke（picker 显示第三方模型、官方→第三方→官方切换、compact/工具/重启恢复）仍未完成，因此 apply/restore 继续阻断，不伪装成可用。
 
 开发入口：
 
