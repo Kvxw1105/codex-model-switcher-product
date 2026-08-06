@@ -261,3 +261,53 @@ def test_router_http_stream_failure_returns_503_instead_of_silent_hang() -> None
 
     assert status == 503
     assert json.loads(body)["error"]["type"] == "router_not_running"
+
+
+class TimeoutRouter(FakeRouter):
+    async def handle(self, request: RouterRequest) -> RouterResponse:
+        self.requests.append(request)
+        raise TimeoutError("upstream timed out")
+
+
+def test_router_http_stream_timeout_returns_504() -> None:
+    from codex_model_switcher.router_http import start_router_http
+
+    router = TimeoutRouter()
+    instance = start_router_http(router, port=0)
+    try:
+        status, body, _ = _post(
+            instance,
+            "/v1/responses",
+            {"model": "cms-deepseek-v4-flash", "input": "hello", "stream": True},
+            {
+                "X-Codex-Task-Id": "task-timeout",
+                "X-Codex-Turn-Id": "turn-timeout",
+            },
+        )
+    finally:
+        instance.stop()
+
+    assert status == 504
+    assert json.loads(body)["error"]["type"] == "router_timeout"
+
+
+def test_router_http_non_stream_timeout_returns_504() -> None:
+    from codex_model_switcher.router_http import start_router_http
+
+    router = TimeoutRouter()
+    instance = start_router_http(router, port=0)
+    try:
+        status, body, _ = _post(
+            instance,
+            "/v1/responses",
+            {"model": "cms-deepseek-v4-flash", "input": "hello"},
+            {
+                "X-Codex-Task-Id": "task-timeout",
+                "X-Codex-Turn-Id": "turn-timeout",
+            },
+        )
+    finally:
+        instance.stop()
+
+    assert status == 504
+    assert json.loads(body)["error"]["type"] == "router_timeout"

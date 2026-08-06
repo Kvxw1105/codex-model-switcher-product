@@ -118,6 +118,20 @@ class RouterHttpService:
         future = asyncio.run_coroutine_threadsafe(operation, self._loop)
         return future.result(timeout=130)
 
+    def submit_stream(self, operation: Awaitable[Any]) -> None:
+        """Run an SSE stream task and wait for it without the 130s cap.
+
+        Streaming responses can legitimately outlive the 130s window used by
+        :meth:`submit`; capping here would tear down the SSE connection while
+        the task keeps writing.  The handler stays alive until the stream task
+        finishes writing, so the client sees the complete event stream.
+        """
+
+        if self._stopped:
+            raise RuntimeError("router HTTP service is stopped")
+        future = asyncio.run_coroutine_threadsafe(operation, self._loop)
+        future.result()
+
     def stop(self) -> None:
         if self._stopped:
             return
@@ -196,7 +210,7 @@ class RouterHttpService:
                 )
                 if stream:
                     try:
-                        service.submit(self._stream_response(request))
+                        service.submit_stream(self._stream_response(request))
                     except RuntimeError as error:
                         self._write_error(
                             503,
@@ -221,19 +235,25 @@ class RouterHttpService:
             async def _stream_response(self, request: RouterRequest) -> None:
                 try:
                     response = await service.router.handle(request)
-                except (RuntimeError, TimeoutError) as error:
-                    if self.wfile.closed:
-                        return
-                    self._write_error(
-                        503,
-                        "router_not_running",
-                        f"router is not running: {error}",
-                    )
+                except TimeoutError:
+                    if not self.wfile.closed:
+                        self._write_error(
+                            504, "router_timeout", "router request timed out"
+                        )
+                    return
+                except RuntimeError as error:
+                    if not self.wfile.closed:
+                        self._write_error(
+                            503,
+                            "router_not_running",
+                            f"router is not running: {error}",
+                        )
                     return
                 except Exception as error:
-                    if self.wfile.closed:
-                        return
-                    self._write_error(500, "router_error", f"router request failed: {error}")
+                    if not self.wfile.closed:
+                        self._write_error(
+                            500, "router_error", f"router request failed: {error}"
+                        )
                     return
                 if not response.is_streaming:
                     self._write_router_response(response)
@@ -248,7 +268,24 @@ class RouterHttpService:
                         self.wfile.write(event.encode())
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
-                    await response.aclose()
+                    pass
+                except Exception as error:
+                    if not self.wfile.closed:
+                        error_frame = (
+                            "event: error\n"
+                            "data: "
+                            + json.dumps(
+                                {"type": "router_error", "message": str(error)},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            + "\n\n"
+                        )
+                        try:
+                            self.wfile.write(error_frame.encode())
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
                 finally:
                     await response.aclose()
 
