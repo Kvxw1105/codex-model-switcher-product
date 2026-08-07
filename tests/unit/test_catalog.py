@@ -417,8 +417,14 @@ def test_native_record_matches_official_model_info_contract() -> None:
     # Official ModelInfo JSON keys (from the openai/codex source above).
     assert record["slug"] == route.model_id
     assert record["display_name"] == route.display_name
-    assert record["supported_reasoning_levels"] == []
-    assert record["shell_type"] == "disabled"
+    assert record["default_reasoning_level"] == "medium"
+    assert [e["effort"] for e in record["supported_reasoning_levels"]] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
+    assert record["shell_type"] == "shell_command"
     assert record["visibility"] == "list"
     assert record["supported_in_api"] is True
     assert record["priority"] == 0

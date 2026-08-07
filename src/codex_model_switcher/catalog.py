@@ -631,9 +631,21 @@ def _route_to_native_record(route: ModelRoute) -> dict[str, object]:
         "slug": route.model_id,
         "display_name": route.display_name,
         "description": f"{route.display_name} via the local Router",
-        "default_reasoning_level": None,
-        "supported_reasoning_levels": [],
-        "shell_type": "disabled",
+        # Match the installed client's bundled catalog (verified via
+        # `codex debug models --bundled`): picker models carry four reasoning
+        # effort presets and a medium default; an empty effort list makes the
+        # model unselectable in the desktop picker.
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Fast responses with lighter reasoning"},
+            {
+                "effort": "medium",
+                "description": "Balances speed and reasoning depth for everyday tasks",
+            },
+            {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+            {"effort": "xhigh", "description": "Extra high reasoning depth for complex problems"},
+        ],
+        "shell_type": "shell_command",
         "visibility": "list",
         "supported_in_api": capability.supports_responses,
         "priority": 0,
