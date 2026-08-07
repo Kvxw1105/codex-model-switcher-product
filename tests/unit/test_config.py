@@ -1502,3 +1502,36 @@ def test_managed_block_is_inserted_before_first_table_for_top_level_scope() -> N
     )
     assert rewritten.index("model_provider") < rewritten.index("[features]")
     assert 'model_provider = "deepseek-v2"' in rewritten[: rewritten.index("[features]")]
+
+
+def test_managed_block_reapply_stays_top_level_when_old_block_contains_table() -> None:
+    """Re-applying must not treat the managed block's own [model_providers] header
+    as the first table: the block must stay before every user table."""
+
+    original = (
+        'model = "gpt-5.5"\n'
+        "\n"
+        "[features]\n"
+        "goals = true\n"
+        "\n"
+        '[plugins."ponytail@personal"]\n'
+        "enabled = true\n"
+    )
+    block = "\n".join(
+        (
+            MANAGED_START,
+            'model_provider = "deepseek"',
+            'model_catalog_json = "C:/native.json"',
+            "",
+            '[model_providers."deepseek"]',
+            'base_url = "http://127.0.0.1:4318/v1"',
+            MANAGED_END,
+        )
+    )
+    first = _replace_or_append_managed_block(original, block)
+    assert first.index(MANAGED_START) < first.index("[features]")
+    second = _replace_or_append_managed_block(first, block.replace("deepseek-v2", "deepseek"))
+    assert second.index(MANAGED_START) < second.index("[features]")
+    assert second.index('[model_providers."deepseek"]') < second.index("[features]")
+
+

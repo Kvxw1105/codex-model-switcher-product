@@ -1609,7 +1609,7 @@ def _replace_or_append_managed_block(original: str, block: str) -> str:
     lines = original.splitlines(keepends=True)
     start_lines: list[int] = []
     end_lines: list[int] = []
-    first_table_index: int | None = None
+    table_indexes: list[int] = []
     multiline_quote: str | None = None
     for index, line in enumerate(lines):
         content = line.rstrip("\r\n")
@@ -1621,27 +1621,46 @@ def _replace_or_append_managed_block(original: str, block: str) -> str:
                     raise ConfigError("managed config marker must occupy a complete line")
                 matches.append(index)
         stripped = content.strip()
-        if (
-            first_table_index is None
-            and multiline_quote is None
-            and stripped.startswith("[")
-        ):
-            first_table_index = index
+        if multiline_quote is None and stripped.startswith("["):
+            table_indexes.append(index)
         multiline_quote = _advance_toml_multiline_state(line, multiline_quote)
     if len(start_lines) > 1 or len(end_lines) > 1:
         raise ConfigError("managed config must contain exactly one marker pair")
     if len(start_lines) != len(end_lines):
         raise ConfigError("managed config marker pair is incomplete")
 
-    # 移除既有受管区块（若存在）
+    managed_range: tuple[int, int] | None = None
     if start_lines:
         start_line = start_lines[0]
         end_line = end_lines[0]
         if end_line < start_line:
             raise ConfigError("managed config marker pair is out of order")
+        managed_range = (start_line, end_line)
         lines = lines[:start_line] + lines[end_line + 1 :]
-        if first_table_index is not None and end_line < first_table_index:
-            first_table_index = max(0, first_table_index - (end_line - start_line + 1))
+
+    # 第一个 table 指**受管区块之外**最早的 table 头（受管区块自身含
+    # `[model_providers."..."]`，必须被排除，否则插入点会落在受管区块内部）。
+    first_managed_table: int | None = None
+    if managed_range is not None:
+        start_line, end_line = managed_range
+        for table_index in table_indexes:
+            if start_line <= table_index <= end_line:
+                first_managed_table = table_index
+                break
+    first_table_index: int | None = None
+    for table_index in table_indexes:
+        if table_index == first_managed_table:
+            continue
+        if managed_range is not None:
+            if table_index > managed_range[1]:
+                first_table_index = table_index - (managed_range[1] - managed_range[0] + 1)
+                break
+            if table_index < managed_range[0]:
+                first_table_index = table_index
+                break
+        else:
+            first_table_index = table_index
+            break
 
     # 插入到第一个 table 之前，保证受管顶层键（model_provider /
     # model_catalog_json）处于顶层作用域，而不是被归入文件尾部某个
