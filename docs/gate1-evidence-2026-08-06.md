@@ -130,7 +130,34 @@ catalog + `[model_providers.deepseek]`（`base_url = http://127.0.0.1:4318/v1`�
 真实 turn** 的运行时收据已取得（RUNTIME TURN VERIFIED）。仍缺的是官方通道
 turn、picker 显示与 compact/工具/重启的桌面交互收据。
 
-## 6. Gate 1 结论
+## 7. 桌面端 26.730 的 model_catalog_json 覆盖行为（实测，2026-08-08）
+
+在真实桌面端（WindowsApps 版 OpenAI.Codex 26.730，内核 ≈ client_version
+0.147.0）实测：
+
+- 现象：config.toml 受管区块（`model_provider = "deepseek"` + `model_catalog_json`
+  指向 11 模型 native catalog）在桌面端**账户/设置区显示 provider=deepseek**，
+  但模型列表只有 8 个官方在线模型（无 `cms-deepseek-v4-flash`）。
+- 根因：桌面端 26.730 启动时用 `OnlineIfUncached` 从官方 `/models` 拉取并写入
+  `models_cache.json`（`client_version = 0.147.0`），**在线模型列表覆盖/取代了
+  `model_catalog_json` 提供的 catalog**。CLI 0.133.0 则用 `model_catalog` 替换
+  bundled（两者对同一配置行为不同）。
+- 证据：`models_cache.json` 的 `fetched_at` 与桌面端启动时间吻合；
+  同一 config 下 CLI `codex debug models` 显示 11 个（含 DeepSeek），
+  桌面端 model/list 路径被在线列表取代。
+- 结论：**`model_catalog_json` 在桌面端 26.730 上不可靠（被在线覆盖）**，
+  真实桌面端同屏共存第三方模型暂不可行。这是客户端版本行为差异，不是
+  本项目配置错误。
+
+### 可用通道（已验证）
+
+- **CLI 通道**：隔离 CODEX_HOME + 完整 provider config + 本地 Router →
+  真实 DeepSeek turn 成功。可复现：`scripts/cli-deepseek.sh "提示词"`。
+  该脚本不修改真实 `~/.codex`。
+- 桌面端恢复官方模型列表：移除本项目受管区块后，桌面端重启即回到
+  官方在线模型（含账户专属模型如 gpt-5.6-luna）。
+
+## 8. Gate 1 结论
 
 - picker 可接受的 provider/catalog schema：**已证实**（官方文档 + 本机 schema 生成器 +
   运行时加载收据）。
@@ -145,7 +172,7 @@ turn、picker 显示与 compact/工具/重启的桌面交互收据。
   `env_key`/`auth` 机制（官方文档）；第三方 provider 不使用 OpenAI 认证。
   官方认证 header 的具体值**未取得也不猜测**（遵守约束）。
 
-## 7. 仍未验证（保持阻断的原因）
+## 9. 仍未验证（保持阻断的原因）
 
 - picker 是否显示本项目 catalog 中的第三方模型并可在真实 Codex 桌面端选中：
   需要完整桌面 smoke（`gui --smoke` + `docs/smoke-acceptance-checklist.md`）。

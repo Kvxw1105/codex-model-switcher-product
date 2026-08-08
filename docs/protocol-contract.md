@@ -21,6 +21,11 @@
 
 状态：`CONTRACT VERIFIED / RUNTIME LOAD VERIFIED / RUNTIME TURN VERIFIED / PICKER UNVERIFIED`。
 
+桌面端结论（2026-08-08 实测）：WindowsApps 桌面端 26.730（内核 ≈ 0.147.0）
+用在线模型列表**覆盖** `model_catalog_json`（models_cache 刷新），因此真实
+桌面端无法同屏显示第三方模型；CLI 0.133.0 则正常替换。可用通道是隔离
+CODEX_HOME 的 CLI（`scripts/cli-deepseek.sh`）。详见证据文档第 7 节。
+
 证据文件：`docs/gate1-evidence-2026-08-06.md`（只含官方文档、当前客户端 schema
 生成器、官方开源源码与隔离 CODEX_HOME 实测的不含隐私证据；不复制真实
 catalog、auth、token、cookie）。复现脚本：`scripts/verify-native-load.sh`。
